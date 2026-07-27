@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>図面寸法ハイライト</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <input id="pdfFileInput" type="file" accept=".pdf,application/pdf" hidden>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">DA</div>
+        <div>
+          <strong>図面アシスト</strong>
+          <span>寸法チェック・追記</span>
+        </div>
+      </div>
+
+      <button id="openButton" class="primary-button hidden" type="button">
+        <span class="button-icon">＋</span> 別のPDFを開く
+      </button>
+
+      <div class="file-summary">
+        <span id="fileName">PDF未選択</span>
+        <small id="fileMeta">画面へドラッグ＆ドロップできます</small>
+      </div>
+
+      <div class="page-nav" aria-label="ページ移動">
+        <button id="previousButton" class="icon-button" title="前のページ" type="button">‹</button>
+        <span id="pageLabel">— / —</span>
+        <button id="nextButton" class="icon-button" title="次のページ" type="button">›</button>
+      </div>
+
+      <div class="top-actions">
+        <button id="undoButton" class="soft-button" type="button" title="直前の追加を取り消します">↶ 取り消し</button>
+        <button id="clearPageButton" class="soft-button danger-text" type="button" title="現在ページの追加内容だけを消します">ページをクリア</button>
+        <button id="saveButton" class="save-button" type="button">別名で保存</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="tool-panel">
+        <div class="panel-heading">
+          <span>ツール</span>
+          <small>使う機能を選択</small>
+        </div>
+
+        <button class="tool-card active" data-mode="word" type="button">
+          <span class="tool-icon marker-icon"></span>
+          <span><strong>文字・記号をマーク</strong><small>クリック／ドラッグ</small></span>
+        </button>
+        <button class="tool-card" data-mode="work_shape" type="button">
+          <span class="tool-icon work-shape-icon"></span>
+          <span><strong>ワーク形状をマーク</strong><small>内部クリック／手動指定</small></span>
+        </button>
+        <button class="tool-card" data-mode="replace" type="button">
+          <span class="tool-icon replace-icon">12<span>→</span>15</span>
+          <span><strong>寸法値を修正</strong><small>値・公差を置き換え</small></span>
+        </button>
+        <button class="tool-card" data-mode="strike" type="button">
+          <span class="tool-icon strike-icon"></span>
+          <span><strong>二重取消線</strong><small>寸法をクリック</small></span>
+        </button>
+        <button class="tool-card" data-mode="dimension" type="button">
+          <span class="tool-icon dimension-icon"></span>
+          <span><strong>寸法・引出線</strong><small>矢先から文字へドラッグ</small></span>
+        </button>
+        <div class="tool-separator"><span>スタンプ</span></div>
+        <button class="tool-card stamp-card quality" data-mode="quality_stamp" type="button">
+          <span class="stamp-preview red">品質<br>保証</span>
+          <span><strong>品質保証印</strong><small>配置場所をクリック</small></span>
+        </button>
+        <button class="tool-card stamp-card process" data-mode="process_stamp" type="button">
+          <span class="stamp-preview blue">加工<br>図</span>
+          <span><strong>加工図印</strong><small>配置場所をクリック</small></span>
+        </button>
+
+        <div class="source-note">
+          <span class="note-icon">i</span>
+          <p>原本PDFは変更しません。編集結果は別ファイルに保存されます。</p>
+        </div>
+      </aside>
+
+      <section class="viewer">
+        <div id="dropOverlay" class="drop-overlay">
+          <div class="drop-symbol">↓</div>
+          <strong>ここにPDFをドロップ</strong>
+          <span>ファイルを離すと開きます</span>
+        </div>
+
+        <div id="emptyState" class="empty-state">
+          <div class="empty-illustration">
+            <span class="sheet-back"></span>
+            <span class="sheet-front">PDF</span>
+          </div>
+          <h1>編集する図面を開いてください</h1>
+          <p>PDFをこの画面にドラッグ＆ドロップ<br>または下のボタンから選択できます</p>
+          <button id="emptyOpenButton" class="primary-button large" type="button">PDFを選択</button>
+          <span class="support-note">テキストPDF・画像化PDFの両方に対応</span>
+        </div>
+
+        <div id="documentViewport" class="document-viewport hidden">
+          <div id="documentStage" class="document-stage">
+            <img id="pageImage" alt="PDFページ">
+            <canvas id="interactionCanvas"></canvas>
+          </div>
+        </div>
+
+        <div class="viewer-footer">
+          <div id="statusMessage" class="status-message">
+            <span class="status-dot"></span>
+            <span>PDFを開くか、画面へドロップしてください。</span>
+          </div>
+          <div class="zoom-control">
+            <button id="zoomOutButton" class="mini-button" type="button">−</button>
+            <input id="zoomRange" type="range" min="60" max="220" step="10" value="100" aria-label="ズーム">
+            <span id="zoomLabel">100%</span>
+            <button id="zoomInButton" class="mini-button" type="button">＋</button>
+          </div>
+        </div>
+      </section>
+
+      <aside class="settings-panel">
+        <div class="panel-heading">
+          <span>設定</span>
+          <small id="settingsToolName">文字・記号をマーク</small>
+        </div>
+
+        <section class="setting-group color-setting" data-for="word work_shape dimension">
+          <label>マーカーカラー</label>
+          <div id="colorSwatches" class="color-swatches">
+            <button class="swatch selected" data-color="#fff24d" style="--swatch:#fff24d" title="黄色" type="button"></button>
+            <button class="swatch" data-color="#ff76bf" style="--swatch:#ff76bf" title="桃色" type="button"></button>
+            <button class="swatch" data-color="#5ee7f2" style="--swatch:#5ee7f2" title="水色" type="button"></button>
+            <button class="swatch" data-color="#72df78" style="--swatch:#72df78" title="緑色" type="button"></button>
+            <button class="swatch" data-color="#ffb347" style="--swatch:#ffb347" title="橙色" type="button"></button>
+            <button class="swatch" data-color="#ff6961" style="--swatch:#ff6961" title="赤色" type="button"></button>
+            <label class="custom-color" title="その他の色">
+              <input id="customColor" type="color" value="#fff24d">
+              <span>＋</span>
+            </label>
+          </div>
+        </section>
+
+        <section class="setting-group" data-for="word work_shape dimension">
+          <div class="setting-row">
+            <label for="opacityRange">濃さ</label>
+            <output id="opacityValue">42%</output>
+          </div>
+          <input id="opacityRange" class="wide-range" type="range" min="10" max="85" value="42">
+          <div class="range-hints"><span>薄い</span><span>濃い</span></div>
+          <p class="setting-tip">乗算合成により、黒い文字をくっきり保ちながら背景をマーキングします。</p>
+        </section>
+
+        <section class="setting-group hidden" data-for="word">
+          <label for="markMethod">ドラッグ方法</label>
+          <select id="markMethod" class="text-input">
+            <option value="box">範囲を囲んでマーク</option>
+            <option value="angled">斜め文字に沿ってマーク</option>
+          </select>
+          <div class="unified-highlight-guide">
+            <strong>クリック</strong>
+            <span>寸法値や文字を自動選択</span>
+            <strong>ドラッグ</strong>
+            <span>選択した方法で文字・記号・任意範囲をマーク</span>
+          </div>
+          <div id="angledWidthGroup" class="hidden">
+            <label for="highlightWidth" class="sub-label">マーカー幅</label>
+            <div class="number-field">
+              <input id="highlightWidth" type="number" min="3" max="40" step="0.5" value="11">
+              <span>pt</span>
+            </div>
+            <p class="setting-tip">斜め文字の左端から右端へ、文字と平行にドラッグしてください。</p>
+          </div>
+          <p class="setting-tip">詳細部は橙色を選び、詳細名称と図面上の対応箇所をそれぞれマーキングしてください。</p>
+        </section>
+
+        <section class="setting-group hidden" data-for="work_shape">
+          <label for="workShapeStyle">マーキング方法</label>
+          <select id="workShapeStyle" class="text-input">
+            <option value="auto">半自動（内部をクリック）</option>
+            <option value="fill">面を囲んでマーク</option>
+            <option value="line">実線を点でなぞってマーク</option>
+          </select>
+          <div id="autoWorkControls">
+            <div class="auto-operation-buttons">
+              <button id="autoWorkReplaceButton" class="choice-button active" type="button">選び直す</button>
+              <button id="autoWorkAddButton" class="choice-button" type="button">範囲を追加</button>
+              <button id="autoWorkRemoveButton" class="choice-button" type="button">範囲を除外</button>
+            </div>
+            <div class="selection-progress">
+              <span>候補範囲</span>
+              <output id="autoWorkCandidateCount">未選択</output>
+            </div>
+            <div class="auto-work-actions">
+              <button id="cancelAutoWorkButton" class="soft-button" type="button" disabled>候補を解除</button>
+              <button id="confirmAutoWorkButton" class="save-button" type="button" disabled>候補を確定</button>
+            </div>
+            <p class="setting-tip">ワーク内部をクリックすると閉じた外形を候補表示します。黄色い候補を確認してから確定してください。検出できない場合は手動方式へ切り替えます。</p>
+          </div>
+          <div id="manualWorkControls" class="hidden">
+            <div id="workLineWidthGroup" class="hidden">
+              <label for="workLineWidth" class="sub-label">線の太さ</label>
+              <div class="number-field">
+                <input id="workLineWidth" type="number" min="1" max="30" step="0.5" value="6">
+                <span>pt</span>
+              </div>
+            </div>
+            <div class="selection-progress">
+              <span>指定点</span>
+              <output id="workPointCount">0点</output>
+            </div>
+            <div class="work-shape-actions">
+              <button id="removeWorkPointButton" class="soft-button" type="button" disabled>1点戻す</button>
+              <button id="cancelWorkShapeButton" class="soft-button" type="button" disabled>選択解除</button>
+              <button id="finishWorkShapeButton" class="save-button" type="button" disabled>この形状をマーク</button>
+            </div>
+            <p class="setting-tip">ワークの角や曲線上を順番にクリックします。面は3点以上、実線は2点以上を指定してから確定してください。</p>
+          </div>
+        </section>
+
+        <section class="setting-group hidden" data-for="dimension">
+          <label for="dimensionText">追加する寸法値</label>
+          <input id="dimensionText" class="text-input" type="text" value="R0.1以下" maxlength="80">
+          <label for="fontSize" class="sub-label">文字サイズ</label>
+          <div class="number-field">
+            <input id="fontSize" type="number" min="5" max="36" step="0.5" value="10">
+            <span>pt</span>
+          </div>
+          <div class="gesture-guide">
+            <span class="guide-dot"></span><span class="guide-line"></span><span class="guide-label">R0.1以下</span>
+          </div>
+          <p class="setting-tip">矢印の先端から、文字を置く場所までドラッグします。</p>
+        </section>
+
+        <section class="setting-group hidden" data-for="replace">
+          <div class="replacement-selection-card">
+            <span>選択した元の値</span>
+            <output id="originalReplacementValue">未選択</output>
+            <small id="replacementSelectionHint">図面上の修正したい寸法値を選択してください</small>
+          </div>
+          <label for="replacementValue">新しい寸法値</label>
+          <input id="replacementValue" class="text-input" type="text" placeholder="例: φ15.4" maxlength="40">
+          <div class="tolerance-grid">
+            <label>
+              <span>上公差</span>
+              <input id="upperTolerance" class="text-input" type="text" placeholder="+0.03" maxlength="20">
+            </label>
+            <label>
+              <span>下公差</span>
+              <input id="lowerTolerance" class="text-input" type="text" placeholder="-0.01" maxlength="20">
+            </label>
+          </div>
+          <label for="replacementSize" class="sub-label">画像PDFの文字サイズ</label>
+          <div class="number-field">
+            <input id="replacementSize" type="number" min="5" max="36" step="0.5" value="9">
+            <span>pt</span>
+          </div>
+          <div class="replacement-preview">
+            <strong id="replacementPreviewValue">φ15.4</strong>
+            <span id="replacementPreviewTolerance"><small id="replacementPreviewUpper"></small><small id="replacementPreviewLower"></small></span>
+          </div>
+          <div class="replacement-actions">
+            <button id="cancelReplacementButton" class="soft-button" type="button" disabled>選択解除</button>
+            <button id="confirmReplacementButton" class="save-button" type="button" disabled>修正を反映</button>
+          </div>
+          <p class="setting-tip">対象を選択してから修正後の値を入力し、「修正を反映」を押します。上・下公差が空欄の場合、公差は記載しません。</p>
+        </section>
+
+        <section class="setting-group hidden" data-for="quality_stamp process_stamp">
+          <label for="stampName">名前・部署名</label>
+          <input id="stampName" class="text-input" type="text" value="担当者" maxlength="20">
+          <label for="stampDate" class="sub-label">日付</label>
+          <input id="stampDate" class="text-input" type="text" value="" maxlength="20">
+          <label for="stampSize" class="sub-label">印の大きさ</label>
+          <div class="number-field">
+            <input id="stampSize" type="number" min="30" max="150" step="1" value="62">
+            <span>pt</span>
+          </div>
+        </section>
+
+        <section class="setting-group mode-help">
+          <div class="help-title"><span>操作方法</span><kbd>Esc</kbd></div>
+          <p id="modeHelp">寸法値はクリック、文字・記号・任意範囲は選択方法を選んでドラッグします。</p>
+        </section>
+
+        <button id="clearAllButton" class="clear-all-button" type="button">すべての追加内容を消去</button>
+      </aside>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

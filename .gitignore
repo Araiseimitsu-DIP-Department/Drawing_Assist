@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Generated files
+tmp/
+output/
