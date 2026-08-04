@@ -38,7 +38,7 @@ except ImportError:
     )
 
 
-APP_NAME = "図面寸法ハイライト"
+APP_NAME = "加工図面作成支援ツール"
 PAGE_MARGIN = 24
 PRESET_COLORS = [
     ("黄", "#fff24d"),

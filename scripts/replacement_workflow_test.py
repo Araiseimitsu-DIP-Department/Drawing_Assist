@@ -71,16 +71,26 @@ def main() -> None:
         not selection_state
         or selection_state["original_text"] != "φ17.1"
         or selection_state["original_value"] != "17.1"
+        or not selection_state.get("selection_key")
+        or selected.get("image") == loaded.get("image")
     ):
-        raise RuntimeError("The original value was not returned to the UI.")
+        raise RuntimeError(
+            "The original value or highlighted selection was not returned to the UI."
+        )
 
+    requested_size = 14.0
+    value_offset = (4.0, -3.0)
     confirmed = api.confirm_replacement(
         {
             "replacement_value": "17.2",
             "upper_tolerance": "",
             "lower_tolerance": "",
-            # Text PDFs must ignore this and preserve the source size.
-            "replacement_size": 30,
+            "replacement_size": requested_size,
+            "replacement_tolerance_size": 6.0,
+            "replacement_value_x": value_offset[0],
+            "replacement_value_y": value_offset[1],
+            "replacement_tolerance_x": 2.0,
+            "replacement_tolerance_y": 1.0,
         }
     )
     if not confirmed.get("ok") or confirmed.get("replacement_selection"):
@@ -93,15 +103,19 @@ def main() -> None:
     if mark.origin is None:
         raise RuntimeError("The original baseline was not retained.")
     if math.dist(mark.origin, origin) > 0.01:
-        raise RuntimeError(f"Origin changed: {origin} -> {mark.origin}")
+        raise RuntimeError(f"Base origin changed: {origin} -> {mark.origin}")
     if math.dist(mark.direction, direction) > 0.001:
         raise RuntimeError(
             f"Direction changed: {direction} -> {mark.direction}"
         )
-    if abs(mark.font_size - font_size) > 0.01:
+    if abs(mark.font_size - requested_size) > 0.01:
         raise RuntimeError(
-            f"Font size changed: {font_size} -> {mark.font_size}"
+            f"Requested font size was ignored: {requested_size} -> {mark.font_size}"
         )
+    if mark.tolerance_font_size != 6.0:
+        raise RuntimeError("The independent tolerance size was not retained.")
+    if mark.value_offset != value_offset or mark.tolerance_offset != (2.0, 1.0):
+        raise RuntimeError("Independent text offsets were not retained.")
 
     export_pdf(args.source, args.output, api.items)
     api.close()
@@ -113,17 +127,21 @@ def main() -> None:
         "17.2",
         minimum_x=400,
     )
-    if math.dist(new_origin, origin) > 0.05:
+    expected_origin = (
+        origin[0] + value_offset[0],
+        origin[1] + value_offset[1],
+    )
+    if math.dist(new_origin, expected_origin) > 0.05:
         raise RuntimeError(
-            f"Rendered origin changed: {origin} -> {new_origin}"
+            f"Rendered origin differs: {expected_origin} -> {new_origin}"
         )
     if math.dist(new_direction, direction) > 0.001:
         raise RuntimeError(
             f"Rendered direction changed: {direction} -> {new_direction}"
         )
-    if abs(new_size - font_size) > 0.05:
+    if abs(new_size - requested_size) > 0.05:
         raise RuntimeError(
-            f"Rendered font size changed: {font_size} -> {new_size}"
+            f"Rendered font size differs: {requested_size} -> {new_size}"
         )
 
     clip = fitz.Rect(rect.x0 - 25, rect.y0 - 35, rect.x1 + 25, rect.y1 + 20)
@@ -145,9 +163,9 @@ def main() -> None:
     output_document.close()
 
     print(
-        "PASS: two-step replacement preserved "
-        f"origin={origin}, direction={direction}, size={font_size:.3f}pt; "
-        "blank tolerances were omitted"
+        "PASS: two-step replacement highlighted the selection and applied "
+        f"size={requested_size:.1f}pt, offset={value_offset}; "
+        "blank tolerances were omitted and independent tolerance settings were retained"
     )
 
 

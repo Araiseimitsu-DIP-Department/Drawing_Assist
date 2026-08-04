@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
+import heapq
+from io import BytesIO
 import math
 import os
 from pathlib import Path
+import re
 from typing import Iterable, TypeAlias
 
 import fitz
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,20 @@ class DimensionMark:
     color: str = "#fff24d"
     opacity: float = 0.42
     font_size: float = 10.0
+    font_name: str = ""
+    font_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    line_width: float = 0.45
+    show_leader: bool = True
+
+
+@dataclass(frozen=True)
+class DimensionStyle:
+    """Drawing-derived typography and line weight for a new dimension."""
+
+    font_size: float
+    font_name: str
+    font_color: tuple[float, float, float]
+    line_width: float
 
 
 @dataclass(frozen=True)
@@ -60,6 +77,63 @@ class StampMark:
 
 
 @dataclass(frozen=True)
+class ProcedureNoteMark:
+    """A procedure-required note placed directly on the drawing."""
+
+    page_index: int
+    origin: tuple[float, float]
+    kind: str
+    text: str
+    font_size: float = 10.0
+
+
+def stamp_mark_rect(mark: StampMark) -> fitz.Rect:
+    """Return the exact square occupied by a stamp."""
+
+    center = fitz.Point(mark.center)
+    radius = max(1.0, mark.size / 2)
+    return fitz.Rect(
+        center.x - radius,
+        center.y - radius,
+        center.x + radius,
+        center.y + radius,
+    )
+
+
+def procedure_note_rect(mark: ProcedureNoteMark) -> fitz.Rect:
+    """Return a practical selection box matching the rendered note."""
+
+    origin = fitz.Point(mark.origin)
+    font_size = max(6.0, min(24.0, mark.font_size))
+    font = _pdf_font()
+    lines = [line.strip() for line in mark.text.splitlines() if line.strip()]
+    if not lines:
+        return fitz.Rect(origin.x, origin.y, origin.x + font_size, origin.y + font_size)
+
+    def text_width(text: str, size: float = font_size) -> float:
+        return font.text_length(text, fontsize=size)
+
+    if mark.kind == "phase":
+        width = text_width(lines[0]) + font_size * 1.3
+        height = font_size * 1.75
+    elif mark.kind == "post_process":
+        content_width = max((text_width(line) for line in lines), default=0.0)
+        width = max(150.0, content_width + font_size * 1.2)
+        header_height = font_size * 2.0
+        body_height = max(
+            font_size * 2.3,
+            len(lines) * font_size * 1.3 + font_size,
+        )
+        height = header_height + body_height
+    else:
+        width = max((text_width(line) for line in lines), default=font_size)
+        height = font_size + max(0, len(lines) - 1) * font_size * 1.28
+        width += max(1.5, font_size * 0.12)
+        height += max(1.5, font_size * 0.18)
+    return fitz.Rect(origin.x, origin.y, origin.x + width, origin.y + height)
+
+
+@dataclass(frozen=True)
 class ReplacementMark:
     """A white-out and replacement for an existing dimension value."""
 
@@ -70,9 +144,49 @@ class ReplacementMark:
     upper_tolerance: str = ""
     lower_tolerance: str = ""
     font_size: float = 9.0
+    tolerance_font_size: float | None = None
+    value_offset: tuple[float, float] = (0.0, 0.0)
+    tolerance_offset: tuple[float, float] = (0.0, 0.0)
     origin: tuple[float, float] | None = None
     font_name: str = ""
     font_color: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class ToleranceAddition:
+    """One general-tolerance label positioned after an OCR dimension."""
+
+    origin: tuple[float, float]
+    direction: tuple[float, float]
+    text: str
+    font_size: float
+    suffix_text: str = ""
+    suffix_rect: tuple[float, float, float, float] | None = None
+    suffix_font_size: float | None = None
+
+
+@dataclass(frozen=True)
+class GeneralToleranceBatchMark:
+    """A single undoable batch of automatically added tolerances."""
+
+    page_index: int
+    additions: tuple[ToleranceAddition, ...]
+
+
+@dataclass(frozen=True)
+class DimensionMarkingEntry:
+    rect: tuple[float, float, float, float]
+    color: str
+    opacity: float = 0.42
+    quad: tuple[tuple[float, float], ...] | None = None
+
+
+@dataclass(frozen=True)
+class DimensionMarkingBatch:
+    """A single undoable batch of dimension and tolerance highlights."""
+
+    page_index: int
+    entries: tuple[DimensionMarkingEntry, ...]
 
 
 @dataclass(frozen=True)
@@ -152,12 +266,26 @@ class TextHit:
     preserved_prefix: str = ""
 
 
+@dataclass(frozen=True)
+class _InkComponent:
+    """One connected dark component in a rendered PDF crop."""
+
+    bbox: tuple[int, int, int, int]
+    area: int
+    center: tuple[float, float]
+    major_span: float
+    elongation: float
+
+
 DrawingItem: TypeAlias = (
     Mark
     | StrikeMark
     | DimensionMark
     | StampMark
+    | ProcedureNoteMark
     | ReplacementMark
+    | GeneralToleranceBatchMark
+    | DimensionMarkingBatch
     | GeometricToleranceMark
     | SurfaceFinishMark
     | WorkShapeMark
@@ -559,6 +687,342 @@ def detect_enclosed_region(
     return points
 
 
+def expand_work_region(
+    points: tuple[tuple[float, float], ...],
+    page_rect: fitz.Rect,
+    *,
+    padding: float = 1.1,
+    raster_scale: float = 4.0,
+) -> tuple[tuple[float, float], ...]:
+    """Expand a detected region slightly to cover anti-aliased edge gaps.
+
+    The expansion is intentionally small and raster based.  This handles
+    concave workpiece outlines more safely than moving vertices away from a
+    centroid and keeps the correction visually consistent in every direction.
+    """
+
+    if len(points) < 3 or padding <= 0:
+        return points
+    source_rect = fitz.Rect(
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    )
+    margin = padding + 2.0
+    crop = fitz.Rect(
+        source_rect.x0 - margin,
+        source_rect.y0 - margin,
+        source_rect.x1 + margin,
+        source_rect.y1 + margin,
+    ) & page_rect
+    if crop.is_empty:
+        return points
+    width = max(3, int(math.ceil(crop.width * raster_scale)) + 1)
+    height = max(3, int(math.ceil(crop.height * raster_scale)) + 1)
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).polygon(
+        [
+            (
+                (point[0] - crop.x0) * raster_scale,
+                (point[1] - crop.y0) * raster_scale,
+            )
+            for point in points
+        ],
+        fill=255,
+    )
+    radius = max(1, int(math.ceil(padding * raster_scale)))
+    expanded = mask.filter(ImageFilter.MaxFilter(radius * 2 + 1))
+    boundary = _largest_mask_boundary(expanded)
+    if len(boundary) < 3:
+        return points
+    simplified = _simplify_closed_polygon(
+        boundary,
+        tolerance=max(1.0, raster_scale * 0.25),
+    )
+    corrected = tuple(
+        (
+            min(page_rect.x1, max(page_rect.x0, crop.x0 + x / raster_scale)),
+            min(page_rect.y1, max(page_rect.y0, crop.y0 + y / raster_scale)),
+        )
+        for x, y in simplified
+    )
+    return corrected if len(corrected) >= 3 else points
+
+
+def _nearest_ink_pixel(
+    image: Image.Image,
+    point: tuple[float, float],
+    *,
+    radius: int,
+    threshold: int,
+) -> tuple[int, int] | None:
+    """Snap a user anchor to the nearest strong drawing line."""
+
+    center_x = int(round(point[0]))
+    center_y = int(round(point[1]))
+    pixels = image.load()
+    best: tuple[float, int, int] | None = None
+    for y in range(
+        max(0, center_y - radius),
+        min(image.height, center_y + radius + 1),
+    ):
+        for x in range(
+            max(0, center_x - radius),
+            min(image.width, center_x + radius + 1),
+        ):
+            distance = math.hypot(x - point[0], y - point[1])
+            if distance > radius:
+                continue
+            value = pixels[x, y]
+            if value >= threshold:
+                continue
+            # Prefer a solid black contour over a closer pale dimension line.
+            score = distance + value / 255 * radius * 0.75
+            candidate = (score, x, y)
+            if best is None or candidate < best:
+                best = candidate
+    return (best[1], best[2]) if best is not None else None
+
+
+def _point_segment_distance(
+    point: tuple[int, int],
+    start: tuple[int, int],
+    end: tuple[int, int],
+) -> float:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 0:
+        return math.dist(point, start)
+    ratio = max(
+        0.0,
+        min(
+            1.0,
+            (
+                (point[0] - start[0]) * dx
+                + (point[1] - start[1]) * dy
+            )
+            / length_squared,
+        ),
+    )
+    projection = (
+        start[0] + ratio * dx,
+        start[1] + ratio * dy,
+    )
+    return math.dist(point, projection)
+
+
+def _trace_ink_segment(
+    image: Image.Image,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    threshold: int,
+    render_scale: float,
+) -> list[tuple[int, int]]:
+    """Trace the darkest reasonable route between two outline anchors."""
+
+    direct_length = max(1.0, math.dist(start, end))
+    margin = int(
+        round(
+            max(
+                render_scale * 9,
+                min(render_scale * 28, direct_length * 0.22),
+            )
+        )
+    )
+    x0 = max(0, min(start[0], end[0]) - margin)
+    y0 = max(0, min(start[1], end[1]) - margin)
+    x1 = min(image.width - 1, max(start[0], end[0]) + margin)
+    y1 = min(image.height - 1, max(start[1], end[1]) + margin)
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    if width <= 0 or height <= 0:
+        return [start, end]
+    local_start = (start[0] - x0, start[1] - y0)
+    local_end = (end[0] - x0, end[1] - y0)
+    crop = image.crop((x0, y0, x1 + 1, y1 + 1))
+    pixels = crop.tobytes()
+
+    def index(point: tuple[int, int]) -> int:
+        return point[1] * width + point[0]
+
+    start_index = index(local_start)
+    end_index = index(local_end)
+    distances = {start_index: 0.0}
+    previous: dict[int, int] = {}
+    queue: list[tuple[float, float, int]] = [
+        (direct_length, 0.0, start_index)
+    ]
+    visited = 0
+    maximum_visited = min(280_000, width * height)
+    neighbor_steps = (
+        (-1, -1, math.sqrt(2)),
+        (0, -1, 1.0),
+        (1, -1, math.sqrt(2)),
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (-1, 1, math.sqrt(2)),
+        (0, 1, 1.0),
+        (1, 1, math.sqrt(2)),
+    )
+    while queue and visited < maximum_visited:
+        _, current_distance, current_index = heapq.heappop(queue)
+        if current_distance != distances.get(current_index):
+            continue
+        if current_index == end_index:
+            break
+        visited += 1
+        current_y, current_x = divmod(current_index, width)
+        for step_x, step_y, step_length in neighbor_steps:
+            next_x = current_x + step_x
+            next_y = current_y + step_y
+            if not (0 <= next_x < width and 0 <= next_y < height):
+                continue
+            next_index = next_y * width + next_x
+            value = pixels[next_index]
+            darkness_cost = 1.0 + (value / 255) ** 3 * 30.0
+            page_pixel = (next_x + x0, next_y + y0)
+            corridor_cost = (
+                _point_segment_distance(page_pixel, start, end)
+                / max(1.0, margin)
+            ) ** 2 * 2.0
+            candidate_distance = current_distance + step_length * (
+                darkness_cost + corridor_cost
+            )
+            if candidate_distance >= distances.get(next_index, math.inf):
+                continue
+            distances[next_index] = candidate_distance
+            previous[next_index] = current_index
+            heuristic = math.hypot(
+                local_end[0] - next_x,
+                local_end[1] - next_y,
+            )
+            heapq.heappush(
+                queue,
+                (
+                    candidate_distance + heuristic,
+                    candidate_distance,
+                    next_index,
+                ),
+            )
+    if end_index not in distances:
+        return [start, end]
+    path_indices = [end_index]
+    while path_indices[-1] != start_index:
+        predecessor = previous.get(path_indices[-1])
+        if predecessor is None:
+            return [start, end]
+        path_indices.append(predecessor)
+    path_indices.reverse()
+    path = [
+        (
+            path_index % width + x0,
+            path_index // width + y0,
+        )
+        for path_index in path_indices
+    ]
+    dark_pixels = sum(
+        image.getpixel(point) < threshold
+        for point in path
+    )
+    if (
+        len(path) > direct_length * 2.8 + render_scale * 20
+        or dark_pixels / max(1, len(path)) < 0.48
+    ):
+        return [start, end]
+    return path
+
+
+def predict_work_outline(
+    page: fitz.Page,
+    points: tuple[tuple[float, float], ...],
+    *,
+    render_scale: float = 2.2,
+) -> tuple[tuple[float, float], ...]:
+    """Predict one closed work outline from ordered contour anchor points."""
+
+    if not 3 <= len(points) <= 32:
+        raise ValueError("輪郭の角・変曲点を3～32点指定してください。")
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(render_scale, render_scale),
+        colorspace=fitz.csGRAY,
+        alpha=False,
+        annots=False,
+    )
+    grayscale = Image.frombytes(
+        "L",
+        (pixmap.width, pixmap.height),
+        pixmap.samples,
+    )
+    threshold = min(185, _otsu_threshold(grayscale))
+    snap_radius = max(4, int(round(render_scale * 7)))
+    snapped: list[tuple[int, int]] = []
+    for point in points:
+        pixel_point = (
+            (point[0] - page.rect.x0) * render_scale,
+            (point[1] - page.rect.y0) * render_scale,
+        )
+        nearest = _nearest_ink_pixel(
+            grayscale,
+            pixel_point,
+            radius=snap_radius,
+            threshold=threshold,
+        )
+        if nearest is None:
+            raise ValueError(
+                "輪郭線から離れた点があります。"
+                "黒い外形線の角または線上をクリックしてください。"
+            )
+        snapped.append(nearest)
+    traced: list[tuple[int, int]] = []
+    for index, start in enumerate(snapped):
+        end = snapped[(index + 1) % len(snapped)]
+        segment = _trace_ink_segment(
+            grayscale,
+            start,
+            end,
+            threshold=threshold,
+            render_scale=render_scale,
+        )
+        traced.extend(segment[:-1])
+    traced = [
+        (int(point[0]), int(point[1]))
+        for point in _simplify_closed_polygon(
+            [(float(x), float(y)) for x, y in traced],
+            tolerance=max(1.4, render_scale * 0.8),
+        )
+    ]
+    coarse_area = abs(
+        _polygon_area(
+            [(float(x), float(y)) for x, y in snapped]
+        )
+    )
+    traced_area = abs(
+        _polygon_area(
+            [(float(x), float(y)) for x, y in traced]
+        )
+    )
+    if (
+        len(traced) < 3
+        or coarse_area < render_scale * render_scale * 8
+        or traced_area < coarse_area * 0.52
+        or traced_area > coarse_area * 1.65
+    ):
+        traced = snapped
+    predicted = tuple(
+        (
+            page.rect.x0 + x / render_scale,
+            page.rect.y0 + y / render_scale,
+        )
+        for x, y in traced
+    )
+    if len(predicted) < 3:
+        raise ValueError("指定点から閉じたワーク外形を予測できませんでした。")
+    return predicted
+
+
 def _distance_to_rect(point: fitz.Point, rect: fitz.Rect) -> float:
     dx = max(rect.x0 - point.x, 0.0, point.x - rect.x1)
     dy = max(rect.y0 - point.y, 0.0, point.y - rect.y1)
@@ -577,6 +1041,400 @@ def _projection_interval(
 
 def _interval_gap(first: tuple[float, float], second: tuple[float, float]) -> float:
     return max(first[0] - second[1], second[0] - first[1], 0.0)
+
+
+def _otsu_threshold(image: Image.Image) -> int:
+    """Return a stable dark/bright split for a grayscale drawing crop."""
+
+    histogram = image.histogram()
+    total = image.width * image.height
+    weighted_total = sum(index * count for index, count in enumerate(histogram))
+    background_weight = 0
+    background_sum = 0
+    best_variance = -1.0
+    best_threshold = 180
+    for threshold, count in enumerate(histogram):
+        background_weight += count
+        if background_weight == 0:
+            continue
+        foreground_weight = total - background_weight
+        if foreground_weight == 0:
+            break
+        background_sum += threshold * count
+        background_mean = background_sum / background_weight
+        foreground_mean = (
+            weighted_total - background_sum
+        ) / foreground_weight
+        variance = (
+            background_weight
+            * foreground_weight
+            * (background_mean - foreground_mean) ** 2
+        )
+        if variance > best_variance:
+            best_variance = variance
+            best_threshold = threshold
+    return max(95, min(225, best_threshold + 16))
+
+
+def _connected_ink_components(
+    image: Image.Image,
+    threshold: int,
+) -> list[_InkComponent]:
+    """Extract 8-connected dark components without an OpenCV dependency."""
+
+    width, height = image.size
+    pixels = image.tobytes()
+    ink = bytearray(value < threshold for value in pixels)
+    visited = bytearray(width * height)
+    components: list[_InkComponent] = []
+    for seed_index, is_ink in enumerate(ink):
+        if not is_ink or visited[seed_index]:
+            continue
+        visited[seed_index] = 1
+        stack = [seed_index]
+        area = 0
+        x0 = width
+        y0 = height
+        x1 = 0
+        y1 = 0
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_xx = 0.0
+        sum_yy = 0.0
+        sum_xy = 0.0
+        while stack:
+            index = stack.pop()
+            y, x = divmod(index, width)
+            area += 1
+            x0 = min(x0, x)
+            y0 = min(y0, y)
+            x1 = max(x1, x + 1)
+            y1 = max(y1, y + 1)
+            sum_x += x
+            sum_y += y
+            sum_xx += x * x
+            sum_yy += y * y
+            sum_xy += x * y
+            for neighbor_y in range(max(0, y - 1), min(height, y + 2)):
+                row = neighbor_y * width
+                for neighbor_x in range(max(0, x - 1), min(width, x + 2)):
+                    neighbor = row + neighbor_x
+                    if ink[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        stack.append(neighbor)
+        if area < 2:
+            continue
+        center_x = sum_x / area
+        center_y = sum_y / area
+        variance_x = max(0.0, sum_xx / area - center_x * center_x)
+        variance_y = max(0.0, sum_yy / area - center_y * center_y)
+        covariance = sum_xy / area - center_x * center_y
+        trace = variance_x + variance_y
+        discriminant = math.sqrt(
+            max(
+                0.0,
+                (variance_x - variance_y) ** 2
+                + 4 * covariance * covariance,
+            )
+        )
+        major_variance = max(0.0, (trace + discriminant) / 2)
+        minor_variance = max(0.0, (trace - discriminant) / 2)
+        components.append(
+            _InkComponent(
+                bbox=(x0, y0, x1, y1),
+                area=area,
+                center=(center_x, center_y),
+                major_span=4 * math.sqrt(major_variance),
+                elongation=(major_variance + 1.0) / (minor_variance + 1.0),
+            )
+        )
+    return components
+
+
+def _component_distance(
+    point: tuple[float, float],
+    component: _InkComponent,
+) -> float:
+    x0, y0, x1, y1 = component.bbox
+    dx = max(x0 - point[0], 0.0, point[0] - x1)
+    dy = max(y0 - point[1], 0.0, point[1] - y1)
+    return math.hypot(dx, dy)
+
+
+def _component_projection(
+    component: _InkComponent,
+    axis: tuple[float, float],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    normal = (-axis[1], axis[0])
+    x0, y0, x1, y1 = component.bbox
+    corners = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    along = tuple(x * axis[0] + y * axis[1] for x, y in corners)
+    across = tuple(x * normal[0] + y * normal[1] for x, y in corners)
+    return (min(along), max(along)), (min(across), max(across))
+
+
+def detect_visual_text_group(
+    page: fitz.Page,
+    point: fitz.Point,
+    *,
+    render_scale: float = 3.2,
+) -> TextHit:
+    """Detect a likely text / symbol group near a click on a visual-only PDF.
+
+    This intentionally recognizes geometry rather than characters. It works
+    for both scanned pages and CAD PDFs whose text has been converted to
+    outlines, while keeping OCR and external runtime dependencies optional.
+    """
+
+    clip = fitz.Rect(
+        point.x - 110,
+        point.y - 72,
+        point.x + 110,
+        point.y + 72,
+    ) & page.rect
+    if clip.is_empty:
+        raise ValueError("クリック位置の周辺を解析できませんでした。")
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(render_scale, render_scale),
+        clip=clip,
+        colorspace=fitz.csGRAY,
+        alpha=False,
+        annots=False,
+    )
+    grayscale = Image.frombytes(
+        "L",
+        (pixmap.width, pixmap.height),
+        pixmap.samples,
+    )
+    components = _connected_ink_components(
+        grayscale,
+        _otsu_threshold(grayscale),
+    )
+    maximum_component_span = render_scale * 26
+    usable = [
+        component
+        for component in components
+        if component.area >= 2
+        and (
+            component.major_span <= maximum_component_span
+            or component.elongation < 18
+        )
+        and component.area < pixmap.width * pixmap.height * 0.035
+    ]
+    if not usable:
+        raise ValueError(
+            "クリック位置の近くに文字・記号の候補が見つかりませんでした。"
+        )
+    local_point = (
+        (point.x - clip.x0) * render_scale,
+        (point.y - clip.y0) * render_scale,
+    )
+    seed_candidates = [
+        component
+        for component in usable
+        if _component_distance(local_point, component) <= render_scale * 7
+    ]
+    if not seed_candidates:
+        raise ValueError(
+            "文字・記号の線に近い位置をクリックしてください。"
+        )
+    seed = min(
+        seed_candidates,
+        key=lambda component: (
+            _component_distance(local_point, component),
+            component.area,
+        ),
+    )
+
+    best_group: list[_InkComponent] | None = None
+    best_axis = (1.0, 0.0)
+    best_score = -math.inf
+    for degrees in range(0, 180, 15):
+        radians = math.radians(degrees)
+        axis = (math.cos(radians), math.sin(radians))
+        projections = {
+            component: _component_projection(component, axis)
+            for component in usable
+        }
+        group = [seed]
+        remaining = set(usable)
+        remaining.discard(seed)
+        changed = True
+        while changed:
+            changed = False
+            for candidate in tuple(remaining):
+                candidate_along, candidate_across = projections[candidate]
+                candidate_across_size = (
+                    candidate_across[1] - candidate_across[0]
+                )
+                connected = False
+                for selected in group:
+                    selected_along, selected_across = projections[selected]
+                    selected_across_size = (
+                        selected_across[1] - selected_across[0]
+                    )
+                    along_limit = max(
+                        render_scale * 5.5,
+                        min(
+                            render_scale * 20,
+                            max(
+                                selected_across_size,
+                                candidate_across_size,
+                            ) * 0.75,
+                        ),
+                    )
+                    across_limit = max(
+                        render_scale * 1.8,
+                        min(
+                            selected_across_size,
+                            candidate_across_size,
+                        ) * 0.45,
+                    )
+                    if (
+                        _interval_gap(
+                            selected_along,
+                            candidate_along,
+                        ) <= along_limit
+                        and _interval_gap(
+                            selected_across,
+                            candidate_across,
+                        ) <= across_limit
+                        and abs(
+                            sum(selected_across) / 2
+                            - sum(candidate_across) / 2
+                        ) <= render_scale * 10
+                    ):
+                        connected = True
+                        break
+                if connected:
+                    group.append(candidate)
+                    remaining.remove(candidate)
+                    changed = True
+        group_along = [
+            value
+            for component in group
+            for value in projections[component][0]
+        ]
+        group_across = [
+            value
+            for component in group
+            for value in projections[component][1]
+        ]
+        along_span = max(group_along) - min(group_along)
+        across_span = max(group_across) - min(group_across)
+        if (
+            along_span > render_scale * 240
+            or across_span > render_scale * 55
+        ):
+            continue
+        ratio = along_span / max(across_span, render_scale)
+        density = sum(component.area for component in group) / max(
+            1.0,
+            along_span * across_span,
+        )
+        score = (
+            len(group) * 2.3
+            + min(12.0, ratio) * 1.4
+            + min(80.0, along_span / render_scale) * 0.05
+            - max(0.0, across_span / render_scale - 18) * 0.5
+            - abs(density - 0.22) * 2
+        )
+        if score > best_score:
+            best_score = score
+            best_group = group
+            best_axis = axis
+    if not best_group:
+        raise ValueError(
+            "文字・記号のまとまりを判定できませんでした。"
+        )
+
+    # Two-character dimensions such as "R3" are common. Their component
+    # centers are already enough to refine the coarse 15-degree search, while
+    # the alignment guard below prevents an unrelated pair from rotating the
+    # result away from the selected baseline.
+    if len(best_group) >= 2:
+        center_x = sum(component.center[0] for component in best_group) / len(
+            best_group
+        )
+        center_y = sum(component.center[1] for component in best_group) / len(
+            best_group
+        )
+        variance_x = sum(
+            (component.center[0] - center_x) ** 2
+            for component in best_group
+        )
+        variance_y = sum(
+            (component.center[1] - center_y) ** 2
+            for component in best_group
+        )
+        covariance = sum(
+            (component.center[0] - center_x)
+            * (component.center[1] - center_y)
+            for component in best_group
+        )
+        refined_angle = 0.5 * math.atan2(
+            2 * covariance,
+            variance_x - variance_y,
+        )
+        refined_axis = (
+            math.cos(refined_angle),
+            math.sin(refined_angle),
+        )
+        alignment = abs(
+            refined_axis[0] * best_axis[0]
+            + refined_axis[1] * best_axis[1]
+        )
+        if alignment >= math.cos(math.radians(20)):
+            if (
+                refined_axis[0] * best_axis[0]
+                + refined_axis[1] * best_axis[1]
+            ) < 0:
+                refined_axis = (-refined_axis[0], -refined_axis[1])
+            best_axis = refined_axis
+
+    best_projections = [
+        _component_projection(component, best_axis)
+        for component in best_group
+    ]
+    along_min = min(value[0][0] for value in best_projections)
+    along_max = max(value[0][1] for value in best_projections)
+    across_min = min(value[1][0] for value in best_projections)
+    across_max = max(value[1][1] for value in best_projections)
+    along_padding = render_scale * 1.5
+    across_padding = render_scale * 1.15
+    along_min -= along_padding
+    along_max += along_padding
+    across_min -= across_padding
+    across_max += across_padding
+    normal = (-best_axis[1], best_axis[0])
+
+    def page_point(along: float, across: float) -> tuple[float, float]:
+        pixel_x = best_axis[0] * along + normal[0] * across
+        pixel_y = best_axis[1] * along + normal[1] * across
+        return (
+            clip.x0 + pixel_x / render_scale,
+            clip.y0 + pixel_y / render_scale,
+        )
+
+    quad = (
+        page_point(along_min, across_min),
+        page_point(along_max, across_min),
+        page_point(along_max, across_max),
+        page_point(along_min, across_max),
+    )
+    rect = fitz.Rect(quad[0], quad[0])
+    for quad_point in quad[1:]:
+        rect.include_point(fitz.Point(quad_point))
+    rect &= page.rect
+    if rect.is_empty or rect.get_area() < 4:
+        raise ValueError("候補範囲が小さすぎます。")
+    return TextHit(
+        rect=(rect.x0, rect.y0, rect.x1, rect.y1),
+        text="",
+        direction=best_axis,
+        font_size=(across_max - across_min) / render_scale,
+        quad=quad,
+    )
 
 
 def _raw_text_lines(page: fitz.Page) -> list[dict[str, object]]:
@@ -682,6 +1540,7 @@ def find_text_group(
     hit_slop: float = 5.0,
     along_gap: float = 10.0,
     normal_gap: float = 1.75,
+    text_lines: list[dict[str, object]] | None = None,
 ) -> TextHit | None:
     """Select one dimension group, including prefixes and tolerance symbols.
 
@@ -690,7 +1549,10 @@ def find_text_group(
     lines are therefore merged around the clicked text.
     """
 
-    lines = _raw_text_lines(page)
+    # Batch operations may resolve dozens of dimensions on the same page.
+    # Reusing the parsed lines avoids rebuilding every recovered text quad for
+    # each dimension while preserving the single-click API's old behaviour.
+    lines = text_lines if text_lines is not None else _raw_text_lines(page)
     candidates: list[tuple[float, float, int]] = []
     for index, line in enumerate(lines):
         text = str(line["text"])
@@ -937,12 +1799,338 @@ def strike_from_hit(page_index: int, hit: TextHit) -> StrikeMark:
     )
 
 
+_DIMENSION_TEXT_PATTERN = re.compile(
+    r"^[\s0-9０-９A-Za-zφΦØ∅⌀RrCcM＋+\-−±°′″.,()（）/以下最大最小]+$"
+)
+
+
+def _looks_like_dimension_text(text: str) -> bool:
+    compact = "".join(text.split())
+    return (
+        0 < len(compact) <= 24
+        and any(character.isdigit() for character in compact)
+        and bool(_DIMENSION_TEXT_PATTERN.fullmatch(compact))
+    )
+
+
+def _dimension_text_spans(
+    page: fitz.Page,
+) -> list[dict[str, object]]:
+    spans: list[dict[str, object]] = []
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = "".join(
+                    character.get("c", "")
+                    for character in span.get("chars", [])
+                ).strip()
+                size = float(span.get("size", 0.0))
+                if not _looks_like_dimension_text(text) or size <= 0:
+                    continue
+                color = fitz.sRGB_to_rgb(
+                    int(span.get("color", 0))
+                )
+                spans.append(
+                    {
+                        "text": text,
+                        "rect": fitz.Rect(span["bbox"]),
+                        "font_size": size,
+                        "font_name": str(span.get("font", "")),
+                        "font_color": tuple(
+                            float(channel) / 255.0
+                            for channel in color
+                        ),
+                    }
+                )
+    return spans
+
+
+def _drawing_line_width(page: fitz.Page) -> float:
+    counts: dict[float, int] = {}
+    for drawing in page.get_drawings():
+        width = float(drawing.get("width") or 0.0)
+        if not 0.08 <= width <= 0.75:
+            continue
+        rounded = round(width, 2)
+        counts[rounded] = counts.get(rounded, 0) + 1
+    if not counts:
+        return 0.35
+    return max(counts, key=lambda width: (counts[width], -width))
+
+
+def infer_dimension_style(
+    page: fitz.Page,
+    target: tuple[float, float] | None = None,
+    label: tuple[float, float] | None = None,
+) -> DimensionStyle:
+    """Infer the typical dimension text and thin-line style on a page."""
+
+    spans = _dimension_text_spans(page)
+    selected: dict[str, object] | None = None
+    if spans and target is not None:
+        font_counts: dict[str, int] = {}
+        for span in spans:
+            font_name = str(span["font_name"])
+            font_counts[font_name] = font_counts.get(font_name, 0) + 1
+        maximum_font_count = max(font_counts.values())
+        minimum_font_count = (
+            1
+            if maximum_font_count < 4
+            else max(2, math.ceil(maximum_font_count * 0.08))
+        )
+        nearby_pool = [
+            span
+            for span in spans
+            if font_counts[str(span["font_name"])] >= minimum_font_count
+        ]
+        target_point = fitz.Point(target)
+        label_point = fitz.Point(label or target)
+        selected = min(
+            nearby_pool or spans,
+            key=lambda span: (
+                _distance_to_rect(target_point, span["rect"]) * 0.72
+                + _distance_to_rect(label_point, span["rect"]) * 0.28
+            ),
+        )
+        nearest_distance = min(
+            _distance_to_rect(target_point, selected["rect"]),
+            _distance_to_rect(label_point, selected["rect"]),
+        )
+        if nearest_distance > max(page.rect.width, page.rect.height) * 0.28:
+            selected = None
+    if spans and selected is None:
+        style_counts: dict[tuple[str, float], int] = {}
+        for span in spans:
+            key = (
+                str(span["font_name"]),
+                round(float(span["font_size"]) * 2) / 2,
+            )
+            style_counts[key] = style_counts.get(key, 0) + 1
+        preferred = max(
+            style_counts,
+            key=lambda key: (
+                style_counts[key],
+                "gothic" in key[0].lower(),
+                key[1],
+            ),
+        )
+        selected = min(
+            (
+                span
+                for span in spans
+                if str(span["font_name"]) == preferred[0]
+                and abs(float(span["font_size"]) - preferred[1]) <= 0.3
+            ),
+            key=lambda span: abs(float(span["font_size"]) - preferred[1]),
+        )
+    if selected is None:
+        return DimensionStyle(
+            font_size=max(6.5, min(10.5, page.rect.width / 90.0)),
+            font_name="MS-PGothic",
+            font_color=(0.0, 0.0, 0.0),
+            line_width=_drawing_line_width(page),
+        )
+    return DimensionStyle(
+        font_size=max(5.0, min(18.0, float(selected["font_size"]))),
+        font_name=str(selected["font_name"]),
+        font_color=selected["font_color"],
+        line_width=_drawing_line_width(page),
+    )
+
+
+def _segment_intersects_rect(
+    start: fitz.Point,
+    end: fitz.Point,
+    rect: fitz.Rect,
+) -> bool:
+    """Return whether a finite line segment crosses a rectangle."""
+
+    dx = end.x - start.x
+    dy = end.y - start.y
+    lower = 0.0
+    upper = 1.0
+    for origin, delta, minimum, maximum in (
+        (start.x, dx, rect.x0, rect.x1),
+        (start.y, dy, rect.y0, rect.y1),
+    ):
+        if abs(delta) < 1e-9:
+            if origin < minimum or origin > maximum:
+                return False
+            continue
+        first = (minimum - origin) / delta
+        second = (maximum - origin) / delta
+        if first > second:
+            first, second = second, first
+        lower = max(lower, first)
+        upper = min(upper, second)
+        if lower > upper:
+            return False
+    return True
+
+
+def _dimension_occupied_rects(
+    page: fitz.Page,
+    existing_items: Iterable[DrawingItem],
+) -> list[fitz.Rect]:
+    occupied = [
+        fitz.Rect(span["rect"]) + (-2.0, -2.0, 2.0, 2.0)
+        for span in _dimension_text_spans(page)
+    ]
+    for item in existing_items:
+        if item.page_index != page.number:
+            continue
+        if isinstance(item, DimensionMark):
+            occupied.append(
+                dimension_label_rect(item) + (-3.0, -3.0, 3.0, 3.0)
+            )
+        elif isinstance(item, ReplacementMark):
+            source_rect = fitz.Rect(item.rect)
+            occupied.append(source_rect + (-3.0, -3.0, 3.0, 3.0))
+            for offset in (item.value_offset, item.tolerance_offset):
+                moved_rect = source_rect + (
+                    offset[0],
+                    offset[1],
+                    offset[0],
+                    offset[1],
+                )
+                padding = max(
+                    item.font_size,
+                    item.tolerance_font_size or item.font_size * 0.8,
+                )
+                occupied.append(
+                    moved_rect + (-padding, -padding, padding, padding)
+                )
+    return occupied
+
+
+def _rendered_ink_density(
+    image: Image.Image,
+    page_rect: fitz.Rect,
+    rect: fitz.Rect,
+    scale: float,
+) -> float:
+    x0 = max(
+        0,
+        int(math.floor((rect.x0 - page_rect.x0) * scale)),
+    )
+    y0 = max(
+        0,
+        int(math.floor((rect.y0 - page_rect.y0) * scale)),
+    )
+    x1 = min(
+        image.width,
+        int(math.ceil((rect.x1 - page_rect.x0) * scale)),
+    )
+    y1 = min(
+        image.height,
+        int(math.ceil((rect.y1 - page_rect.y0) * scale)),
+    )
+    if x1 <= x0 or y1 <= y0:
+        return 1.0
+    crop = image.crop((x0, y0, x1, y1))
+    histogram = crop.histogram()
+    dark = sum(histogram[:176])
+    return dark / max(1, crop.width * crop.height)
+
+
+def avoid_dimension_overlap(
+    page: fitz.Page,
+    mark: DimensionMark,
+    existing_items: Iterable[DrawingItem] = (),
+) -> DimensionMark:
+    """Move a new label to the nearest clear area when text would overlap."""
+
+    preferred = fitz.Point(mark.label)
+    preferred_rect = dimension_label_rect(mark)
+    step_x = max(16.0, preferred_rect.width * 0.58)
+    step_y = max(14.0, preferred_rect.height + 6.0)
+    offsets: list[tuple[float, float]] = [(0.0, 0.0)]
+    for ring in range(1, 6):
+        offsets.extend(
+            (
+                (0.0, -step_y * ring),
+                (0.0, step_y * ring),
+                (-step_x * ring, 0.0),
+                (step_x * ring, 0.0),
+                (-step_x * ring, -step_y * ring),
+                (step_x * ring, -step_y * ring),
+                (-step_x * ring, step_y * ring),
+                (step_x * ring, step_y * ring),
+            )
+        )
+    occupied = _dimension_occupied_rects(page, existing_items)
+    raster_scale = 1.5
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(raster_scale, raster_scale),
+        colorspace=fitz.csGRAY,
+        alpha=False,
+        annots=False,
+    )
+    grayscale = Image.frombytes(
+        "L",
+        (pixmap.width, pixmap.height),
+        pixmap.samples,
+    )
+    target = fitz.Point(mark.target)
+    page_margin = 3.0
+    best_mark = mark
+    best_score = math.inf
+    for offset_x, offset_y in offsets:
+        candidate_label = (
+            preferred.x + offset_x,
+            preferred.y + offset_y,
+        )
+        candidate = replace(mark, label=candidate_label)
+        label_rect = dimension_label_rect(candidate)
+        if (
+            label_rect.x0 < page.rect.x0 + page_margin
+            or label_rect.y0 < page.rect.y0 + page_margin
+            or label_rect.x1 > page.rect.x1 - page_margin
+            or label_rect.y1 > page.rect.y1 - page_margin
+        ):
+            continue
+        anchor = _leader_anchor(target, label_rect)
+        label_collisions = sum(
+            label_rect.intersects(rect)
+            for rect in occupied
+        )
+        leader_collisions = sum(
+            not rect.contains(target)
+            and _segment_intersects_rect(target, anchor, rect)
+            for rect in occupied
+        )
+        ink_density = _rendered_ink_density(
+            grayscale,
+            page.rect,
+            label_rect + (-2.0, -2.0, 2.0, 2.0),
+            raster_scale,
+        )
+        distance = math.hypot(offset_x, offset_y)
+        score = (
+            distance
+            + label_collisions * 10_000
+            + leader_collisions * 1_500
+            + ink_density * 8_000
+        )
+        if score < best_score:
+            best_score = score
+            best_mark = candidate
+        if (
+            label_collisions == 0
+            and leader_collisions == 0
+            and ink_density < 0.012
+        ):
+            return candidate
+    return best_mark
+
+
 def find_japanese_font() -> Path:
     windows = Path(os.environ.get("WINDIR", r"C:\Windows"))
     candidates = (
         windows / "Fonts" / "meiryo.ttc",
         windows / "Fonts" / "YuGothM.ttc",
         windows / "Fonts" / "msgothic.ttc",
+        windows / "Fonts" / "msmincho.ttc",
     )
     for candidate in candidates:
         if candidate.exists():
@@ -955,8 +2143,64 @@ def _pdf_font() -> fitz.Font:
     return fitz.Font(fontfile=str(find_japanese_font()))
 
 
+@lru_cache(maxsize=24)
+def _dimension_font_file(font_name: str) -> Path:
+    windows_fonts = Path(
+        os.environ.get("WINDIR", r"C:\Windows"),
+        "Fonts",
+    )
+    normalized = font_name.lower().replace(" ", "").replace("-", "")
+    if "mincho" in normalized or "明朝" in font_name:
+        candidates = ("msmincho.ttc", "YuMincho.ttc")
+    elif "gothic" in normalized or "ゴシック" in font_name:
+        candidates = ("msgothic.ttc", "YuGothM.ttc", "meiryo.ttc")
+    elif "meiryo" in normalized:
+        candidates = ("meiryo.ttc", "msgothic.ttc")
+    else:
+        candidates = ("msgothic.ttc", "YuGothM.ttc", "meiryo.ttc")
+    for file_name in candidates:
+        candidate = windows_fonts / file_name
+        if candidate.is_file():
+            return candidate
+    return find_japanese_font()
+
+
+def _dimension_font_index(font_name: str) -> int:
+    """Return the matching face index inside common Windows TTC files."""
+
+    normalized = font_name.lower().replace(" ", "").replace("-", "")
+    font_file = _dimension_font_file(font_name).name.lower()
+    if font_file == "msgothic.ttc":
+        if "pgothic" in normalized:
+            return 2
+        if "uigothic" in normalized:
+            return 1
+    if font_file == "msmincho.ttc" and "pmincho" in normalized:
+        return 1
+    if font_file == "meiryo.ttc" and "meiryoui" in normalized:
+        return 2
+    return 0
+
+
+@lru_cache(maxsize=64)
+def _dimension_pillow_font(
+    font_name: str,
+    pixel_size: int,
+) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(
+        str(_dimension_font_file(font_name)),
+        max(1, pixel_size),
+        index=_dimension_font_index(font_name),
+    )
+
+
 def dimension_label_rect(mark: DimensionMark) -> fitz.Rect:
-    width = _pdf_font().text_length(mark.text, fontsize=mark.font_size)
+    measurement_scale = 4.0
+    font = _dimension_pillow_font(
+        mark.font_name,
+        round(mark.font_size * measurement_scale),
+    )
+    width = font.getlength(mark.text) / measurement_scale
     return fitz.Rect(
         mark.label[0],
         mark.label[1],
@@ -965,6 +2209,65 @@ def dimension_label_rect(mark: DimensionMark) -> fitz.Rect:
     )
 
 
+def replacement_content_rect(mark: ReplacementMark) -> fitz.Rect:
+    """Return the visible replacement text bounds for direct manipulation."""
+
+    if mark.origin is None:
+        return fitz.Rect(mark.rect)
+    direction = fitz.Point(mark.direction)
+    length = math.hypot(direction.x, direction.y) or 1.0
+    direction /= length
+    normal = fitz.Point(-direction.y, direction.x)
+    font = _pdf_font()
+    nominal_size = max(5.0, mark.font_size)
+    tolerance_size = max(
+        4.0,
+        mark.tolerance_font_size
+        if mark.tolerance_font_size is not None
+        else nominal_size * 0.8,
+    )
+    base = fitz.Point(mark.origin)
+    nominal_origin = base + fitz.Point(mark.value_offset)
+    entries: list[tuple[fitz.Point, str, float]] = [
+        (nominal_origin, mark.value, nominal_size)
+    ]
+    if mark.upper_tolerance or mark.lower_tolerance:
+        tolerance_origin = (
+            base
+            + direction
+            * (font.text_length(mark.value, fontsize=nominal_size) + 0.5)
+            + fitz.Point(mark.tolerance_offset)
+        )
+        if mark.upper_tolerance:
+            entries.append(
+                (
+                    tolerance_origin - normal * tolerance_size,
+                    mark.upper_tolerance,
+                    tolerance_size,
+                )
+            )
+        if mark.lower_tolerance:
+            entries.append(
+                (tolerance_origin, mark.lower_tolerance, tolerance_size)
+            )
+    points: list[fitz.Point] = []
+    for origin, text, size in entries:
+        width = max(size * 0.5, font.text_length(text, fontsize=size))
+        points.extend(
+            origin + direction * x + normal * y
+            for x, y in (
+                (-2.0, -size * 1.15),
+                (width + 2.0, -size * 1.15),
+                (width + 2.0, size * 0.35),
+                (-2.0, size * 0.35),
+            )
+        )
+    return fitz.Rect(
+        min(point.x for point in points),
+        min(point.y for point in points),
+        max(point.x for point in points),
+        max(point.y for point in points),
+    )
 def _leader_anchor(target: fitz.Point, label_rect: fitz.Rect) -> fitz.Point:
     if target.x < label_rect.x0:
         return fitz.Point(label_rect.x0, label_rect.y0 + label_rect.height / 2)
@@ -975,49 +2278,87 @@ def _leader_anchor(target: fitz.Point, label_rect: fitz.Rect) -> fitz.Point:
     return fitz.Point(label_rect.x0 + label_rect.width / 2, label_rect.y1)
 
 
-def _draw_dimension(page: fitz.Page, mark: DimensionMark, font_file: Path) -> None:
+def _draw_dimension(page: fitz.Page, mark: DimensionMark, _font_file: Path) -> None:
     target = fitz.Point(mark.target)
     label_rect = dimension_label_rect(mark)
     anchor = _leader_anchor(target, label_rect)
     vector = anchor - target
     length = math.hypot(vector.x, vector.y)
-    if length > 0.1:
+    stroke_color = mark.font_color
+    line_width = max(0.18, min(1.2, mark.line_width))
+    if mark.show_leader and length > 0.1:
         unit = vector / length
         normal = fitz.Point(-unit.y, unit.x)
-        arrow_length = max(5.0, mark.font_size * 0.7)
-        arrow_width = max(2.0, mark.font_size * 0.25)
+        arrow_length = max(3.2, mark.font_size * 0.48)
+        arrow_width = max(1.2, mark.font_size * 0.16)
         base = target + unit * arrow_length
-        page.draw_line(base, anchor, color=(0, 0, 0), width=0.9, overlay=True)
+        page.draw_line(
+            base,
+            anchor,
+            color=stroke_color,
+            width=line_width,
+            overlay=True,
+        )
         page.draw_polyline(
             [target, base + normal * arrow_width, base - normal * arrow_width],
-            color=(0, 0, 0),
-            fill=(0, 0, 0),
-            width=0.6,
+            color=stroke_color,
+            fill=stroke_color,
+            width=max(0.18, line_width),
             closePath=True,
             overlay=True,
         )
 
+    # Clear any source line behind the label before applying the translucent
+    # marker color. This keeps both the dimension value and its leader legible.
     page.draw_rect(
         label_rect,
         color=None,
-        fill=hex_to_rgb(mark.color),
-        fill_opacity=max(0.05, min(1.0, mark.opacity)),
+        fill=(1, 1, 1),
         overlay=True,
     )
-    font = _pdf_font()
-    text_height = (font.ascender - font.descender) * mark.font_size
-    baseline = (
-        label_rect.y0
-        + (label_rect.height - text_height) / 2
-        + font.ascender * mark.font_size
+    if mark.opacity > 0:
+        page.draw_rect(
+            label_rect,
+            color=None,
+            fill=hex_to_rgb(mark.color),
+            fill_opacity=min(1.0, mark.opacity),
+            overlay=True,
+        )
+    # Render from the matching face inside Windows TTC collections. PyMuPDF
+    # otherwise always selects face 0 (for example MS Gothic instead of
+    # MS PGothic), which visibly changes CAD dimension spacing.
+    text_scale = 4.0
+    pixel_size = max(1, round(mark.font_size * text_scale))
+    text_font = _dimension_pillow_font(mark.font_name, pixel_size)
+    image_width = max(1, math.ceil(label_rect.width * text_scale))
+    image_height = max(1, math.ceil(label_rect.height * text_scale))
+    text_image = Image.new(
+        "RGBA",
+        (image_width, image_height),
+        (255, 255, 255, 0),
     )
-    page.insert_text(
-        (label_rect.x0 + 2.0, baseline),
+    text_draw = ImageDraw.Draw(text_image)
+    text_bbox = text_draw.textbbox((0, 0), mark.text, font=text_font)
+    text_y = (
+        (image_height - (text_bbox[3] - text_bbox[1])) / 2
+        - text_bbox[1]
+    )
+    text_draw.text(
+        (2.0 * text_scale, text_y),
         mark.text,
-        fontname="jpfont",
-        fontfile=str(font_file),
-        fontsize=mark.font_size,
-        color=(0, 0, 0),
+        font=text_font,
+        fill=tuple(
+            round(max(0.0, min(1.0, component)) * 255)
+            for component in stroke_color
+        )
+        + (255,),
+    )
+    text_stream = BytesIO()
+    text_image.save(text_stream, format="PNG")
+    page.insert_image(
+        label_rect,
+        stream=text_stream.getvalue(),
+        keep_proportion=False,
         overlay=True,
     )
 
@@ -1057,14 +2398,7 @@ def _draw_stamp(page: fitz.Page, mark: StampMark, font_file: Path) -> None:
     else:
         raise ValueError(f"Unsupported stamp kind: {mark.kind}")
 
-    center = fitz.Point(mark.center)
-    radius = mark.size / 2
-    rect = fitz.Rect(
-        center.x - radius,
-        center.y - radius,
-        center.x + radius,
-        center.y + radius,
-    )
+    rect = stamp_mark_rect(mark)
     first_y = rect.y0 + rect.height * 0.34
     second_y = rect.y0 + rect.height * 0.67
     page.draw_oval(rect, color=color, width=max(1.1, mark.size * 0.022), overlay=True)
@@ -1108,6 +2442,73 @@ def _draw_stamp(page: fitz.Page, mark: StampMark, font_file: Path) -> None:
     )
 
 
+def _draw_procedure_note(
+    page: fitz.Page,
+    mark: ProcedureNoteMark,
+    font_file: Path,
+) -> None:
+    """Draw one simple, readable note style from the in-app procedure."""
+
+    origin = fitz.Point(mark.origin)
+    font_size = max(6.0, min(24.0, mark.font_size))
+    font = fitz.Font(fontfile=str(font_file))
+    red = hex_to_rgb("#e31b23")
+    green = hex_to_rgb("#6ee76e")
+    black = (0.0, 0.0, 0.0)
+
+    def text_width(text: str, size: float = font_size) -> float:
+        return font.text_length(text, fontsize=size)
+
+    def insert_lines(
+        lines: list[str],
+        point: fitz.Point,
+        *,
+        color: tuple[float, float, float] = black,
+        size: float = font_size,
+    ) -> None:
+        line_height = size * 1.28
+        for index, line in enumerate(lines):
+            if not line:
+                continue
+            page.insert_text(
+                (point.x, point.y + size + index * line_height),
+                line,
+                fontname="jpfont",
+                fontfile=str(font_file),
+                fontsize=size,
+                color=color,
+                overlay=True,
+            )
+
+    lines = [line.strip() for line in mark.text.splitlines() if line.strip()]
+    if not lines:
+        return
+    if mark.kind == "phase":
+        label = lines[0]
+        width = text_width(label) + font_size * 1.3
+        height = font_size * 1.75
+        rect = fitz.Rect(origin.x, origin.y, origin.x + width, origin.y + height)
+        page.draw_rect(rect, color=red, width=max(1.0, font_size * 0.12), overlay=True)
+        insert_lines([label], origin + fitz.Point(font_size * 0.55, font_size * 0.10), color=red)
+        return
+    if mark.kind == "post_process":
+        content_width = max((text_width(line) for line in lines), default=0.0)
+        width = max(150.0, content_width + font_size * 1.2)
+        header_height = font_size * 2.0
+        body_height = max(font_size * 2.3, len(lines) * font_size * 1.3 + font_size)
+        outer = fitz.Rect(origin.x, origin.y, origin.x + width, origin.y + header_height + body_height)
+        header = fitz.Rect(origin.x, origin.y, origin.x + width, origin.y + header_height)
+        page.draw_rect(outer, color=black, width=max(1.0, font_size * 0.11), overlay=True)
+        page.draw_rect(header, color=black, fill=green, width=max(1.0, font_size * 0.11), overlay=True)
+        insert_lines(["後処理あり"], origin + fitz.Point(font_size * 0.55, font_size * 0.2), size=font_size * 1.08)
+        insert_lines(lines, fitz.Point(origin.x + font_size * 0.55, origin.y + header_height + font_size * 0.15), size=font_size * 0.90)
+        return
+    if mark.kind in {"confidential", "borrowed"}:
+        insert_lines(lines, origin, color=red)
+        return
+    insert_lines(lines, origin, color=black)
+
+
 def _insert_rotated_text(
     page: fitz.Page,
     origin: fitz.Point,
@@ -1117,22 +2518,124 @@ def _insert_rotated_text(
     font_file: Path,
     font_size: float,
     color: tuple[float, float, float] = (0, 0, 0),
+    halo_width: float = 0.0,
 ) -> None:
     if not text:
         return
     # PyMuPDF's morph matrix rotates counter to the page text direction.
     # Negating the PDF direction angle preserves vertical and oblique text.
     angle = -math.degrees(math.atan2(direction.y, direction.x))
+    insert_options = {}
+    if halo_width > 0:
+        # A narrow white outline keeps a drawing line from running through
+        # the glyphs without blanking a rectangular section of that line.
+        insert_options = {
+            "fill": color,
+            "color": (1, 1, 1),
+            "border_width": halo_width,
+            "render_mode": 2,
+        }
+    else:
+        insert_options = {"color": color}
+    # Built-in Helvetica renders compact Latin engineering notation more
+    # reliably than a TTC subfont (notably the ± glyph in rotated text).
+    latin_text = all(ord(character) <= 255 for character in text)
+    font_options = (
+        {"fontname": "helv"}
+        if latin_text
+        else {"fontname": "jpfont", "fontfile": str(font_file)}
+    )
     page.insert_text(
         origin,
         text,
-        fontname="jpfont",
-        fontfile=str(font_file),
         fontsize=font_size,
-        color=color,
         morph=(origin, fitz.Matrix(angle)),
         overlay=True,
+        **font_options,
+        **insert_options,
     )
+
+
+def _clip_line_to_rect(
+    start: fitz.Point,
+    end: fitz.Point,
+    rect: fitz.Rect,
+) -> tuple[fitz.Point, fitz.Point] | None:
+    """Return the portion of a line segment inside ``rect``."""
+
+    dx = end.x - start.x
+    dy = end.y - start.y
+    lower = 0.0
+    upper = 1.0
+    for coefficient, distance in (
+        (-dx, start.x - rect.x0),
+        (dx, rect.x1 - start.x),
+        (-dy, start.y - rect.y0),
+        (dy, rect.y1 - start.y),
+    ):
+        if abs(coefficient) < 1e-9:
+            if distance < 0:
+                return None
+            continue
+        ratio = distance / coefficient
+        if coefficient < 0:
+            lower = max(lower, ratio)
+        else:
+            upper = min(upper, ratio)
+        if lower > upper:
+            return None
+    return (
+        fitz.Point(start.x + lower * dx, start.y + lower * dy),
+        fitz.Point(start.x + upper * dx, start.y + upper * dy),
+    )
+
+
+def _whiteout_preserving_lines(
+    page: fitz.Page,
+    rect: fitz.Rect,
+) -> None:
+    """Clear source text while restoring thin vector dimension lines.
+
+    A PDF text replacement still needs to cover the old glyphs. Capturing the
+    thin source line segments first and drawing only their clipped portions
+    back prevents that whiteout from creating a visible gap in a dimension
+    line.
+    """
+
+    preserved: list[
+        tuple[fitz.Point, fitz.Point, tuple[float, ...], float]
+    ] = []
+    for drawing in page.get_drawings():
+        color = drawing.get("color")
+        width = float(drawing.get("width") or 0.0)
+        if color is None or width <= 0 or width > 1.25:
+            continue
+        for item in drawing.get("items", []):
+            if not item or item[0] != "l":
+                continue
+            clipped = _clip_line_to_rect(
+                fitz.Point(item[1]),
+                fitz.Point(item[2]),
+                rect,
+            )
+            if clipped is not None and math.dist(*clipped) > 0.05:
+                preserved.append(
+                    (clipped[0], clipped[1], tuple(color), width)
+                )
+    page.draw_rect(
+        rect,
+        color=None,
+        fill=(1, 1, 1),
+        overlay=True,
+    )
+    for start, end, color, width in preserved:
+        page.draw_line(
+            start,
+            end,
+            color=color,
+            width=width,
+            overlay=True,
+        )
 
 
 def _draw_replacement(
@@ -1143,12 +2646,7 @@ def _draw_replacement(
     rect = fitz.Rect(mark.rect) & page.rect
     if rect.is_empty:
         return
-    page.draw_rect(
-        rect,
-        color=None,
-        fill=(1, 1, 1),
-        overlay=True,
-    )
+    _whiteout_preserving_lines(page, rect)
 
     direction = fitz.Point(mark.direction)
     length = math.hypot(direction.x, direction.y) or 1.0
@@ -1167,22 +2665,44 @@ def _draw_replacement(
         fontfile=str(replacement_font_file)
     )
     nominal_size = max(5.0, mark.font_size)
-    small_size = max(4.0, nominal_size * 0.80)
+    small_size = max(
+        4.0,
+        min(
+            36.0,
+            mark.tolerance_font_size
+            if mark.tolerance_font_size is not None
+            else nominal_size * 0.80,
+        ),
+    )
+
+    def offset_point(
+        origin: fitz.Point,
+        offset: tuple[float, float],
+    ) -> fitz.Point:
+        return origin + fitz.Point(offset)
+
+    def render_text_entries(
+        entries: list[tuple[fitz.Point, str, float]],
+    ) -> None:
+        for origin, text, font_size in entries:
+            _insert_rotated_text(
+                page,
+                origin,
+                text,
+                direction=direction,
+                font_file=replacement_font_file,
+                font_size=font_size,
+                color=mark.font_color,
+                halo_width=0.025,
+            )
 
     if mark.origin is not None:
-        nominal_origin = fitz.Point(mark.origin)
-        _insert_rotated_text(
-            page,
-            nominal_origin,
-            mark.value,
-            direction=direction,
-            font_file=replacement_font_file,
-            font_size=nominal_size,
-            color=mark.font_color,
-        )
+        base_origin = fitz.Point(mark.origin)
+        nominal_origin = offset_point(base_origin, mark.value_offset)
+        entries = [(nominal_origin, mark.value, nominal_size)]
         if mark.upper_tolerance or mark.lower_tolerance:
-            tolerance_origin = (
-                nominal_origin
+            tolerance_origin = offset_point(
+                base_origin
                 + direction
                 * (
                     replacement_font.text_length(
@@ -1190,77 +2710,162 @@ def _draw_replacement(
                         fontsize=nominal_size,
                     )
                     + 0.5
-                )
+                ),
+                mark.tolerance_offset,
             )
             if mark.upper_tolerance:
-                _insert_rotated_text(
-                    page,
-                    tolerance_origin - normal * small_size,
-                    mark.upper_tolerance,
-                    direction=direction,
-                    font_file=replacement_font_file,
-                    font_size=small_size,
-                    color=mark.font_color,
+                entries.append(
+                    (
+                        tolerance_origin - normal * small_size,
+                        mark.upper_tolerance,
+                        small_size,
+                    )
                 )
             if mark.lower_tolerance:
-                _insert_rotated_text(
-                    page,
-                    tolerance_origin,
-                    mark.lower_tolerance,
-                    direction=direction,
-                    font_file=replacement_font_file,
-                    font_size=small_size,
-                    color=mark.font_color,
+                entries.append(
+                    (tolerance_origin, mark.lower_tolerance, small_size)
                 )
+        render_text_entries(entries)
         return
 
     along = _projection_interval(rect, (direction.x, direction.y))
     across = _projection_interval(rect, (normal.x, normal.y))
     font = _pdf_font()
     nominal_baseline = across[1] + font.descender * nominal_size
-    nominal_origin = (
+    base_origin = (
         direction * (along[0] + 1.0) + normal * nominal_baseline
     )
-    _insert_rotated_text(
-        page,
-        nominal_origin,
-        mark.value,
-        direction=direction,
-        font_file=replacement_font_file,
-        font_size=nominal_size,
-        color=mark.font_color,
-    )
+    nominal_origin = offset_point(base_origin, mark.value_offset)
+    entries = [(nominal_origin, mark.value, nominal_size)]
 
     if mark.upper_tolerance or mark.lower_tolerance:
         tolerance_along = (
-            along[0]
-            + 1.0
             + font.text_length(mark.value, fontsize=nominal_size)
             + 1.0
         )
         if mark.upper_tolerance:
             upper_baseline = across[0] + font.ascender * small_size
-            _insert_rotated_text(
-                page,
-                direction * tolerance_along + normal * upper_baseline,
-                mark.upper_tolerance,
-                direction=direction,
-                font_file=replacement_font_file,
-                font_size=small_size,
-                color=mark.font_color,
+            entries.append(
+                (
+                    offset_point(
+                        direction * (along[0] + 1.0 + tolerance_along)
+                        + normal * upper_baseline,
+                        mark.tolerance_offset,
+                    ),
+                    mark.upper_tolerance,
+                    small_size,
+                )
             )
         if mark.lower_tolerance:
             lower_baseline = across[1] + font.descender * small_size
+            entries.append(
+                (
+                    offset_point(
+                        direction * (along[0] + 1.0 + tolerance_along)
+                        + normal * lower_baseline,
+                        mark.tolerance_offset,
+                    ),
+                    mark.lower_tolerance,
+                    small_size,
+                )
+            )
+    render_text_entries(entries)
+
+
+def _draw_general_tolerance_batch(
+    page: fitz.Page,
+    mark: GeneralToleranceBatchMark,
+    font_file: Path,
+) -> None:
+    font = fitz.Font(fontfile=str(font_file))
+    for addition in mark.additions:
+        direction = fitz.Point(addition.direction)
+        length = math.hypot(direction.x, direction.y) or 1.0
+        direction /= length
+        origin = fitz.Point(addition.origin)
+        font_size = max(4.0, min(24.0, addition.font_size))
+        if addition.suffix_rect is not None:
+            suffix_rect = fitz.Rect(addition.suffix_rect) & page.rect
+            if not suffix_rect.is_empty:
+                _whiteout_preserving_lines(page, suffix_rect)
+        if addition.text.startswith("\u00b1"):
+            # PyMuPDF can retain ± in extraction while producing no visible
+            # glyph with some Windows TTC / subset combinations. Draw the
+            # compact engineering symbol as vectors, then render ASCII digits.
+            normal = fitz.Point(-direction.y, direction.x)
+            width = max(0.55, font_size * 0.055)
+            symbol_center = (
+                origin + direction * font_size * 0.27
+                - normal * font_size * 0.39
+            )
+            half = font_size * 0.20
+            page.draw_line(
+                symbol_center - direction * half,
+                symbol_center + direction * half,
+                color=(0, 0, 0),
+                width=width,
+                overlay=True,
+            )
+            page.draw_line(
+                symbol_center - normal * half,
+                symbol_center + normal * half,
+                color=(0, 0, 0),
+                width=width,
+                overlay=True,
+            )
+            minus_center = symbol_center + normal * font_size * 0.42
+            page.draw_line(
+                minus_center - direction * half,
+                minus_center + direction * half,
+                color=(0, 0, 0),
+                width=width,
+                overlay=True,
+            )
             _insert_rotated_text(
                 page,
-                direction * tolerance_along + normal * lower_baseline,
-                mark.lower_tolerance,
+                origin + direction * font_size * 0.62,
+                addition.text[1:],
                 direction=direction,
-                font_file=replacement_font_file,
-                font_size=small_size,
-                color=mark.font_color,
+                font_file=font_file,
+                font_size=font_size,
+                color=(0, 0, 0),
+                halo_width=0.0,
             )
-
+        else:
+            _insert_rotated_text(
+                page,
+                origin,
+                addition.text,
+                direction=direction,
+                font_file=font_file,
+                font_size=font_size,
+                color=(0, 0, 0),
+                halo_width=0.0,
+            )
+        if addition.suffix_text:
+            suffix_font_size = max(
+                font_size,
+                min(
+                    24.0,
+                    addition.suffix_font_size
+                    if addition.suffix_font_size is not None
+                    else font_size,
+                ),
+            )
+            suffix_origin = origin + direction * (
+                font.text_length(addition.text, fontsize=font_size)
+                + max(0.45, font_size * 0.07)
+            )
+            _insert_rotated_text(
+                page,
+                suffix_origin,
+                addition.suffix_text,
+                direction=direction,
+                font_file=font_file,
+                font_size=suffix_font_size,
+                color=(0, 0, 0),
+                halo_width=0.0,
+            )
 
 def _draw_geometric_symbol(
     page: fitz.Page,
@@ -1670,11 +3275,87 @@ def _draw_surface_finish(
         )
 
 
+def _point_in_polygon(
+    point: fitz.Point,
+    polygon: tuple[tuple[float, float], ...],
+) -> bool:
+    """Return whether a point is inside a page-space polygon."""
+
+    inside = False
+    previous = fitz.Point(polygon[-1])
+    for raw_point in polygon:
+        current = fitz.Point(raw_point)
+        if (current.y > point.y) != (previous.y > point.y):
+            crossing_x = (
+                (previous.x - current.x)
+                * (point.y - current.y)
+                / (previous.y - current.y)
+                + current.x
+            )
+            if point.x < crossing_x:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def _rect_intersects_polygon(
+    rect: fitz.Rect,
+    polygon: tuple[tuple[float, float], ...],
+) -> bool:
+    if len(polygon) < 3:
+        return False
+    polygon_rect = fitz.Rect(
+        min(point[0] for point in polygon),
+        min(point[1] for point in polygon),
+        max(point[0] for point in polygon),
+        max(point[1] for point in polygon),
+    )
+    if (rect & polygon_rect).is_empty:
+        return False
+    rect_corners = (
+        fitz.Point(rect.x0, rect.y0),
+        fitz.Point(rect.x1, rect.y0),
+        fitz.Point(rect.x1, rect.y1),
+        fitz.Point(rect.x0, rect.y1),
+    )
+    if any(_point_in_polygon(corner, polygon) for corner in rect_corners):
+        return True
+    if any(fitz.Point(point) in rect for point in polygon):
+        return True
+    previous = fitz.Point(polygon[-1])
+    for raw_point in polygon:
+        current = fitz.Point(raw_point)
+        if _segment_intersects_rect(previous, current, rect):
+            return True
+        previous = current
+    return False
+
+
+def _needs_white_separation_border(
+    rect: fitz.Rect,
+    work_fill_items: Iterable[DrawingItem],
+) -> bool:
+    """Only separate markers that actually cross a product fill."""
+
+    for fill_item in work_fill_items:
+        if isinstance(fill_item, WorkShapeMark) and fill_item.style != "line":
+            if _rect_intersects_polygon(rect, fill_item.points):
+                return True
+        elif isinstance(fill_item, WorkRegionMark):
+            if any(
+                _rect_intersects_polygon(rect, region)
+                for region in fill_item.regions
+            ):
+                return True
+    return False
+
+
 def apply_item_to_page(
     page: fitz.Page,
     item: DrawingItem,
     *,
     font_file: Path | None = None,
+    work_fill_items: Iterable[DrawingItem] = (),
 ) -> None:
     """Apply one drawing item to a page.
 
@@ -1684,6 +3365,39 @@ def apply_item_to_page(
 
     if font_file is None:
         font_file = find_japanese_font()
+
+    def annotation_point(
+        point: tuple[float, float] | fitz.Point,
+    ) -> fitz.Point:
+        """Convert a visible-page point to annotation coordinates.
+
+        PyMuPDF reports ``page.rect`` in the page's displayed orientation,
+        while annotation constructors expect coordinates for the unrotated
+        page.  Without this conversion, markers on 90 / 180 / 270 degree
+        PDFs are written to a different visible location.
+        """
+
+        value = fitz.Point(point)
+        if page.rotation:
+            value *= page.derotation_matrix
+        return value
+
+    def annotation_rect(rect: fitz.Rect) -> fitz.Rect:
+        """Convert a visible-page rectangle to annotation coordinates."""
+
+        corners = (
+            (rect.x0, rect.y0),
+            (rect.x1, rect.y0),
+            (rect.x1, rect.y1),
+            (rect.x0, rect.y1),
+        )
+        converted = [annotation_point(point) for point in corners]
+        return fitz.Rect(
+            min(point.x for point in converted),
+            min(point.y for point in converted),
+            max(point.x for point in converted),
+            max(point.y for point in converted),
+        )
 
     def finalize_fill_annotation(
         annotation: fitz.Annot,
@@ -1717,14 +3431,42 @@ def apply_item_to_page(
             "[0 0 0]",
         )
 
+    def add_white_separation_border(
+        rect: fitz.Rect,
+        quad: tuple[tuple[float, float], ...] | None,
+    ) -> None:
+        """Separate a dimension marker from a workpiece fill.
+
+        Product regions are deliberately rendered first.  A normal-blended
+        white stroke then cuts a narrow, clean gap around every dimension
+        marker without hiding the source glyphs inside the marker.
+        """
+
+        if quad:
+            annotation = page.add_polygon_annot(
+                [annotation_point(point) for point in quad]
+            )
+        else:
+            annotation = page.add_rect_annot(annotation_rect(rect))
+        annotation.set_border(width=1.65)
+        annotation.set_colors(stroke=(1.0, 1.0, 1.0), fill=None)
+        annotation.set_opacity(1.0)
+        annotation.set_blendmode("Normal")
+        annotation.update()
+
     if isinstance(item, Mark):
         rect = fitz.Rect(item.rect) & page.rect
         if not rect.is_empty and rect.get_area() > 0:
+            if _needs_white_separation_border(rect, work_fill_items):
+                add_white_separation_border(rect, item.quad)
             if item.quad:
-                points = [fitz.Point(point) for point in item.quad]
+                points = [
+                    annotation_point(point)
+                    for point in item.quad
+                ]
                 annotation = page.add_polygon_annot(points)
             else:
-                annotation = page.add_rect_annot(rect)
+                annotation = page.add_rect_annot(annotation_rect(rect))
             finalize_fill_annotation(
                 annotation,
                 item.color,
@@ -1746,14 +3488,66 @@ def apply_item_to_page(
         _draw_dimension(page, item, font_file)
     elif isinstance(item, StampMark):
         _draw_stamp(page, item, font_file)
+    elif isinstance(item, ProcedureNoteMark):
+        _draw_procedure_note(page, item, font_file)
     elif isinstance(item, ReplacementMark):
         _draw_replacement(page, item, font_file)
+    elif isinstance(item, GeneralToleranceBatchMark):
+        if page.rotation:
+            converted_additions: list[ToleranceAddition] = []
+            for addition in item.additions:
+                visible_origin = fitz.Point(addition.origin)
+                visible_end = visible_origin + fitz.Point(addition.direction)
+                origin = visible_origin * page.derotation_matrix
+                end = visible_end * page.derotation_matrix
+                direction = end - origin
+                direction /= math.hypot(direction.x, direction.y) or 1.0
+                suffix_rect = (
+                    tuple(annotation_rect(fitz.Rect(addition.suffix_rect)))
+                    if addition.suffix_rect is not None
+                    else None
+                )
+                converted_additions.append(
+                    replace(
+                        addition,
+                        origin=(origin.x, origin.y),
+                        direction=(direction.x, direction.y),
+                        suffix_rect=suffix_rect,
+                    )
+                )
+            _draw_general_tolerance_batch(
+                page,
+                GeneralToleranceBatchMark(
+                    item.page_index, tuple(converted_additions)
+                ),
+                font_file,
+            )
+        else:
+            _draw_general_tolerance_batch(page, item, font_file)
+    elif isinstance(item, DimensionMarkingBatch):
+        for entry in item.entries:
+            rect = fitz.Rect(entry.rect) & page.rect
+            if rect.is_empty or rect.get_area() <= 0:
+                continue
+            if _needs_white_separation_border(rect, work_fill_items):
+                add_white_separation_border(rect, entry.quad)
+            if entry.quad:
+                annotation = page.add_polygon_annot(
+                    [annotation_point(point) for point in entry.quad]
+                )
+            else:
+                annotation = page.add_rect_annot(annotation_rect(rect))
+            finalize_fill_annotation(
+                annotation,
+                entry.color,
+                entry.opacity,
+            )
     elif isinstance(item, GeometricToleranceMark):
         _draw_geometric_tolerance(page, item, font_file)
     elif isinstance(item, SurfaceFinishMark):
         _draw_surface_finish(page, item, font_file)
     elif isinstance(item, WorkShapeMark):
-        points = [fitz.Point(point) for point in item.points]
+        points = [annotation_point(point) for point in item.points]
         if item.style == "line":
             if len(points) >= 2:
                 annotation = page.add_polyline_annot(points)
@@ -1771,7 +3565,7 @@ def apply_item_to_page(
             )
     elif isinstance(item, WorkRegionMark):
         for region in item.regions:
-            points = [fitz.Point(point) for point in region]
+            points = [annotation_point(point) for point in region]
             if len(points) < 3:
                 continue
             annotation = page.add_polygon_annot(points)
@@ -1785,7 +3579,7 @@ def apply_item_to_page(
             rect = fitz.Rect(area) & page.rect
             if rect.is_empty or rect.get_area() <= 0:
                 continue
-            annotation = page.add_rect_annot(rect)
+            annotation = page.add_rect_annot(annotation_rect(rect))
             finalize_fill_annotation(
                 annotation,
                 item.color,
@@ -1793,6 +3587,25 @@ def apply_item_to_page(
             )
     else:
         raise TypeError(f"Unsupported drawing item: {type(item)!r}")
+
+
+def _items_in_visual_order(
+    items: Iterable[DrawingItem],
+    page_index: int,
+) -> list[DrawingItem]:
+    """Render product fills below dimensions regardless of operation order."""
+
+    page_items = [item for item in items if item.page_index == page_index]
+    fills: list[DrawingItem] = []
+    foreground: list[DrawingItem] = []
+    for item in page_items:
+        if isinstance(item, WorkRegionMark) or (
+            isinstance(item, WorkShapeMark) and item.style != "line"
+        ):
+            fills.append(item)
+        else:
+            foreground.append(item)
+    return fills + foreground
 
 
 def render_page_preview(
@@ -1809,9 +3622,20 @@ def render_page_preview(
         preview.insert_pdf(document, from_page=page_index, to_page=page_index)
         preview_page = preview[0]
         font_file = find_japanese_font()
-        for item in items:
-            if item.page_index == page_index:
-                apply_item_to_page(preview_page, item, font_file=font_file)
+        ordered_items = _items_in_visual_order(items, page_index)
+        work_fill_items = tuple(
+            item
+            for item in ordered_items
+            if isinstance(item, WorkRegionMark)
+            or (isinstance(item, WorkShapeMark) and item.style != "line")
+        )
+        for item in ordered_items:
+            apply_item_to_page(
+                preview_page,
+                item,
+                font_file=font_file,
+                work_fill_items=work_fill_items,
+            )
         pixmap = preview_page.get_pixmap(
             matrix=fitz.Matrix(zoom, zoom),
             alpha=False,
@@ -1837,11 +3661,26 @@ def export_pdf(
     document = fitz.open(source)
     font_file = find_japanese_font()
     try:
-        for item in items:
+        all_items = list(items)
+        for item in all_items:
             if not 0 <= item.page_index < document.page_count:
                 raise IndexError(f"Invalid page index: {item.page_index}")
-            page = document[item.page_index]
-            apply_item_to_page(page, item, font_file=font_file)
+        for page_index in range(document.page_count):
+            page = document[page_index]
+            ordered_items = _items_in_visual_order(all_items, page_index)
+            work_fill_items = tuple(
+                item
+                for item in ordered_items
+                if isinstance(item, WorkRegionMark)
+                or (isinstance(item, WorkShapeMark) and item.style != "line")
+            )
+            for item in ordered_items:
+                apply_item_to_page(
+                    page,
+                    item,
+                    font_file=font_file,
+                    work_fill_items=work_fill_items,
+                )
 
         output.parent.mkdir(parents=True, exist_ok=True)
         document.save(output, garbage=4, deflate=True)

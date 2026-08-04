@@ -4,11 +4,21 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# PyInstaller
+# Build artifacts
 build/
 dist/
-*.spec
-
-# Generated files
 tmp/
 output/
+
+# PyInstaller
+*.spec
+
+# Generated icon
+assets/app_icon.ico
+
+# Logs and reports
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini

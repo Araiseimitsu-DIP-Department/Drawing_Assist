@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>図面寸法ハイライト</title>
+  <title>加工図面作成支援ツール</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -13,7 +13,7 @@
       <div class="brand">
         <div class="brand-mark">DA</div>
         <div>
-          <strong>図面アシスト</strong>
+          <strong>加工図面作成支援ツール</strong>
           <span>寸法チェック・追記</span>
         </div>
       </div>
@@ -35,47 +35,73 @@
 
       <div class="top-actions">
         <button id="undoButton" class="soft-button" type="button" title="直前の追加を取り消します">↶ 取り消し</button>
-        <button id="clearPageButton" class="soft-button danger-text" type="button" title="現在ページの追加内容だけを消します">ページをクリア</button>
         <button id="saveButton" class="save-button" type="button">別名で保存</button>
+        <details class="top-more-menu">
+          <summary title="その他の操作">•••</summary>
+          <div>
+            <button id="clearPageButton" class="menu-button danger-text" type="button" title="現在ページの追加内容だけを消します">このページの追加を消す</button>
+          </div>
+        </details>
       </div>
     </header>
 
     <main class="workspace">
       <aside class="tool-panel">
         <div class="panel-heading">
-          <span>ツール</span>
-          <small>使う機能を選択</small>
+          <span><b>1</b> 作業を選ぶ</span>
+          <small>よく使う作業</small>
         </div>
 
-        <button class="tool-card active" data-mode="word" type="button">
+        <button class="tool-card active flow-tool" data-flow-step="1" data-mode="general_tolerance" type="button">
+          <span class="tool-icon tolerance-icon">±</span>
+          <span><strong>公差をまとめて入れる</strong><small>対象を検出して一括反映</small></span>
+        </button>
+        <details class="dimension-fix-tools">
+          <summary><b>2</b><span><strong>必要な寸法を整える</strong><small id="dimensionFixStatus">公差反映後に行います</small></span><i>⌄</i></summary>
+          <p>必要な場合だけ修正し、完了したら色分けへ進みます。</p>
+          <button class="tool-card compact" data-mode="dimension" type="button">
+            <span class="tool-icon dimension-icon"></span>
+            <span><strong>寸法と矢印を追加</strong><small>追加・移動・矢先調整</small></span>
+          </button>
+          <button class="tool-card compact" data-mode="replace" type="button">
+            <span class="tool-icon replace-icon">12<span>→</span>15</span>
+            <span><strong>必要な寸法を書き直す</strong><small>元の寸法を選んで入力</small></span>
+          </button>
+          <button class="tool-card compact" data-mode="strike" type="button">
+            <span class="tool-icon strike-icon"></span>
+            <span><strong>二重線で消す</strong><small>寸法をクリック</small></span>
+          </button>
+        </details>
+        <button class="tool-card flow-tool" data-flow-step="3" data-mode="word" type="button">
           <span class="tool-icon marker-icon"></span>
-          <span><strong>文字・記号をマーク</strong><small>クリック／ドラッグ</small></span>
+          <span><strong>寸法・公差を色分けする</strong><small>一括色分けして手動調整</small></span>
         </button>
-        <button class="tool-card" data-mode="work_shape" type="button">
+        <button class="tool-card flow-tool" data-flow-step="4" data-mode="work_shape" type="button">
           <span class="tool-icon work-shape-icon"></span>
-          <span><strong>ワーク形状をマーク</strong><small>内部クリック／手動指定</small></span>
+          <span><strong>製品部分を塗る</strong><small>断面・加工部の範囲を選択</small></span>
         </button>
-        <button class="tool-card" data-mode="replace" type="button">
-          <span class="tool-icon replace-icon">12<span>→</span>15</span>
-          <span><strong>寸法値を修正</strong><small>値・公差を置き換え</small></span>
-        </button>
-        <button class="tool-card" data-mode="strike" type="button">
-          <span class="tool-icon strike-icon"></span>
-          <span><strong>二重取消線</strong><small>寸法をクリック</small></span>
-        </button>
-        <button class="tool-card" data-mode="dimension" type="button">
-          <span class="tool-icon dimension-icon"></span>
-          <span><strong>寸法・引出線</strong><small>矢先から文字へドラッグ</small></span>
-        </button>
-        <div class="tool-separator"><span>スタンプ</span></div>
-        <button class="tool-card stamp-card quality" data-mode="quality_stamp" type="button">
-          <span class="stamp-preview red">品質<br>保証</span>
-          <span><strong>品質保証印</strong><small>配置場所をクリック</small></span>
-        </button>
-        <button class="tool-card stamp-card process" data-mode="process_stamp" type="button">
-          <span class="stamp-preview blue">加工<br>図</span>
-          <span><strong>加工図印</strong><small>配置場所をクリック</small></span>
-        </button>
+        <details class="more-tools">
+          <summary><span><strong>その他の機能</strong><small>印・注記・測定記号</small></span><i>⌄</i></summary>
+          <details class="workflow-stamps">
+            <summary><strong>印・必要な注記を入れる</strong><small>印または注記を選択</small></summary>
+            <button class="tool-card compact stamp-card quality" data-mode="quality_stamp" type="button">
+              <span class="stamp-preview red">品質<br>保証</span>
+              <span><strong>品質保証印</strong><small>置く場所をクリック</small></span>
+            </button>
+            <button class="tool-card compact stamp-card process" data-mode="process_stamp" type="button">
+              <span class="stamp-preview blue">加工<br>図</span>
+              <span><strong>加工図印</strong><small>置く場所をクリック</small></span>
+            </button>
+            <button class="tool-card compact" data-mode="procedure_note" type="button">
+              <span class="tool-icon note-tool-icon">注</span>
+              <span><strong>必要な注記</strong><small>種類を選んで配置</small></span>
+            </button>
+          </details>
+          <button class="tool-card compact" data-mode="measurement" type="button">
+            <span class="tool-icon measurement-icon">①</span>
+            <span><strong>測定具・測定順を入れる</strong><small>記号または番号を配置</small></span>
+          </button>
+        </details>
 
         <div class="source-note">
           <span class="note-icon">i</span>
@@ -84,10 +110,23 @@
       </aside>
 
       <section class="viewer">
+        <div id="canvasCoach" class="canvas-coach hidden" aria-live="polite">
+          <span id="canvasCoachStep">2</span>
+          <strong id="canvasCoachText">図面の塗りたい文字をクリック</strong>
+        </div>
+
         <div id="dropOverlay" class="drop-overlay">
           <div class="drop-symbol">↓</div>
           <strong>ここにPDFをドロップ</strong>
           <span>ファイルを離すと開きます</span>
+        </div>
+
+        <div id="processingOverlay" class="processing-overlay" aria-live="assertive" aria-busy="true">
+          <div class="processing-card">
+            <span class="processing-spinner" aria-hidden="true"></span>
+            <strong id="processingTitle">処理しています</strong>
+            <span id="processingDetail">しばらくお待ちください</span>
+          </div>
         </div>
 
         <div id="emptyState" class="empty-state">
@@ -108,6 +147,32 @@
           </div>
         </div>
 
+        <div
+          id="wordCandidateBar"
+          class="candidate-confirm-bar hidden"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="wordCandidateTitle"
+          tabindex="-1"
+        >
+          <span class="candidate-step" aria-hidden="true">確認</span>
+          <div class="candidate-confirm-message">
+            <strong id="wordCandidateTitle">色の付いた範囲でよろしいですか？</strong>
+            <span id="wordCandidateOrientation">寸法値の向きに合わせてマーキングします</span>
+          </div>
+          <div class="candidate-confirm-actions">
+            <button id="cancelWordCandidateButton" class="soft-button" type="button">
+              やり直す
+            </button>
+            <button id="confirmWordCandidateButton" class="save-button" type="button">
+              マークを確定
+            </button>
+          </div>
+          <span class="candidate-shortcuts" aria-hidden="true">Esc：やり直す　Enter：確定</span>
+        </div>
+
+        <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
         <div class="viewer-footer">
           <div id="statusMessage" class="status-message">
             <span class="status-dot"></span>
@@ -115,7 +180,7 @@
           </div>
           <div class="zoom-control">
             <button id="zoomOutButton" class="mini-button" type="button">−</button>
-            <input id="zoomRange" type="range" min="60" max="220" step="10" value="100" aria-label="ズーム">
+            <input id="zoomRange" type="range" min="60" max="500" step="10" value="100" aria-label="ズーム">
             <span id="zoomLabel">100%</span>
             <button id="zoomInButton" class="mini-button" type="button">＋</button>
           </div>
@@ -124,81 +189,136 @@
 
       <aside class="settings-panel">
         <div class="panel-heading">
-          <span>設定</span>
-          <small id="settingsToolName">文字・記号をマーク</small>
+          <span><b>2</b> 設定と操作</span>
+          <small id="settingsToolName">公差をまとめて入れる</small>
         </div>
 
-        <section class="setting-group color-setting" data-for="word work_shape dimension">
-          <label>マーカーカラー</label>
-          <div id="colorSwatches" class="color-swatches">
-            <button class="swatch selected" data-color="#fff24d" style="--swatch:#fff24d" title="黄色" type="button"></button>
-            <button class="swatch" data-color="#ff76bf" style="--swatch:#ff76bf" title="桃色" type="button"></button>
-            <button class="swatch" data-color="#5ee7f2" style="--swatch:#5ee7f2" title="水色" type="button"></button>
-            <button class="swatch" data-color="#72df78" style="--swatch:#72df78" title="緑色" type="button"></button>
-            <button class="swatch" data-color="#ffb347" style="--swatch:#ffb347" title="橙色" type="button"></button>
-            <button class="swatch" data-color="#ff6961" style="--swatch:#ff6961" title="赤色" type="button"></button>
-            <label class="custom-color" title="その他の色">
-              <input id="customColor" type="color" value="#fff24d">
-              <span>＋</span>
-            </label>
-          </div>
+        <section id="taskGuide" class="task-guide">
+          <div class="task-guide-heading"><span id="taskStep">2</span><small>次の操作</small></div>
+          <strong id="taskTitle">規格を選んで対象を検出</strong>
+          <p id="modeHelp">規格を選び、候補を確認してから一括反映します。</p>
         </section>
 
-        <section class="setting-group" data-for="word work_shape dimension">
-          <div class="setting-row">
-            <label for="opacityRange">濃さ</label>
-            <output id="opacityValue">42%</output>
-          </div>
-          <input id="opacityRange" class="wide-range" type="range" min="10" max="85" value="42">
-          <div class="range-hints"><span>薄い</span><span>濃い</span></div>
-          <p class="setting-tip">乗算合成により、黒い文字をくっきり保ちながら背景をマーキングします。</p>
-        </section>
-
-        <section class="setting-group hidden" data-for="word">
-          <label for="markMethod">ドラッグ方法</label>
-          <select id="markMethod" class="text-input">
-            <option value="box">範囲を囲んでマーク</option>
-            <option value="angled">斜め文字に沿ってマーク</option>
-          </select>
-          <div class="unified-highlight-guide">
-            <strong>クリック</strong>
-            <span>寸法値や文字を自動選択</span>
-            <strong>ドラッグ</strong>
-            <span>選択した方法で文字・記号・任意範囲をマーク</span>
-          </div>
-          <div id="angledWidthGroup" class="hidden">
-            <label for="highlightWidth" class="sub-label">マーカー幅</label>
-            <div class="number-field">
-              <input id="highlightWidth" type="number" min="3" max="40" step="0.5" value="11">
-              <span>pt</span>
+        <section class="setting-group hidden marking-flow-panel" data-for="word">
+          <h3 class="setting-title">一括色分け</h3>
+          <button id="applyDimensionMarkingsButton" class="soft-button wide-button marking-button" type="button" disabled>
+            寸法・公差を一括で色分け
+          </button>
+          <p id="dimensionMarkingHint" class="setting-tip">
+            先に「公差をまとめて入れる」で公差を反映してください。
+          </p>
+          <p class="compact-guidance">一括処理後は、図面上の文字をクリックして修正できます。選べない場合はドラッグで囲みます。</p>
+          <details class="advanced-details compact-details">
+            <summary>色分け基準を確認</summary>
+            <div class="marking-rule-card">
+              <span><i class="rule-color pink"></i>ピンク：公差レンジ0.03以内／角度1°以内</span>
+              <span><i class="rule-color yellow"></i>黄色：上記を超える寸法・角度</span>
+              <small>括弧寸法は黄色です。その他は色を選び、手動で追加できます。</small>
             </div>
-            <p class="setting-tip">斜め文字の左端から右端へ、文字と平行にドラッグしてください。</p>
-          </div>
-          <p class="setting-tip">詳細部は橙色を選び、詳細名称と図面上の対応箇所をそれぞれマーキングしてください。</p>
+          </details>
         </section>
 
-        <section class="setting-group hidden" data-for="work_shape">
-          <label for="workShapeStyle">マーキング方法</label>
-          <select id="workShapeStyle" class="text-input">
-            <option value="auto">半自動（内部をクリック）</option>
-            <option value="fill">面を囲んでマーク</option>
-            <option value="line">実線を点でなぞってマーク</option>
-          </select>
-          <div id="autoWorkControls">
-            <div class="auto-operation-buttons">
-              <button id="autoWorkReplaceButton" class="choice-button active" type="button">選び直す</button>
-              <button id="autoWorkAddButton" class="choice-button" type="button">範囲を追加</button>
-              <button id="autoWorkRemoveButton" class="choice-button" type="button">範囲を除外</button>
+        <details class="advanced-details" data-for="word work_shape dimension">
+          <summary><span class="summary-color"></span>色・濃さを変える</summary>
+          <section class="setting-group color-setting">
+            <label>マーカーカラー</label>
+            <div id="colorSwatches" class="color-swatches">
+              <button class="swatch selected" data-color="#fff24d" style="--swatch:#fff24d" title="黄色" aria-label="黄色" type="button"></button>
+              <button class="swatch" data-color="#ff76bf" style="--swatch:#ff76bf" title="ピンク" aria-label="ピンク" type="button"></button>
+              <button class="swatch" data-color="#5ee7f2" style="--swatch:#5ee7f2" title="水色" aria-label="水色" type="button"></button>
+              <button class="swatch" data-color="#72df78" style="--swatch:#72df78" title="緑色" aria-label="緑色" type="button"></button>
+              <button class="swatch" data-color="#ffb347" style="--swatch:#ffb347" title="橙色" aria-label="橙色" type="button"></button>
+              <button class="swatch" data-color="#ff6961" style="--swatch:#ff6961" title="赤色" aria-label="赤色" type="button"></button>
+              <label class="custom-color" title="その他の色">
+                <input id="customColor" type="color" value="#fff24d" aria-label="その他の色">
+                <span>＋</span>
+              </label>
+            </div>
+          </section>
+          <section class="setting-group">
+            <div class="setting-row">
+              <label for="opacityRange">濃さ</label>
+              <output id="opacityValue">42%</output>
+            </div>
+            <input id="opacityRange" class="wide-range" type="range" min="10" max="85" value="42">
+            <div class="range-hints"><span>薄い</span><span>濃い</span></div>
+          </section>
+        </details>
+
+        <details class="advanced-details hidden" data-for="word">
+          <summary>うまく選べないとき</summary>
+          <section class="setting-group">
+            <label for="markMethod">ドラッグで選ぶ方法</label>
+            <select id="markMethod" class="text-input">
+              <option value="box">四角く囲む</option>
+              <option value="angled">斜め文字をなぞる</option>
+            </select>
+            <div class="unified-highlight-guide">
+              <strong>ふつう</strong>
+              <span>文字・記号をクリック</span>
+              <strong>選べない</strong>
+              <span>必要な範囲をドラッグ</span>
+            </div>
+            <div id="angledWidthGroup" class="hidden">
+              <label for="highlightWidth" class="sub-label">マーカー幅</label>
+              <div class="number-field">
+                <input id="highlightWidth" type="number" min="3" max="40" step="0.5" value="11">
+                <span>pt</span>
+              </div>
+              <p class="setting-tip">斜め文字の左端から右端へ、文字と平行にドラッグします。</p>
+            </div>
+            <p class="setting-tip">詳細部は橙色を選び、詳細名称と図面上の対応箇所をそれぞれマークできます。</p>
+          </section>
+        </details>
+
+        <section class="setting-group hidden work-guide-panel" data-for="work_shape">
+          <details class="advanced-details inline-details">
+            <summary>別の選び方に変える</summary>
+            <label for="workShapeStyle">選び方</label>
+            <select id="workShapeStyle" class="text-input">
+              <option value="guided">おすすめ：角をクリックして予測</option>
+              <option value="auto">内部を1回クリック</option>
+              <option value="fill">面を手動で囲む</option>
+              <option value="line">実線を点でなぞる</option>
+            </select>
+          </details>
+          <div id="guidedWorkControls">
+            <div class="guided-work-intro">
+              <strong>1</strong>
+              <span>外形の角を、ぐるっと順番にクリック</span>
+              <strong>2</strong>
+              <span>3点以上で「形を予測する」を押す</span>
             </div>
             <div class="selection-progress">
-              <span>候補範囲</span>
+              <span>クリックした点</span>
+              <output id="guidedWorkPointCount">0 / 32点</output>
+            </div>
+            <div class="guided-work-actions">
+              <button id="removeGuidedPointButton" class="soft-button" type="button" disabled>1つ戻す</button>
+              <button id="resetGuidedPointsButton" class="soft-button" type="button" disabled>全部やり直す</button>
+              <button id="predictWorkShapeButton" class="save-button primary-next" type="button" disabled>形を予測する</button>
+            </div>
+          </div>
+          <div id="autoWorkControls" class="hidden">
+            <div id="workCorrectionGuide" class="correction-guide hidden">
+              色の付いた形を確認します。直す必要がなければ、そのまま確定してください。
+            </div>
+            <div class="selection-progress">
+              <span>いまの候補</span>
               <output id="autoWorkCandidateCount">未選択</output>
             </div>
-            <div class="auto-work-actions">
-              <button id="cancelAutoWorkButton" class="soft-button" type="button" disabled>候補を解除</button>
-              <button id="confirmAutoWorkButton" class="save-button" type="button" disabled>候補を確定</button>
-            </div>
-            <p class="setting-tip">ワーク内部をクリックすると閉じた外形を候補表示します。黄色い候補を確認してから確定してください。検出できない場合は手動方式へ切り替えます。</p>
+            <button id="confirmAutoWorkButton" class="save-button primary-next wide-button" type="button" disabled>この形で確定する</button>
+            <details class="advanced-details correction-details">
+              <summary>形を少し直す</summary>
+              <div class="auto-operation-buttons">
+                <button id="autoWorkReplaceButton" class="choice-button active" type="button">選び直す</button>
+                <button id="autoWorkAddButton" class="choice-button" type="button">不足を追加</button>
+                <button id="autoWorkRemoveButton" class="choice-button" type="button">不要を除外</button>
+              </div>
+              <div class="auto-work-actions">
+                <button id="cancelAutoWorkButton" class="soft-button" type="button" disabled>最初から</button>
+              </div>
+            </details>
           </div>
           <div id="manualWorkControls" class="hidden">
             <div id="workLineWidthGroup" class="hidden">
@@ -209,30 +329,42 @@
               </div>
             </div>
             <div class="selection-progress">
-              <span>指定点</span>
+              <span>クリックした点</span>
               <output id="workPointCount">0点</output>
             </div>
             <div class="work-shape-actions">
-              <button id="removeWorkPointButton" class="soft-button" type="button" disabled>1点戻す</button>
-              <button id="cancelWorkShapeButton" class="soft-button" type="button" disabled>選択解除</button>
-              <button id="finishWorkShapeButton" class="save-button" type="button" disabled>この形状をマーク</button>
+              <button id="removeWorkPointButton" class="soft-button" type="button" disabled>1つ戻す</button>
+              <button id="cancelWorkShapeButton" class="soft-button" type="button" disabled>全部やり直す</button>
+              <button id="finishWorkShapeButton" class="save-button primary-next" type="button" disabled>この形で確定する</button>
             </div>
-            <p class="setting-tip">ワークの角や曲線上を順番にクリックします。面は3点以上、実線は2点以上を指定してから確定してください。</p>
           </div>
         </section>
 
         <section class="setting-group hidden" data-for="dimension">
           <label for="dimensionText">追加する寸法値</label>
           <input id="dimensionText" class="text-input" type="text" value="R0.1以下" maxlength="80">
-          <label for="fontSize" class="sub-label">文字サイズ</label>
-          <div class="number-field">
-            <input id="fontSize" type="number" min="5" max="36" step="0.5" value="10">
-            <span>pt</span>
-          </div>
+          <label class="auto-style-card">
+            <input id="dimensionShowLeader" type="checkbox" checked>
+            <span><strong>矢印を付ける</strong><small>φ12・φ16など文字だけの場合は外します</small></span>
+          </label>
+          <label class="auto-style-card">
+            <input id="dimensionAutoStyle" type="checkbox" checked>
+            <span>
+              <strong>原図の書式に自動で合わせる</strong>
+              <small id="dimensionStyleStatus">フォント・文字サイズ・線の太さを判定します</small>
+            </span>
+          </label>
           <div class="gesture-guide">
             <span class="guide-dot"></span><span class="guide-line"></span><span class="guide-label">R0.1以下</span>
           </div>
-          <p class="setting-tip">矢印の先端から、文字を置く場所までドラッグします。</p>
+          <p class="replacement-drag-hint">追加後は青い枠内で移動、右下の丸でサイズ変更できます。矢印付きは青い丸で矢先も調整できます。</p>
+          <div id="dimensionManualStyle" class="manual-dimension-style hidden">
+            <label for="fontSize" class="sub-label">文字サイズ</label>
+            <div class="number-field">
+              <input id="fontSize" type="number" min="5" max="36" step="0.5" value="10">
+              <span>pt</span>
+            </div>
+          </div>
         </section>
 
         <section class="setting-group hidden" data-for="replace">
@@ -243,21 +375,36 @@
           </div>
           <label for="replacementValue">新しい寸法値</label>
           <input id="replacementValue" class="text-input" type="text" placeholder="例: φ15.4" maxlength="40">
-          <div class="tolerance-grid">
-            <label>
-              <span>上公差</span>
-              <input id="upperTolerance" class="text-input" type="text" placeholder="+0.03" maxlength="20">
-            </label>
-            <label>
-              <span>下公差</span>
-              <input id="lowerTolerance" class="text-input" type="text" placeholder="-0.01" maxlength="20">
-            </label>
-          </div>
-          <label for="replacementSize" class="sub-label">画像PDFの文字サイズ</label>
-          <div class="number-field">
-            <input id="replacementSize" type="number" min="5" max="36" step="0.5" value="9">
-            <span>pt</span>
-          </div>
+          <details class="advanced-details inline-details">
+            <summary>公差・文字サイズも指定する</summary>
+            <div class="tolerance-grid">
+              <label>
+                <span>上公差</span>
+                <input id="upperTolerance" class="text-input" type="text" placeholder="+0.03" maxlength="20">
+              </label>
+              <label>
+                <span>下公差</span>
+                <input id="lowerTolerance" class="text-input" type="text" placeholder="-0.01" maxlength="20">
+              </label>
+            </div>
+            <div class="replacement-size-grid">
+              <label>
+                <span>寸法値の文字サイズ</span>
+                <span class="number-field">
+                  <input id="replacementSize" type="number" min="5" max="36" step="0.01" value="9">
+                  <span>pt</span>
+                </span>
+              </label>
+              <label>
+                <span>公差の文字サイズ</span>
+                <span class="number-field">
+                  <input id="replacementToleranceSize" type="number" min="4" max="36" step="0.01" value="7.2">
+                  <span>pt</span>
+                </span>
+              </label>
+            </div>
+            <p class="replacement-drag-hint">位置は図面上の青い枠をドラッグして調整できます。寸法値と公差は別々に動かせます。</p>
+          </details>
           <div class="replacement-preview">
             <strong id="replacementPreviewValue">φ15.4</strong>
             <span id="replacementPreviewTolerance"><small id="replacementPreviewUpper"></small><small id="replacementPreviewLower"></small></span>
@@ -266,7 +413,53 @@
             <button id="cancelReplacementButton" class="soft-button" type="button" disabled>選択解除</button>
             <button id="confirmReplacementButton" class="save-button" type="button" disabled>修正を反映</button>
           </div>
-          <p class="setting-tip">対象を選択してから修正後の値を入力し、「修正を反映」を押します。上・下公差が空欄の場合、公差は記載しません。</p>
+        </section>
+
+        <section class="setting-group hidden tolerance-panel" data-for="general_tolerance">
+          <h3 class="setting-title">一般公差の設定</h3>
+          <label for="generalToleranceStandard">規格</label>
+          <select id="generalToleranceStandard" class="text-input">
+            <option value="jis_b_0405">JIS B 0405</option>
+            <option value="pisco">日本ピスコ普通公差（加工寸法）</option>
+          </select>
+          <div id="generalToleranceGradeGroup" class="hidden">
+            <label for="generalToleranceGrade" class="sub-label">JIS 公差等級</label>
+            <select id="generalToleranceGrade" class="text-input">
+              <option value="m">m 中級</option>
+              <option value="f">f 精級</option>
+            </select>
+          </div>
+          <details class="advanced-details angle-fallback-details compact-details">
+            <summary>角度公差の設定（指示がない場合のみ）</summary>
+            <p class="angle-setting-help">
+              JIS B 0405に準拠します。図面に角度公差の指示があれば、その値を自動で優先します。
+            </p>
+            <label for="generalToleranceAngleLength" class="sub-label">角度を作る短い方の辺</label>
+            <select id="generalToleranceAngleLength" class="text-input">
+              <option value="10">±1°（10 mm以下／不明）</option>
+              <option value="50">±30′（10～50 mm）</option>
+              <option value="120">±20′（50～120 mm）</option>
+              <option value="400">±10′（120～400 mm）</option>
+              <option value="401">±5′（400 mm超）</option>
+            </select>
+          </details>
+          <details class="advanced-details compact-details tolerance-rule-details">
+            <summary>適用ルールを確認</summary>
+            <p>直線寸法・直径・C/R・角度を検出します。図面注記を優先し、括弧内の参考寸法と幾何公差は対象外です。0.099 mm以下は寸法値と同じ公差、0.1 mm以上0.5 mm未満は±0.1です。</p>
+          </details>
+          <button id="scanGeneralToleranceButton" class="soft-button wide-button" type="button">
+            対象寸法を検出
+          </button>
+          <div class="selection-progress tolerance-progress">
+            <span>反映する候補</span>
+            <output id="generalToleranceCandidateCount">未検出</output>
+          </div>
+          <button id="applyGeneralToleranceButton" class="save-button primary-next wide-button" type="button" disabled>
+            選択した公差を一括反映
+          </button>
+          <p id="generalToleranceHint" class="setting-tip">
+            検出後、水色の候補をクリックすると除外できます。灰色を再クリックすると戻せます。
+          </p>
         </section>
 
         <section class="setting-group hidden" data-for="quality_stamp process_stamp">
@@ -274,24 +467,90 @@
           <input id="stampName" class="text-input" type="text" value="担当者" maxlength="20">
           <label for="stampDate" class="sub-label">日付</label>
           <input id="stampDate" class="text-input" type="text" value="" maxlength="20">
-          <label for="stampSize" class="sub-label">印の大きさ</label>
-          <div class="number-field">
-            <input id="stampSize" type="number" min="30" max="150" step="1" value="62">
-            <span>pt</span>
+          <details class="advanced-details inline-details">
+            <summary>印の大きさを変える</summary>
+            <label for="stampSize" class="sub-label">印の大きさ</label>
+            <div class="number-field">
+              <input id="stampSize" type="number" min="30" max="150" step="1" value="62">
+              <span>pt</span>
+            </div>
+          </details>
+        </section>
+
+        <section class="setting-group hidden procedure-note-panel" data-for="procedure_note">
+          <label for="procedureNoteType">追加する注記</label>
+          <select id="procedureNoteType" class="text-input">
+            <option value="confidential">社外秘の注意文</option>
+            <option value="phase">位置関係注意</option>
+            <option value="post_process">後処理あり</option>
+            <option value="thread">ねじ外径・内径／ねじの具合</option>
+            <option value="borrowed">借用ゲージ</option>
+            <option value="cut_split">カット・スリワリの食い込み</option>
+            <option value="surface">粗さ記号・粗さ値</option>
+            <option value="special">顧客・製品の独自規格</option>
+            <option value="custom">自由入力</option>
+          </select>
+          <label for="procedureNoteText" class="sub-label">図面に入れる内容</label>
+          <textarea id="procedureNoteText" class="text-input note-textarea" rows="4" maxlength="240">【社外秘】
+注）使用後、速やかにシュレッダーで廃棄の事</textarea>
+          <p class="setting-tip">内容を確認し、図面上の空いている場所をクリックして配置します。入力内容は自由に修正できます。</p>
+          <details class="advanced-details inline-details">
+            <summary>文字サイズを変える</summary>
+            <label for="procedureNoteSize" class="sub-label">注記の文字サイズ</label>
+            <div class="number-field">
+              <input id="procedureNoteSize" type="number" min="6" max="24" step="0.5" value="10">
+              <span>pt</span>
+            </div>
+          </details>
+        </section>
+
+        <section class="setting-group hidden measurement-panel" data-for="measurement">
+          <label for="measurementType">追加する表示</label>
+          <select id="measurementType" class="text-input">
+            <option value="instrument">測定具記号</option>
+            <option value="sequence">測定順番号</option>
+          </select>
+          <div id="measurementInstrumentGroup">
+            <label for="measurementInstrument" class="sub-label">測定具</label>
+            <select id="measurementInstrument" class="text-input">
+              <option value="M">M：マイクロメータ</option>
+              <option value="BM">BM：ブレードマイクロメータ</option>
+              <option value="DG">DG：ダイヤルゲージ</option>
+              <option value="K">K：工具顕微鏡</option>
+              <option value="SC">SC：形状測定機</option>
+              <option value="H">H：表面粗さ計</option>
+              <option value="PG">PG：ピンゲージ</option>
+              <option value="SG">SG：プラグゲージ</option>
+              <option value="RC">RC：真円度測定機</option>
+              <option value="DM">DM：三次元測定機</option>
+            </select>
           </div>
+          <div id="measurementSequenceGroup" class="hidden">
+            <label for="measurementSequence" class="sub-label">測定する順番</label>
+            <div class="number-field">
+              <input id="measurementSequence" type="number" min="1" max="999" step="1" value="1">
+              <span>番</span>
+            </div>
+          </div>
+          <p class="setting-tip">種類を選び、対象寸法の近くをクリックします。順番は①～㊿、それ以降は(51)の形式で表示します。</p>
+          <details class="advanced-details inline-details">
+            <summary>文字サイズを変える</summary>
+            <label for="measurementSize" class="sub-label">表示サイズ</label>
+            <div class="number-field">
+              <input id="measurementSize" type="number" min="6" max="24" step="0.5" value="9">
+              <span>pt</span>
+            </div>
+          </details>
         </section>
 
-        <section class="setting-group mode-help">
-          <div class="help-title"><span>操作方法</span><kbd>Esc</kbd></div>
-          <p id="modeHelp">寸法値はクリック、文字・記号・任意範囲は選択方法を選んでドラッグします。</p>
-        </section>
-
-        <button id="clearAllButton" class="clear-all-button" type="button">すべての追加内容を消去</button>
+        <details class="cleanup-details">
+          <summary>やり直し・削除</summary>
+          <button id="clearAllButton" class="clear-all-button" type="button">全ページの追加内容を消す</button>
+        </details>
       </aside>
     </main>
   </div>
 
-  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="app.js"></script>
 </body>
 </html>
