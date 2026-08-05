@@ -2,7 +2,9 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
+.mypy_cache/
 
 # Build artifacts
 build/
@@ -13,12 +15,15 @@ output/
 # PyInstaller
 *.spec
 
-# Generated icon
+# Generated icon (PNGから生成)
 assets/app_icon.ico
 
-# Logs and reports
+# Logs
 *.log
 
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Editor
+.cursor/

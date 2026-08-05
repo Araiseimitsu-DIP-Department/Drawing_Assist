@@ -72,7 +72,7 @@ def main() -> None:
             markings = _detect_local_dimension_markings(page, ocr_page)
             marking_text = {item.source_text for item in markings}
             assert "50.6±0.05" in marking_text
-            assert "C0.2以下" in marking_text
+            assert "C0.2以下" not in marking_text
             assert not any("指示なき" in text for text in marking_text)
             assert "φ0.02" not in marking_text
 

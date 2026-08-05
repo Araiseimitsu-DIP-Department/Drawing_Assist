@@ -42,3 +42,7 @@ New-Item -ItemType Directory -Path $specOutputPath -Force | Out-Null
 
 Write-Host ""
 Write-Host "Build complete: $projectRoot\dist\$appName.exe"
+
+$desktopExe = Join-Path $env:USERPROFILE "Desktop\$appName.exe"
+Copy-Item -Path (Join-Path $projectRoot "dist\$appName.exe") -Destination $desktopExe -Force
+Write-Host "Desktop copy updated: $desktopExe"

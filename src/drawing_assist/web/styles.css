@@ -67,6 +67,52 @@ summary::-webkit-details-marker { display: none; }
 .top-actions { display: flex; align-items: center; gap: 8px; }
 .soft-button { height: 38px; padding: 0 11px; border-radius: 8px; background: #f3f6fa; font-size: 12px; font-weight: 700; }
 .soft-button:hover { background: #e8edf4; }
+.soft-button.active-toggle {
+  background: #fee4e2;
+  color: #9f1239;
+  box-shadow: inset 0 0 0 1px #fda4af;
+}
+.operation-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0 0 12px;
+}
+.operation-step {
+  padding: 6px 4px;
+  border-radius: 7px;
+  background: #f3f6fa;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+}
+.operation-step.active {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+.operation-step.done {
+  background: #ecfdf3;
+  color: #15803d;
+}
+.detect-button {
+  width: 100%;
+  margin-top: 9px;
+  min-height: 44px;
+  border-radius: 10px;
+  border: 1px solid #3b82f6;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.detect-button:hover:not(:disabled) { background: #dbeafe; }
+.detect-button:disabled {
+  opacity: .42;
+  cursor: default;
+}
+.toggle-mode-button { margin-top: 8px; }
 .danger-text { color: #b42318; }
 .save-button { height: 42px; padding: 0 17px; border-radius: 9px; color: #fff; background: #172033; font-weight: 700; }
 .save-button:hover { background: #0b1220; }
@@ -353,6 +399,7 @@ body:not(.document-loaded) .settings-panel { display: none; }
 .mini-button { width: 25px; height: 25px; color: #dce3ed; background: #2a3443; font-size: 17px; }
 #zoomRange { width: 100px; accent-color: #73a1ff; }
 #zoomLabel { width: 42px; color: #acb7c7; font-size: 10px; font-variant-numeric: tabular-nums; }
+.build-label { flex: 0 0 auto; margin-left: 10px; color: #8fa0b8; font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .setting-group { padding: 12px 4px; border-top: 1px solid var(--line); }
 .setting-group > label, .setting-row label { display: block; font-size: 12px; font-weight: 800; }

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import logging
@@ -12,6 +12,23 @@ import unicodedata
 import fitz
 import numpy as np
 from PIL import Image
+
+from drawing_assist.drawing_text_normalizer import normalize_drawing_text
+from drawing_assist.image_preprocessor import prepare_raster_for_rapidocr
+from drawing_assist.ocr_config import (
+    DETAIL_ANGLE_ZOOM,
+    LOCAL_OCR_MIN_CONFIDENCE,
+    LOCAL_OCR_ZOOM_MAX,
+    LOCAL_OCR_ZOOM_MIN,
+    LOCAL_OCR_ZOOM_NUMERATOR,
+    SCANNED_OCR_ZOOM_MAX,
+    SCANNED_OCR_ZOOM_MIN,
+    SCANNED_OCR_ZOOM_NUMERATOR,
+    SCANNED_TILE_ZOOM_MAX,
+    SCANNED_TILE_ZOOM_MIN,
+    SCANNED_TILE_ZOOM_NUMERATOR,
+    SCANNED_TILE_MIN_CONFIDENCE,
+)
 
 
 @dataclass(frozen=True)
@@ -70,19 +87,29 @@ def local_ocr_available() -> bool:
     return True
 
 
-def analyze_page(page: fitz.Page) -> LocalOcrPage:
+def analyze_page(page: fitz.Page, *, scanned: bool = False) -> LocalOcrPage:
     """Run one reusable, fully local OCR pass for an image drawing page."""
 
     maximum_dimension = max(page.rect.width, page.rect.height)
-    zoom = max(1.8, min(2.2, 2400 / maximum_dimension))
+    if scanned:
+        zoom = max(
+            SCANNED_OCR_ZOOM_MIN,
+            min(SCANNED_OCR_ZOOM_MAX, SCANNED_OCR_ZOOM_NUMERATOR / maximum_dimension),
+        )
+    else:
+        zoom = max(
+            LOCAL_OCR_ZOOM_MIN,
+            min(LOCAL_OCR_ZOOM_MAX, LOCAL_OCR_ZOOM_NUMERATOR / maximum_dimension),
+        )
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(zoom, zoom),
         colorspace=fitz.csRGB,
         alpha=False,
         annots=False,
     )
-    image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-    # Passing an ndarray avoids a temporary PNG and its disk I/O.
+    source_image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    # Windows OCR と同等のコントラスト補正を軽量版で適用する。
+    image = prepare_raster_for_rapidocr(source_image)
     array = np.asarray(image)
     with _ENGINE_LOCK:
         result = _engine()(array, return_word_box=False)
@@ -94,9 +121,9 @@ def analyze_page(page: fitz.Page) -> LocalOcrPage:
     scale_y = image.height / page.rect.height
     lines: list[LocalOcrLine] = []
     for box, text, score in zip(boxes, texts, scores):
-        normalized = str(text or "").strip()
+        normalized = normalize_drawing_text(str(text or "").strip())
         confidence = float(score or 0.0)
-        if not normalized or confidence < 0.42 or len(box) < 4:
+        if not normalized or confidence < LOCAL_OCR_MIN_CONFIDENCE or len(box) < 4:
             continue
         quad = tuple(
             (float(point[0]) / scale_x, float(point[1]) / scale_y)
@@ -127,7 +154,7 @@ def _analyze_detail_angles_serial(
     )
     common_angles = {15, 30, 45, 60, 90, 120}
     results: list[LocalOcrLine] = []
-    zoom = 4.0
+    zoom = DETAIL_ANGLE_ZOOM
 
     for caption in ocr_page.lines:
         caption_text = unicodedata.normalize("NFKC", caption.text).upper()
@@ -262,7 +289,7 @@ def analyze_detail_angles(
         r"^[^0-9]{0,2}(\d{1,3})(?:\s*[\u00b0\u00ba])?$"
     )
     common_angles = {15, 30, 45, 60, 90, 120}
-    zoom = 4.0
+    zoom = DETAIL_ANGLE_ZOOM
     regions: list[tuple[fitz.Rect, Image.Image]] = []
     for caption in ocr_page.lines:
         caption_text = unicodedata.normalize("NFKC", caption.text).upper()
@@ -392,3 +419,219 @@ def analyze_detail_angles(
             continue
         deduplicated.append(line)
     return tuple(deduplicated)
+
+
+def _line_center(line: LocalOcrLine) -> tuple[float, float]:
+    return (
+        (line.rect[0] + line.rect[2]) / 2,
+        (line.rect[1] + line.rect[3]) / 2,
+    )
+
+
+def merge_ocr_lines(
+    *groups: tuple[LocalOcrLine, ...],
+) -> tuple[LocalOcrLine, ...]:
+    """複数OCR結果を重複除去して統合する。"""
+
+    merged: list[LocalOcrLine] = []
+    for group in groups:
+        for line in group:
+            center = _line_center(line)
+            duplicate = False
+            for index, existing in enumerate(merged):
+                existing_center = _line_center(existing)
+                if (
+                    existing.text == line.text
+                    and math.dist(center, existing_center) <= 18.0
+                ):
+                    if line.score > existing.score:
+                        merged[index] = line
+                    duplicate = True
+                    break
+            if not duplicate:
+                merged.append(line)
+    return tuple(merged)
+
+
+_EXPLICIT_TOLERANCE_IN_LINE = re.compile(
+    r"(?:±|士|亇|干|土|\+\s*\d|[−－一-]\s*\d)",
+)
+_TOLERANCE_ONLY_LINE = re.compile(
+    r"^[±+\-−－]?\s*\d+(?:[.,]\d+)?$",
+)
+_NOMINAL_START = re.compile(
+    r"^[φΦØ⌀RCＲＣ（(]?\d",
+)
+
+
+def _line_rect(line: LocalOcrLine) -> fitz.Rect:
+    return fitz.Rect(line.rect)
+
+
+def join_nearby_tolerance_ocr_lines(
+    lines: tuple[LocalOcrLine, ...],
+) -> tuple[LocalOcrLine, ...]:
+    """寸法値と分離して読まれた公差記号を結合する。"""
+
+    def _try_pair(
+        left: LocalOcrLine,
+        right: LocalOcrLine,
+    ) -> float | None:
+        left_text = unicodedata.normalize("NFKC", left.text)
+        right_text = unicodedata.normalize("NFKC", right.text)
+        if _EXPLICIT_TOLERANCE_IN_LINE.search(left_text):
+            return None
+        if not _NOMINAL_START.search(left_text.lstrip("△▲A")):
+            return None
+        if not _EXPLICIT_TOLERANCE_IN_LINE.search(right_text):
+            if not _TOLERANCE_ONLY_LINE.fullmatch(right_text.strip()):
+                return None
+        left_rect = _line_rect(left)
+        right_rect = _line_rect(right)
+        if left_rect.is_empty or right_rect.is_empty:
+            return None
+        min_height = max(1.0, min(left_rect.height, right_rect.height))
+        vertical_overlap = min(left_rect.y1, right_rect.y1) - max(
+            left_rect.y0, right_rect.y0
+        )
+        horizontal_overlap = min(left_rect.x1, right_rect.x1) - max(
+            left_rect.x0, right_rect.x0
+        )
+        horizontal_gap = right_rect.x0 - left_rect.x1
+        vertical_gap = right_rect.y0 - left_rect.y1
+        horizontal_match = (
+            vertical_overlap >= min_height * 0.3
+            and right_rect.x0 >= left_rect.x0 - left_rect.height * 0.6
+            and -left_rect.height * 0.5
+            <= horizontal_gap
+            <= max(64.0, left_rect.height * 7.0)
+        )
+        vertical_match = (
+            horizontal_overlap >= min(left_rect.width, right_rect.width) * 0.35
+            and -min_height * 0.35
+            <= vertical_gap
+            <= max(52.0, left_rect.height * 5.5)
+            and abs((left_rect.x0 + left_rect.x1) / 2 - (right_rect.x0 + right_rect.x1) / 2)
+            <= max(left_rect.width, right_rect.width) * 0.75
+        )
+        if not horizontal_match and not vertical_match:
+            return None
+        return right.score
+
+    joined: list[LocalOcrLine] = []
+    consumed: set[int] = set()
+    indexed = list(enumerate(lines))
+    for left_index, left in indexed:
+        if left_index in consumed:
+            continue
+        best: tuple[float, int, LocalOcrLine] | None = None
+        for right_index, right in indexed:
+            if right_index == left_index or right_index in consumed:
+                continue
+            score = _try_pair(left, right)
+            if score is None:
+                continue
+            if best is None or score > best[0]:
+                best = (score, right_index, right)
+        if best is None:
+            continue
+        _, right_index, right = best
+        left_text = unicodedata.normalize("NFKC", left.text)
+        merged_text = normalize_drawing_text(f"{left_text}{right.text}")
+        xs = [point[0] for point in (*left.quad, *right.quad)]
+        ys = [point[1] for point in (*left.quad, *right.quad)]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        merged_quad = (
+            (x0, y0),
+            (x1, y0),
+            (x1, y1),
+            (x0, y1),
+        )
+        joined.append(
+            LocalOcrLine(
+                merged_text,
+                max(left.score, right.score),
+                merged_quad,
+            )
+        )
+        consumed.add(left_index)
+        consumed.add(right_index)
+    return tuple(joined)
+
+
+def enrich_scanned_ocr_page(
+    ocr_page: LocalOcrPage,
+    tile_lines: tuple[LocalOcrLine, ...] | None = None,
+) -> LocalOcrPage:
+    """ページOCRとタイルOCRを統合し、分離公差を結合する。"""
+
+    merged = merge_ocr_lines(ocr_page.lines, tile_lines or ())
+    joined = join_nearby_tolerance_ocr_lines(merged)
+    return replace(ocr_page, lines=merge_ocr_lines(merged, joined))
+
+
+def analyze_scanned_page_tiles(page: fitz.Page) -> tuple[LocalOcrLine, ...]:
+    """画像PDFの図面領域を高解像度タイルOCRで読み取る。"""
+
+    maximum_dimension = max(page.rect.width, page.rect.height)
+    zoom = max(
+        SCANNED_TILE_ZOOM_MIN,
+        min(SCANNED_TILE_ZOOM_MAX, SCANNED_TILE_ZOOM_NUMERATOR / maximum_dimension),
+    )
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(zoom, zoom),
+        colorspace=fitz.csRGB,
+        alpha=False,
+        annots=False,
+    )
+    source_image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    image = prepare_raster_for_rapidocr(source_image)
+    scale_x = image.width / page.rect.width
+    scale_y = image.height / page.rect.height
+    tile_width = min(image.width, max(1000, int(260 * scale_x)))
+    tile_height = min(image.height, max(860, int(200 * scale_y)))
+    step_x = max(520, int(tile_width * 0.48))
+    step_y = max(440, int(tile_height * 0.45))
+    left = int(image.width * 0.03)
+    right = int(image.width * 0.95)
+    top = int(image.height * 0.08)
+    bottom = int(image.height * 0.83)
+
+    lines: list[LocalOcrLine] = []
+    y = top
+    while y < bottom:
+        y1 = min(image.height, y + tile_height)
+        x = left
+        while x < right:
+            x1 = min(image.width, x + tile_width)
+            crop = np.asarray(image.crop((x, y, x1, y1)))
+            with _ENGINE_LOCK:
+                result = _engine()(crop, return_word_box=False)
+            boxes = [] if result.boxes is None else result.boxes
+            texts = [] if result.txts is None else result.txts
+            scores = [] if result.scores is None else result.scores
+            for box, text, score in zip(boxes, texts, scores):
+                normalized = normalize_drawing_text(str(text or "").strip())
+                confidence = float(score or 0.0)
+                if (
+                    not normalized
+                    or confidence < SCANNED_TILE_MIN_CONFIDENCE
+                    or len(box) < 4
+                ):
+                    continue
+                quad = tuple(
+                    (
+                        (float(point[0]) + x) / scale_x,
+                        (float(point[1]) + y) / scale_y,
+                    )
+                    for point in box[:4]
+                )
+                lines.append(LocalOcrLine(normalized, confidence, quad))
+            if x1 >= right:
+                break
+            x += step_x
+        if y1 >= bottom:
+            break
+        y += step_y
+    return merge_ocr_lines(tuple(lines))

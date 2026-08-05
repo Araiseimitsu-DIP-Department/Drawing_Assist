@@ -181,6 +181,18 @@ class DimensionMarkingEntry:
     quad: tuple[tuple[float, float], ...] | None = None
 
 
+@dataclass
+class DimensionMarkingCandidate:
+    """Preview candidate before committing automatic color markings."""
+
+    page_index: int
+    rect: tuple[float, float, float, float]
+    color: str
+    opacity: float = 0.42
+    quad: tuple[tuple[float, float], ...] | None = None
+    selected: bool = True
+
+
 @dataclass(frozen=True)
 class DimensionMarkingBatch:
     """A single undoable batch of dimension and tolerance highlights."""

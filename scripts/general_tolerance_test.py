@@ -40,6 +40,12 @@ from drawing_assist.web_app import (
 )
 
 
+def _scan_and_apply_markings(api) -> dict:
+    scan = api.scan_dimension_markings()
+    assert scan["ok"], scan
+    return api.apply_dimension_markings()
+
+
 def _verify_tables() -> None:
     assert jis_b_0405_tolerance(0.03, "m") == 0.03
     assert jis_b_0405_tolerance(0.05, "m", "chamfer") == 0.05
@@ -285,18 +291,21 @@ def _verify_current_ui_flow() -> None:
         'data-mode="word"'
     )
     for text in (
-        "公差をまとめて入れる",
-        "寸法・公差を色分けする",
-        "製品部分を塗る",
+        "① 公差を入れる",
+        "③ 寸法を色分け",
+        "④ 製品を塗る",
         "その他の機能",
         "二重線で消す",
         "寸法と矢印を追加",
         "必要な寸法を書き直す",
         "印・必要な注記を入れる",
         "測定具・測定順を入れる",
-        "寸法・公差を一括で色分け",
-        "公差レンジ0.03以内／角度1°以内",
+        "一括反映",
+        "scanDimensionMarkingsButton",
+        "detect-button",
+        "厳しい公差（0.03以内・角度1°以内）",
         "角度公差の設定",
+        "operation-steps",
     ):
         assert text in html
     for marker in (
@@ -366,7 +375,7 @@ def _verify_edited_dimensions_join_final_marking() -> None:
     api.last_general_tolerance_additions = [addition]
     api.items.extend((added, replacement))
     try:
-        api.apply_dimension_markings()
+        _scan_and_apply_markings(api)
         batch = api.items[-1]
         assert isinstance(batch, DimensionMarkingBatch)
         added_rect = dimension_label_rect(added)
@@ -447,7 +456,7 @@ def _verify_marking_includes_added_tolerance() -> None:
     )
     api.last_general_tolerance_batch = [candidate]
     try:
-        state = api.apply_dimension_markings()
+        state = _scan_and_apply_markings(api)
         assert state["ok"]
         batch = api.items[-1]
         assert isinstance(batch, DimensionMarkingBatch)
@@ -497,7 +506,7 @@ def _verify_general_tolerance_drag_updates_marking() -> None:
         assert abs(moved.origin[0] - addition.origin[0] - 18) < 0.01
         assert abs(moved.origin[1] - addition.origin[1] - 12) < 0.01
         assert api.items[0].additions[0] == moved
-        api.apply_dimension_markings()
+        _scan_and_apply_markings(api)
         marking = api.items[-1]
         assert isinstance(marking, DimensionMarkingBatch)
         moved_rect = fitz.Rect(api._added_tolerance_mark_rect(moved))
@@ -505,6 +514,62 @@ def _verify_general_tolerance_drag_updates_marking() -> None:
             not (fitz.Rect(entry.rect) & moved_rect).is_empty
             for entry in marking.entries
         )
+    finally:
+        api.document.close()
+        api.upload_directory.cleanup()
+
+
+def _verify_tolerance_resize_shrink() -> None:
+    from drawing_assist.web_app import DrawingApi
+
+    api = DrawingApi()
+    api.document = fitz.open()
+    api.document.new_page(width=260, height=160)
+    addition = ToleranceAddition((80, 78), (1.0, 0.0), "±0.1", 10.0)
+    batch = GeneralToleranceBatchMark(0, (addition,))
+    api.items = [batch]
+    api.last_general_tolerance_additions = [addition]
+    api.editable_item_index = 0
+    api.editable_tolerance_index = 0
+    try:
+        old_rect = api._full_tolerance_addition_rect(addition)
+        enlarged = fitz.Rect(
+            old_rect.x0,
+            old_rect.y0,
+            old_rect.x0 + old_rect.width * 1.6,
+            old_rect.y0 + old_rect.height * 1.6,
+        )
+        api.move_general_tolerance_addition(
+            {
+                "x0": enlarged.x0,
+                "y0": enlarged.y0,
+                "x1": enlarged.x1,
+                "y1": enlarged.y1,
+            }
+        )
+        enlarged_size = api.last_general_tolerance_additions[0].font_size
+        assert enlarged_size > addition.font_size
+
+        enlarged_rect = api._full_tolerance_addition_rect(
+            api.last_general_tolerance_additions[0]
+        )
+        shrunk = fitz.Rect(
+            enlarged_rect.x0,
+            enlarged_rect.y0,
+            enlarged_rect.x0 + enlarged_rect.width * 0.55,
+            enlarged_rect.y0 + enlarged_rect.height * 0.55,
+        )
+        api.move_general_tolerance_addition(
+            {
+                "x0": shrunk.x0,
+                "y0": shrunk.y0,
+                "x1": shrunk.x1,
+                "y1": shrunk.y1,
+            }
+        )
+        shrunk_size = api.last_general_tolerance_additions[0].font_size
+        assert shrunk_size < enlarged_size
+        assert shrunk_size >= 4.0
     finally:
         api.document.close()
         api.upload_directory.cleanup()
@@ -636,7 +701,7 @@ def _verify_native_drawing_detection() -> None:
         api.last_general_tolerance_batch = [diameter_candidate]
         api.last_general_tolerance_additions = [diameter_addition]
         api.last_general_tolerance_marked = False
-        api.apply_dimension_markings()
+        _scan_and_apply_markings(api)
         diameter_batch = api.items[-1]
         assert isinstance(diameter_batch, DimensionMarkingBatch)
         diameter_entry = next(
@@ -661,7 +726,7 @@ def _verify_native_drawing_detection() -> None:
         api.last_general_tolerance_batch = [face_candidate]
         api.last_general_tolerance_additions = [face_addition]
         api.last_general_tolerance_marked = False
-        api.apply_dimension_markings()
+        _scan_and_apply_markings(api)
         descriptor_batch = api.items[-1]
         assert isinstance(descriptor_batch, DimensionMarkingBatch)
         descriptor_rect = fitz.Rect(face_addition.suffix_rect)
@@ -691,7 +756,7 @@ def _verify_native_drawing_detection() -> None:
         api.last_general_tolerance_batch = [diagonal_angle]
         api.last_general_tolerance_additions = [angle_addition]
         api.last_general_tolerance_marked = False
-        marking_state = api.apply_dimension_markings()
+        marking_state = _scan_and_apply_markings(api)
         assert marking_state["ok"]
         marking_batch = api.items[-1]
         assert isinstance(marking_batch, DimensionMarkingBatch)
@@ -745,7 +810,7 @@ def _verify_native_drawing_detection() -> None:
         api.last_general_tolerance_batch = [small_angle]
         api.last_general_tolerance_additions = [small_addition]
         api.last_general_tolerance_marked = False
-        api.apply_dimension_markings()
+        _scan_and_apply_markings(api)
         small_marking_batch = api.items[-1]
         assert isinstance(small_marking_batch, DimensionMarkingBatch)
         small_angle_entries = [
@@ -849,6 +914,89 @@ def _verify_scanned_drawing_detection() -> None:
     )
 
 
+def _verify_applied_tolerance_removal() -> None:
+    from drawing_assist.web_app import DrawingApi
+
+    api = DrawingApi()
+    api.document = fitz.open()
+    api.document.new_page(width=320, height=160)
+    api.source_path = Path("remove-test.pdf")
+    candidates = [
+        GeneralToleranceCandidate(
+            page_index=0,
+            rect=(40, 65, 62, 80),
+            direction=(1.0, 0.0),
+            source_text="10",
+            nominal_value=10.0,
+            kind="linear",
+            tolerance=0.1,
+            tolerance_text="±0.1",
+        ),
+        GeneralToleranceCandidate(
+            page_index=0,
+            rect=(120, 65, 142, 80),
+            direction=(1.0, 0.0),
+            source_text="20",
+            nominal_value=20.0,
+            kind="linear",
+            tolerance=0.1,
+            tolerance_text="±0.1",
+        ),
+    ]
+    additions = (
+        ToleranceAddition((63, 78), (1.0, 0.0), "±0.1", 7.0),
+        ToleranceAddition((143, 78), (1.0, 0.0), "±0.1", 7.0),
+    )
+    api.items = [GeneralToleranceBatchMark(0, additions)]
+    api.last_general_tolerance_batch = list(candidates)
+    api.last_general_tolerance_additions = list(additions)
+    try:
+        state = api.remove_applied_general_tolerance({"x": 51, "y": 72})
+        assert state["ok"]
+        assert len(api.last_general_tolerance_batch) == 1
+        assert api.last_general_tolerance_batch[0].nominal_value == 20.0
+        state = api.remove_applied_general_tolerance({"x": 131, "y": 72})
+        assert state["ok"]
+        assert len(api.last_general_tolerance_batch) == 0
+        assert not api.items
+    finally:
+        api.document.close()
+        api.upload_directory.cleanup()
+
+
+def _verify_dimension_marking_removal() -> None:
+    from drawing_assist.web_app import DrawingApi
+
+    api = DrawingApi()
+    api.document = fitz.open()
+    api.document.new_page(width=320, height=160)
+    api.source_path = Path("marking-remove-test.pdf")
+    entries = (
+        DimensionMarkingEntry(
+            rect=(40, 65, 90, 82),
+            color="#f472b6",
+            quad=((40, 65), (90, 65), (90, 82), (40, 82)),
+        ),
+        DimensionMarkingEntry(
+            rect=(120, 65, 170, 82),
+            color="#facc15",
+            quad=((120, 65), (170, 65), (170, 82), (120, 82)),
+        ),
+    )
+    api.items = [DimensionMarkingBatch(0, entries)]
+    api.last_general_tolerance_marked = True
+    try:
+        state = api.remove_dimension_marking({"x": 65, "y": 72})
+        assert state["ok"]
+        batch = api.items[0]
+        assert isinstance(batch, DimensionMarkingBatch)
+        assert len(batch.entries) == 1
+        assert batch.entries[0].color == "#facc15"
+    finally:
+        api.document.close()
+        api.upload_directory.cleanup()
+
+
 def main() -> None:
     _verify_tables()
     _verify_toggle()
@@ -859,6 +1007,9 @@ def main() -> None:
     _verify_collision_aware_layout()
     _verify_marking_includes_added_tolerance()
     _verify_general_tolerance_drag_updates_marking()
+    _verify_tolerance_resize_shrink()
+    _verify_applied_tolerance_removal()
+    _verify_dimension_marking_removal()
     _verify_hidden_ocr_window()
     _verify_native_drawing_detection()
     _verify_scanned_drawing_detection()

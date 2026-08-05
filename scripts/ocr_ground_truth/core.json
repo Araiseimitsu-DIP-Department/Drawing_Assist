@@ -1,0 +1,19 @@
+{
+  "name": "core",
+  "description": "画像PDFチューニング用の実図面（手動確認ベースの正解寸法）",
+  "dimensions": [
+    {"kind": "linear", "value": 6.2},
+    {"kind": "linear", "value": 9.0},
+    {"kind": "linear", "value": 45.0},
+    {"kind": "linear", "value": 55.0},
+    {"kind": "linear", "value": 75.0},
+    {"kind": "linear", "value": 120.0},
+    {"kind": "linear", "value": 70.0},
+    {"kind": "diameter", "value": 15.4},
+    {"kind": "diameter", "value": 19.0},
+    {"kind": "diameter", "value": 26.5},
+    {"kind": "chamfer", "value": 0.3},
+    {"kind": "radius", "value": 0.3},
+    {"kind": "angle", "value": 60.0}
+  ]
+}

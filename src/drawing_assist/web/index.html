@@ -54,11 +54,11 @@
 
         <button class="tool-card active flow-tool" data-flow-step="1" data-mode="general_tolerance" type="button">
           <span class="tool-icon tolerance-icon">±</span>
-          <span><strong>公差をまとめて入れる</strong><small>対象を検出して一括反映</small></span>
+          <span><strong>① 公差を入れる</strong><small>検出して一括反映</small></span>
         </button>
         <details class="dimension-fix-tools">
-          <summary><b>2</b><span><strong>必要な寸法を整える</strong><small id="dimensionFixStatus">公差反映後に行います</small></span><i>⌄</i></summary>
-          <p>必要な場合だけ修正し、完了したら色分けへ進みます。</p>
+          <summary><b>②</b><span><strong>寸法を直す</strong><small id="dimensionFixStatus">必要なときだけ</small></span><i>⌄</i></summary>
+          <p>修正が終わったら、③の色分けへ進みます。</p>
           <button class="tool-card compact" data-mode="dimension" type="button">
             <span class="tool-icon dimension-icon"></span>
             <span><strong>寸法と矢印を追加</strong><small>追加・移動・矢先調整</small></span>
@@ -74,11 +74,11 @@
         </details>
         <button class="tool-card flow-tool" data-flow-step="3" data-mode="word" type="button">
           <span class="tool-icon marker-icon"></span>
-          <span><strong>寸法・公差を色分けする</strong><small>一括色分けして手動調整</small></span>
+          <span><strong>③ 寸法を色分け</strong><small>一括色分け・手動追加</small></span>
         </button>
         <button class="tool-card flow-tool" data-flow-step="4" data-mode="work_shape" type="button">
           <span class="tool-icon work-shape-icon"></span>
-          <span><strong>製品部分を塗る</strong><small>断面・加工部の範囲を選択</small></span>
+          <span><strong>④ 製品を塗る</strong><small>断面・加工部の範囲</small></span>
         </button>
         <details class="more-tools">
           <summary><span><strong>その他の機能</strong><small>印・注記・測定記号</small></span><i>⌄</i></summary>
@@ -184,6 +184,7 @@
             <span id="zoomLabel">100%</span>
             <button id="zoomInButton" class="mini-button" type="button">＋</button>
           </div>
+          <small id="buildLabel" class="build-label" title="ビルド識別子">—</small>
         </div>
       </section>
 
@@ -194,26 +195,39 @@
         </div>
 
         <section id="taskGuide" class="task-guide">
-          <div class="task-guide-heading"><span id="taskStep">2</span><small>次の操作</small></div>
-          <strong id="taskTitle">規格を選んで対象を検出</strong>
-          <p id="modeHelp">規格を選び、候補を確認してから一括反映します。</p>
+          <div class="task-guide-heading"><span id="taskStep">1</span><small>いまやること</small></div>
+          <strong id="taskTitle">規格を選んで検出</strong>
+          <p id="modeHelp">右の「対象寸法を検出」を押します。</p>
         </section>
 
         <section class="setting-group hidden marking-flow-panel" data-for="word">
-          <h3 class="setting-title">一括色分け</h3>
-          <button id="applyDimensionMarkingsButton" class="soft-button wide-button marking-button" type="button" disabled>
-            寸法・公差を一括で色分け
+          <h3 class="setting-title">色分け</h3>
+          <div class="operation-steps" aria-hidden="true">
+            <span id="markingFlowDetect" class="operation-step active">①検出</span>
+            <span id="markingFlowReview" class="operation-step">②確認</span>
+            <span id="markingFlowApply" class="operation-step">③反映</span>
+          </div>
+          <button id="scanDimensionMarkingsButton" class="detect-button" type="button" disabled>
+            対象寸法を検出
+          </button>
+          <div class="selection-progress tolerance-progress">
+            <span>色分けする件数</span>
+            <output id="dimensionMarkingCandidateCount">未検出</output>
+          </div>
+          <button id="applyDimensionMarkingsButton" class="save-button primary-next wide-button" type="button" disabled>
+            一括反映
+          </button>
+          <button id="removeDimensionMarkingButton" class="soft-button wide-button toggle-mode-button hidden" type="button">
+            不要な色を解除
           </button>
           <p id="dimensionMarkingHint" class="setting-tip">
-            先に「公差をまとめて入れる」で公差を反映してください。
+            ①検出 → ②クリックで確認 → ③一括反映
           </p>
-          <p class="compact-guidance">一括処理後は、図面上の文字をクリックして修正できます。選べない場合はドラッグで囲みます。</p>
           <details class="advanced-details compact-details">
-            <summary>色分け基準を確認</summary>
+            <summary>色の意味</summary>
             <div class="marking-rule-card">
-              <span><i class="rule-color pink"></i>ピンク：公差レンジ0.03以内／角度1°以内</span>
-              <span><i class="rule-color yellow"></i>黄色：上記を超える寸法・角度</span>
-              <small>括弧寸法は黄色です。その他は色を選び、手動で追加できます。</small>
+              <span><i class="rule-color pink"></i>ピンク：厳しい公差（0.03以内・角度1°以内）</span>
+              <span><i class="rule-color yellow"></i>黄色：それ以外の寸法・角度</span>
             </div>
           </details>
         </section>
@@ -416,7 +430,12 @@
         </section>
 
         <section class="setting-group hidden tolerance-panel" data-for="general_tolerance">
-          <h3 class="setting-title">一般公差の設定</h3>
+          <h3 class="setting-title">一般公差</h3>
+          <div class="operation-steps" aria-hidden="true">
+            <span id="toleranceFlowDetect" class="operation-step active">①検出</span>
+            <span id="toleranceFlowReview" class="operation-step">②確認</span>
+            <span id="toleranceFlowApply" class="operation-step">③反映</span>
+          </div>
           <label for="generalToleranceStandard">規格</label>
           <select id="generalToleranceStandard" class="text-input">
             <option value="jis_b_0405">JIS B 0405</option>
@@ -447,18 +466,21 @@
             <summary>適用ルールを確認</summary>
             <p>直線寸法・直径・C/R・角度を検出します。図面注記を優先し、括弧内の参考寸法と幾何公差は対象外です。0.099 mm以下は寸法値と同じ公差、0.1 mm以上0.5 mm未満は±0.1です。</p>
           </details>
-          <button id="scanGeneralToleranceButton" class="soft-button wide-button" type="button">
+          <button id="scanGeneralToleranceButton" class="detect-button" type="button">
             対象寸法を検出
           </button>
           <div class="selection-progress tolerance-progress">
-            <span>反映する候補</span>
+            <span>反映する件数</span>
             <output id="generalToleranceCandidateCount">未検出</output>
           </div>
           <button id="applyGeneralToleranceButton" class="save-button primary-next wide-button" type="button" disabled>
-            選択した公差を一括反映
+            一括反映
+          </button>
+          <button id="removeAppliedToleranceButton" class="soft-button wide-button toggle-mode-button hidden" type="button">
+            不要な公差を解除
           </button>
           <p id="generalToleranceHint" class="setting-tip">
-            検出後、水色の候補をクリックすると除外できます。灰色を再クリックすると戻せます。
+            ①検出 → ②水色をクリックで除外 → ③一括反映
           </p>
         </section>
 

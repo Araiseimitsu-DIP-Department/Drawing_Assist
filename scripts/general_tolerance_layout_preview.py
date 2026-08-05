@@ -41,6 +41,7 @@ def main() -> None:
             raise SystemExit("No general-tolerance candidates detected")
         api.apply_general_tolerances()
         applied_at = time.perf_counter()
+        api.scan_dimension_markings()
         api.apply_dimension_markings()
         marked_at = time.perf_counter()
         args.output.parent.mkdir(parents=True, exist_ok=True)

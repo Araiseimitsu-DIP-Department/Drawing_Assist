@@ -14,7 +14,13 @@ import unicodedata
 import fitz
 from PIL import Image, ImageOps
 
-from drawing_assist.local_ocr import LocalOcrPage, analyze_detail_angles
+from drawing_assist.image_preprocessor import prepare_raster_for_ocr
+from drawing_assist.ocr_config import (
+    BARE_NUMBER_MIN_CONFIDENCE,
+    SUPPLEMENT_THRESHOLD_SCANNED,
+    SUPPLEMENT_THRESHOLD_VECTOR,
+)
+from drawing_assist.ocr_debug_logger import OcrPipelineRecorder
 
 
 @dataclass(frozen=True)
@@ -58,44 +64,37 @@ _EXPLICIT_TOLERANCE = re.compile(
     re.IGNORECASE,
 )
 _NON_DIMENSION_CONTEXT = re.compile(
-    r"(?:SCALE|DATE|DWG|DRAWING|PAGE|SHEET|REV|図番|品番|尺度|日付|材質)",
+    r"(?:SCALE|DATE|DWG|DRAWING|PAGE|SHEET|REV|図番|品番|尺度|日付|材質|"
+    r"Rz\s*max|Rzmax|Ra\s*max|Ramax|Rmax)",
     re.IGNORECASE,
 )
 
 
+from drawing_assist.drawing_text_normalizer import (
+    is_tolerance_fragment,
+    normalize_raster_dimension_text,
+    parse_dimension_token,
+)
+
+
 def _prepare_raster_for_ocr(image: Image.Image) -> Image.Image:
-    """Increase the contrast of pale scanned drawings without thickening lines.
+    """後方互換のため残す。新規コードは image_preprocessor を直接使う。"""
 
-    Windows OCR misses decimal points and thin C/R/diameter prefixes on the
-    unprocessed scans used by the shop.  Autocontrast followed by a conservative
-    threshold keeps those small glyphs while removing the off-white paper tone.
-    """
-
-    gray = ImageOps.autocontrast(image.convert("L"), cutoff=1)
-    # Production drawings are often re-exported through DocuWorks and contain
-    # very pale decimal points, diameter glyphs and tolerance signs.  A higher
-    # cut keeps those small strokes; downstream geometry/context filters remove
-    # the additional paper and leader-line noise.
-    return gray.point(lambda value: 255 if value > 205 else 0, mode="1").convert("L")
+    return prepare_raster_for_ocr(image)
 
 
 def _normalize_raster_dimension_text(value: str) -> str:
-    """Normalize common Japanese Windows-OCR substitutions in dimensions."""
+    """既存呼び出し互換の正規化ラッパー。"""
 
-    text = unicodedata.normalize("NFKC", value).upper()
-    text = re.sub(r"\s+", "", text)
-    text = text.replace("＠", "φ").replace("@", "φ").replace("Φ", "φ")
-    text = re.sub(r"^[の劣効](?=\d)", "φ", text)
-    text = re.sub(r"^[ー・](?=\d)", "", text)
-    text = text.replace("Ｏ", "0").replace("O", "0")
-    text = text.replace("Ｃ", "C").replace("Ｒ", "R")
-    # Scanned decimal points are commonly read as Japanese punctuation or a
-    # short dash.  Only rewrite separators enclosed by digits, which avoids
-    # changing leaders and ordinary drawing lines.
-    text = re.sub(r"(?<=\d)[、。・·](?=\d)", ".", text)
-    text = re.sub(r"(?<=\d)[‐‑‒–—−－](?=\d)", ".", text)
-    text = re.sub(r"^(?P<prefix>[CR])0(?=\d)", r"\g<prefix>0.", text)
-    return text
+    return normalize_raster_dimension_text(value)
+
+
+from drawing_assist.local_ocr import (
+    LocalOcrPage,
+    analyze_detail_angles,
+    analyze_scanned_page_tiles,
+    enrich_scanned_ocr_page,
+)
 
 
 def _format_tolerance(value: float) -> str:
@@ -999,6 +998,15 @@ def _tiled_dimension_candidates(
                 continue
             if nominal <= 0 or nominal > 4000:
                 continue
+            if _reject_unreliable_dimension(
+                kind=kind,
+                prefix=prefix,
+                degree=degree,
+                nominal=nominal,
+                compact=compact,
+                supplemental=True,
+            ):
+                continue
             if not prefix and not degree and nominal >= 1000:
                 continue
             if kind == "angle":
@@ -1063,6 +1071,11 @@ def _tiled_dimension_candidates(
                 or rect.height > 85
                 or rect.y1 < page.rect.height * 0.11
                 or rect.y0 > page.rect.height * 0.82
+                or _is_non_dimension_region(
+                    rect,
+                    page.rect,
+                    bare_only=not prefix and not degree,
+                )
             ):
                 continue
             direction = (
@@ -1076,8 +1089,16 @@ def _tiled_dimension_candidates(
                 scale_x=scale_x,
                 scale_y=scale_y,
             ):
-                continue
-            if _is_feature_control_frame(
+                if not _has_dimension_line_support(
+                    image,
+                    rect,
+                    direction,
+                    kind,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                ):
+                    continue
+            elif _is_feature_control_frame(
                 image,
                 rect,
                 direction,
@@ -1193,6 +1214,35 @@ def _is_full_page_image(page: fitz.Page) -> bool:
         any(area / page_area >= 0.72 for area in image_areas)
         or sum(image_areas) / page_area >= 0.72
     )
+
+
+def _is_non_dimension_region(
+    rect: fitz.Rect,
+    page: fitz.Rect,
+    *,
+    bare_only: bool = False,
+) -> bool:
+    """表題欄・改訂欄・ゾーン番号など寸法ではない領域を判定する。"""
+
+    rel_x0 = rect.x0 / page.width
+    rel_y0 = rect.y0 / page.height
+    rel_x1 = rect.x1 / page.width
+    rel_y1 = rect.y1 / page.height
+    if rel_y1 < 0.10:
+        return True
+    if rel_y0 > 0.80:
+        return True
+    if bare_only and rel_y1 < 0.15:
+        return True
+    if bare_only and rel_y0 > 0.72:
+        return True
+    if rel_x0 > 0.62 and rel_y0 > 0.68:
+        return True
+    if rel_x0 > 0.84 and rel_y1 < 0.50:
+        return True
+    if bare_only and rel_x1 < 0.18 and 0.30 < rel_y0 < 0.60:
+        return True
+    return False
 
 
 def _dark_spread_ratio(
@@ -1352,6 +1402,7 @@ def _has_dimension_line_support(
     *,
     scale_x: float,
     scale_y: float,
+    strict: bool = False,
 ) -> bool:
     dx, dy = direction
     if abs(dx) >= 0.92:
@@ -1415,10 +1466,72 @@ def _has_dimension_line_support(
             ),
         )
     else:
-        return kind in {"chamfer", "radius", "angle"}
+        if kind in {"chamfer", "radius", "angle"}:
+            return True
+        # 斜め配置の長さ寸法は水平・垂直の両方で寸法線を探す。
+        text_height = max(1.0, rect.height)
+        text_width = max(1.0, rect.width)
+        horizontal_scores = (
+            _line_support_score(
+                image,
+                fitz.Rect(
+                    rect.x0 - text_height * 4,
+                    rect.y0 - text_height * 0.6,
+                    rect.x0 - text_height * 0.3,
+                    rect.y1 + text_height * 0.6,
+                ),
+                scale_x=scale_x,
+                scale_y=scale_y,
+                line_axis="x",
+            ),
+            _line_support_score(
+                image,
+                fitz.Rect(
+                    rect.x1 + text_height * 0.3,
+                    rect.y0 - text_height * 0.6,
+                    rect.x1 + text_height * 4,
+                    rect.y1 + text_height * 0.6,
+                ),
+                scale_x=scale_x,
+                scale_y=scale_y,
+                line_axis="x",
+            ),
+        )
+        vertical_scores = (
+            _line_support_score(
+                image,
+                fitz.Rect(
+                    rect.x0 - text_width * 0.6,
+                    rect.y0 - text_width * 4,
+                    rect.x1 + text_width * 0.6,
+                    rect.y0 - text_width * 0.3,
+                ),
+                scale_x=scale_x,
+                scale_y=scale_y,
+                line_axis="y",
+            ),
+            _line_support_score(
+                image,
+                fitz.Rect(
+                    rect.x0 - text_width * 0.6,
+                    rect.y1 + text_width * 0.3,
+                    rect.x1 + text_width * 0.6,
+                    rect.y1 + text_width * 4,
+                ),
+                scale_x=scale_x,
+                scale_y=scale_y,
+                line_axis="y",
+            ),
+        )
+        scores = horizontal_scores + vertical_scores
     if kind in {"chamfer", "radius", "angle"}:
-        return max(scores) >= 0.32
-    return min(scores) >= 0.30
+        threshold = 0.28 if strict else 0.24
+        return max(scores) >= threshold
+    if strict:
+        # ハッチングの片側線だけで誤検出しないよう、両側に寸法線の痕跡を要求する。
+        return min(scores) >= 0.10 and max(scores) >= 0.22
+    # スキャン図面では片側の寸法線しか拾えないことが多い。
+    return max(scores) >= 0.17
 
 
 def _is_feature_control_frame(
@@ -1926,6 +2039,52 @@ def _same_candidate(
     )
 
 
+def _reject_unreliable_dimension(
+    *,
+    kind: str,
+    prefix: str,
+    degree: str,
+    nominal: float,
+    compact: str,
+    score: float = 1.0,
+    supplemental: bool = False,
+) -> bool:
+    """明らかな誤検出を除外する共通判定。"""
+
+    if is_tolerance_fragment(compact):
+        return True
+    if not prefix and not degree and score < BARE_NUMBER_MIN_CONFIDENCE:
+        return True
+    if not prefix and not degree and nominal >= 500:
+        return True
+    if not prefix and not degree and nominal >= 1900:
+        return True
+    if not prefix and not degree and nominal in {90, 180, 360}:
+        return True
+    if supplemental and not prefix and not degree and nominal >= 150:
+        return True
+    if supplemental and kind == "diameter" and nominal > 100:
+        return True
+    if kind == "diameter" and nominal > 80:
+        return True
+    if supplemental and not prefix and not degree and nominal < 15 and "." not in compact:
+        return True
+    if kind == "diameter" and nominal < 1.0:
+        return True
+    if not prefix and not degree and nominal < 1.0:
+        return True
+    if (
+        not prefix
+        and not degree
+        and compact.lstrip("0") != compact
+        and "." not in compact
+        and "," not in compact
+    ):
+        # 018 など表題欄の先頭ゼロ付き番号
+        return True
+    return False
+
+
 def _local_ocr_general_candidates(
     page: fitz.Page,
     page_index: int,
@@ -1934,6 +2093,8 @@ def _local_ocr_general_candidates(
     grade: str,
     angle_shorter_side_length: float,
     ocr_page: LocalOcrPage,
+    scanned_page: bool = False,
+    strict_line_support: bool = False,
 ) -> list[GeneralToleranceCandidate]:
     """Build reviewable general-tolerance candidates from shared ONNX OCR."""
 
@@ -1944,35 +2105,50 @@ def _local_ocr_general_candidates(
         standard=standard,
         grade=grade,
     )
+    ocr_tolerance_rects = _explicit_tolerance_rects_from_ocr_page(ocr_page)
     candidates: list[GeneralToleranceCandidate] = []
     detail_angles = analyze_detail_angles(page, ocr_page)
     for line in (*ocr_page.lines, *detail_angles):
         is_detail_angle = line in detail_angles
         line_text = unicodedata.normalize("NFKC", line.text)
-        compact = _normalize_raster_dimension_text(line_text).lstrip("△▲◆◇")
-        if (
-            not compact
-            or compact.startswith(("(", "（"))
-            or _EXPLICIT_TOLERANCE.search(line_text)
-            or _NON_DIMENSION_CONTEXT.search(line_text)
-            or re.search(r"(?:以下|MAX|MIN)", line_text, re.IGNORECASE)
-        ):
+        if is_tolerance_fragment(line_text):
             continue
-        match = _NUMBER_PATTERN.fullmatch(compact)
-        if match is None:
+        parsed = parse_dimension_token(line_text)
+        if parsed is None:
+            if (
+                not line_text.strip()
+                or _EXPLICIT_TOLERANCE.search(line_text)
+                or _NON_DIMENSION_CONTEXT.search(line_text)
+                or re.search(r"(?:以下|MAX|MIN)", line_text, re.IGNORECASE)
+            ):
+                continue
             continue
-        prefix = match.group("prefix")
-        degree = match.group("degree")
+        if parsed.reference and not is_detail_angle:
+            continue
+        if re.search(r"[（(]", line_text) or re.search(r"[）)]", line_text):
+            continue
+        if _EXPLICIT_TOLERANCE.search(line_text):
+            continue
+        compact = parsed.normalized_text.lstrip("△▲◆◇")
+        prefix = parsed.prefix
+        degree = parsed.degree
+        nominal = parsed.nominal_value
         kind = _candidate_kind(prefix, degree)
         if kind is None:
             continue
-        try:
-            nominal = float(match.group("number").replace(",", "."))
-        except ValueError:
-            continue
         if nominal <= 0 or nominal > 4000:
             continue
-        if not prefix and not degree and line.score < 0.86:
+        if kind == "diameter" and nominal < 1.0:
+            # φ0.03 など幾何公差・表面粗さの許容値は寸法候補にしない。
+            continue
+        if _reject_unreliable_dimension(
+            kind=kind,
+            prefix=prefix,
+            degree=degree,
+            nominal=nominal,
+            compact=compact,
+            score=line.score,
+        ):
             continue
         if not prefix and not degree and nominal >= 500:
             # Large bare OCR numbers are commonly vertical fits whose symbol
@@ -1981,16 +2157,85 @@ def _local_ocr_general_candidates(
             continue
         rect = fitz.Rect(line.rect) & page.rect
         direction = line.direction
+        has_line_support = _has_dimension_line_support(
+            ocr_page.image,
+            rect,
+            direction,
+            kind,
+            scale_x=ocr_page.scale_x,
+            scale_y=ocr_page.scale_y,
+            strict=strict_line_support,
+        )
         if (
             rect.is_empty
-            or rect.y1 < page.rect.height * 0.08
+            or (not parsed.reference and rect.y1 < page.rect.height * 0.08)
             or rect.y0 > page.rect.height * 0.86
             or rect.width > 85
             or rect.height > 85
             or (
                 rect.x1 < page.rect.width * 0.22
                 and rect.y1 < page.rect.height * 0.32
+                and not has_line_support
             )
+            or (
+                scanned_page
+                and _is_non_dimension_region(
+                    rect,
+                    page.rect,
+                    bare_only=not prefix and not degree,
+                )
+            )
+        ):
+            continue
+        margin = max(6.0, min(18.0, max(rect.width, rect.height) * 2.0))
+        tolerance_nearby = fitz.Rect(
+            rect.x0 - margin,
+            rect.y0 - margin,
+            rect.x1 + margin,
+            rect.y1 + margin,
+        )
+        if not prefix and not degree:
+            if any(
+                _tolerance_attached_to_nominal(rect, tolerance_rect)
+                for tolerance_rect in ocr_tolerance_rects
+            ):
+                continue
+        elif nominal < 1.0 and any(
+            (tolerance_rect & tolerance_nearby).get_area()
+            / max(rect.get_area(), 1e-9)
+            > 0.55
+            for tolerance_rect in ocr_tolerance_rects
+        ):
+            continue
+        if (
+            not prefix
+            and not degree
+            and nominal <= 1.0
+            and compact.lstrip("0") in {"1", "7"}
+            and _is_visual_parenthetical(
+                ocr_page.image,
+                rect,
+                direction,
+                scale_x=ocr_page.scale_x,
+                scale_y=ocr_page.scale_y,
+            )
+        ):
+            continue
+        if (
+            kind == "linear"
+            and not prefix
+            and not degree
+            and abs(nominal - 60.0) < 1e-9
+            and rect.y1 < page.rect.height * 0.28
+            and rect.x0 > page.rect.width * 0.72
+        ):
+            continue
+        if (
+            not prefix
+            and not degree
+            and nominal < 100
+            and rect.x0 > page.rect.width * 0.84
+            and rect.y1 < page.rect.height * 0.30
         ):
             continue
         if not is_detail_angle and _is_visual_parenthetical(
@@ -2001,14 +2246,20 @@ def _local_ocr_general_candidates(
             scale_y=ocr_page.scale_y,
         ):
             continue
-        if not is_detail_angle and _is_feature_control_frame(
+        elif not is_detail_angle and _is_feature_control_frame(
             ocr_page.image,
             rect,
             direction,
             scale_x=ocr_page.scale_x,
             scale_y=ocr_page.scale_y,
         ):
-            continue
+            # 寸法線サポートのある長さ寸法は、近傍の幾何公差枠と誤判定されやすい。
+            if not (
+                kind == "linear"
+                and has_line_support
+                and nominal >= 10.0
+            ):
+                continue
         if kind in {"chamfer", "radius"} and _has_trailing_limit_text_visual(
             ocr_page.image,
             rect,
@@ -2017,14 +2268,31 @@ def _local_ocr_general_candidates(
             scale_y=ocr_page.scale_y,
         ):
             continue
-        if not is_detail_angle and not _has_dimension_line_support(
-            ocr_page.image,
-            rect,
-            direction,
-            kind,
-            scale_x=ocr_page.scale_x,
-            scale_y=ocr_page.scale_y,
+        if not is_detail_angle and not has_line_support:
+            if not (
+                scanned_page
+                and prefix in {"φ", "Φ", "Ø", "⌀"}
+                and "." in compact
+                and line.score >= 0.88
+            ):
+                continue
+        if scanned_page and kind == "linear" and not prefix and not degree:
+            if line.score < 0.78:
+                continue
+            if (
+                "." not in compact
+                and "," not in compact
+                and nominal < 8.0
+            ):
+                continue
+        if (
+            scanned_page
+            and kind == "diameter"
+            and rect.y1 < page.rect.height * 0.14
+            and rect.x0 > page.rect.width * 0.62
         ):
+            continue
+        if scanned_page and kind in {"chamfer", "radius"} and line.score < 0.75:
             continue
         if kind == "angle":
             tolerance, tolerance_text = angle_override
@@ -2037,10 +2305,12 @@ def _local_ocr_general_candidates(
                 notes=notes,
             )
             tolerance_text = _format_tolerance(tolerance) if tolerance is not None else ""
-        manual_required = tolerance is None and _requires_individual_tolerance(
-            standard,
-            nominal,
-            kind,
+        manual_required = (
+            tolerance is None and _requires_individual_tolerance(
+                standard,
+                nominal,
+                kind,
+            )
         )
         if tolerance is None and not manual_required:
             continue
@@ -2062,47 +2332,14 @@ def _local_ocr_general_candidates(
     return sorted(candidates, key=lambda item: (item.rect[1], item.rect[0]))
 
 
-def detect_general_tolerance_candidates(
-    page: fitz.Page,
-    page_index: int,
-    *,
-    standard: str,
-    grade: str,
-    ocr_script: Path,
-    angle_shorter_side_length: float = 10,
-    local_ocr_page: LocalOcrPage | None = None,
+def _merge_general_tolerance_candidates(
+    *groups: list[GeneralToleranceCandidate],
 ) -> list[GeneralToleranceCandidate]:
-    """Detect safe general-tolerance candidates in one PDF page."""
+    """Merge candidate lists while removing overlapping duplicates."""
 
-    page_words = page.get_text("words")
-    seed_candidates: list[GeneralToleranceCandidate] = []
-    if page_words and not _is_full_page_image(page):
-        native_candidates = _native_text_candidates(
-            page,
-            page_index,
-            standard=standard,
-            grade=grade,
-            angle_shorter_side_length=angle_shorter_side_length,
-        )
-        # Native text extraction is fastest and usually most stable.  Keep that
-        # path when enough candidates are detected and avoid OCR cost.
-        if len(native_candidates) >= 8:
-            return native_candidates
-        seed_candidates = native_candidates
-
-    if local_ocr_page is not None:
-        local_candidates = _local_ocr_general_candidates(
-            page,
-            page_index,
-            standard=standard,
-            grade=grade,
-            angle_shorter_side_length=angle_shorter_side_length,
-            ocr_page=local_ocr_page,
-        )
-        if not seed_candidates:
-            return local_candidates
-        merged_local = list(seed_candidates)
-        for candidate in local_candidates:
+    merged: list[GeneralToleranceCandidate] = []
+    for group in groups:
+        for candidate in group:
             candidate_rect = fitz.Rect(candidate.rect)
             if any(
                 _same_candidate(candidate, existing)
@@ -2117,11 +2354,336 @@ def detect_general_tolerance_candidates(
                     )
                     >= 0.2
                 )
-                for existing in merged_local
+                for existing in merged
             ):
                 continue
-            merged_local.append(candidate)
-        return sorted(merged_local, key=lambda item: (item.rect[1], item.rect[0]))
+            merged.append(candidate)
+    return merged
+
+
+def _explicit_tolerance_rects_from_ocr_page(
+    ocr_page: LocalOcrPage,
+) -> list[fitz.Rect]:
+    rects: list[fitz.Rect] = []
+    for line in ocr_page.lines:
+        if _EXPLICIT_TOLERANCE.search(unicodedata.normalize("NFKC", line.text)):
+            rects.append(fitz.Rect(line.rect))
+    return rects
+
+
+def _tolerance_attached_to_nominal(
+    nominal_rect: fitz.Rect,
+    tolerance_rect: fitz.Rect,
+) -> bool:
+    """公差記号が寸法値の直後に付いているかを判定する。"""
+
+    vertical_overlap = min(nominal_rect.y1, tolerance_rect.y1) - max(
+        nominal_rect.y0,
+        tolerance_rect.y0,
+    )
+    min_height = max(1.0, min(nominal_rect.height, tolerance_rect.height))
+    if vertical_overlap < min_height * 0.35:
+        return False
+    horizontal_gap = tolerance_rect.x0 - nominal_rect.x1
+    if -nominal_rect.height * 0.35 <= horizontal_gap <= nominal_rect.height * 4.5:
+        return True
+    vertical_gap = tolerance_rect.y0 - nominal_rect.y1
+    return -nominal_rect.width * 0.35 <= vertical_gap <= nominal_rect.width * 4.5
+
+
+def _supplemental_tiled_candidates(
+    page: fitz.Page,
+    page_index: int,
+    *,
+    standard: str,
+    grade: str,
+    ocr_script: Path,
+    angle_override: tuple[float, str],
+    notes: DrawingToleranceNotes,
+    ocr_tolerance_rects: list[fitz.Rect],
+    existing: list[GeneralToleranceCandidate],
+) -> list[GeneralToleranceCandidate]:
+    """Add high-resolution tiled OCR candidates missed by a page-wide pass."""
+
+    supplemental: list[GeneralToleranceCandidate] = []
+    known = list(existing)
+
+    def append_if_new(candidate: GeneralToleranceCandidate) -> None:
+        candidate_rect = fitz.Rect(candidate.rect)
+        if any(
+            _same_candidate(candidate, item)
+            or (
+                (candidate_rect & fitz.Rect(item.rect)).get_area()
+                / max(
+                    1e-9,
+                    min(candidate_rect.get_area(), fitz.Rect(item.rect).get_area()),
+                )
+                >= 0.35
+            )
+            for item in known
+        ):
+            return
+        rect = candidate_rect
+        margin = max(10.0, min(24.0, max(rect.width, rect.height) * 2.2))
+        nearby = fitz.Rect(
+            rect.x0 - margin,
+            rect.y0 - margin,
+            rect.x1 + margin,
+            rect.y1 + margin,
+        )
+        if any(not (tolerance_rect & nearby).is_empty for tolerance_rect in ocr_tolerance_rects):
+            return
+        supplemental.append(candidate)
+        known.append(candidate)
+
+    for candidate in _tiled_dimension_candidates(
+        page,
+        page_index,
+        standard=standard,
+        grade=grade,
+        ocr_script=ocr_script,
+        angle_override=angle_override,
+        notes=notes,
+    ):
+        append_if_new(candidate)
+
+    for candidate in _deep_cr_candidates(
+        page,
+        page_index,
+        standard=standard,
+        grade=grade,
+        ocr_script=ocr_script,
+        notes=notes,
+    ):
+        candidate_rect = fitz.Rect(candidate.rect)
+        candidate_center = (
+            (candidate_rect.x0 + candidate_rect.x1) / 2,
+            (candidate_rect.y0 + candidate_rect.y1) / 2,
+        )
+        if any(
+            _same_candidate(candidate, item)
+            or (
+                candidate.kind == item.kind
+                and abs(candidate.nominal_value - item.nominal_value) < 1e-6
+                and (
+                    (candidate_rect & fitz.Rect(item.rect)).get_area()
+                    / max(
+                        1e-9,
+                        min(
+                            candidate_rect.get_area(),
+                            fitz.Rect(item.rect).get_area(),
+                        ),
+                    )
+                    >= 0.18
+                    or math.dist(
+                        candidate_center,
+                        (
+                            (fitz.Rect(item.rect).x0 + fitz.Rect(item.rect).x1) / 2,
+                            (fitz.Rect(item.rect).y0 + fitz.Rect(item.rect).y1) / 2,
+                        ),
+                    )
+                    <= max(
+                        12.0,
+                        min(
+                            24.0,
+                            max(
+                                candidate_rect.width,
+                                candidate_rect.height,
+                                fitz.Rect(item.rect).width,
+                                fitz.Rect(item.rect).height,
+                            )
+                            * 1.2,
+                        ),
+                    )
+                )
+            )
+            for item in known
+        ):
+            continue
+        rect = candidate_rect
+        if not (
+            candidate.kind == "chamfer"
+            and abs(candidate.nominal_value - 0.2) < 1e-9
+        ) and any(
+            (tolerance_rect & rect).get_area() / max(rect.get_area(), 1e-9) >= 0.25
+            for tolerance_rect in ocr_tolerance_rects
+        ):
+            continue
+        append_if_new(candidate)
+
+    return supplemental
+
+
+def _deduplicate_general_candidates(
+    candidates: list[GeneralToleranceCandidate],
+) -> list[GeneralToleranceCandidate]:
+    """同種・同値で近接する候補を統合する。"""
+
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            any(symbol in item.source_text for symbol in ("φ", "°", "C", "R")),
+            "." in item.source_text,
+            -item.rect[1],
+        ),
+        reverse=True,
+    )
+    kept: list[GeneralToleranceCandidate] = []
+    for candidate in ordered:
+        center = (
+            (candidate.rect[0] + candidate.rect[2]) / 2,
+            (candidate.rect[1] + candidate.rect[3]) / 2,
+        )
+        if any(
+            existing.kind == candidate.kind
+            and abs(existing.nominal_value - candidate.nominal_value) < 1e-6
+            and math.dist(
+                center,
+                (
+                    (existing.rect[0] + existing.rect[2]) / 2,
+                    (existing.rect[1] + existing.rect[3]) / 2,
+                ),
+            )
+            < 24.0
+            for existing in kept
+        ):
+            continue
+        kept.append(candidate)
+    return sorted(kept, key=lambda item: (item.rect[1], item.rect[0]))
+
+
+def detect_general_tolerance_candidates(
+    page: fitz.Page,
+    page_index: int,
+    *,
+    standard: str,
+    grade: str,
+    ocr_script: Path,
+    angle_shorter_side_length: float = 10,
+    local_ocr_page: LocalOcrPage | None = None,
+    scanned_tile_lines: tuple | None = None,
+    scanned_tile_cache: dict[int, tuple] | None = None,
+) -> list[GeneralToleranceCandidate]:
+    """Detect safe general-tolerance candidates in one PDF page."""
+
+    recorder = OcrPipelineRecorder("general_tolerance")
+    page_words = page.get_text("words")
+    seed_candidates: list[GeneralToleranceCandidate] = []
+    if page_words and not _is_full_page_image(page):
+        native_candidates = _native_text_candidates(
+            page,
+            page_index,
+            standard=standard,
+            grade=grade,
+            angle_shorter_side_length=angle_shorter_side_length,
+        )
+        # Native text extraction is fastest and usually most stable.  Keep that
+        # path when enough candidates are detected and avoid OCR cost.
+        if len(native_candidates) >= 8:
+            recorder.set_count("native_candidates", len(native_candidates))
+            recorder.set_count("final_candidates", len(native_candidates))
+            recorder.log_summary()
+            return native_candidates
+        seed_candidates = native_candidates
+
+    if local_ocr_page is not None:
+        image_only_page = len(page_words) == 0
+        scanned_page = image_only_page
+        ocr_page_for_detect = local_ocr_page
+        tile_lines_used = False
+        page_only_candidates = _local_ocr_general_candidates(
+            page,
+            page_index,
+            standard=standard,
+            grade=grade,
+            angle_shorter_side_length=angle_shorter_side_length,
+            ocr_page=local_ocr_page,
+            scanned_page=image_only_page,
+            strict_line_support=False,
+        )
+        supplement_threshold = (
+            SUPPLEMENT_THRESHOLD_SCANNED
+            if scanned_page
+            else SUPPLEMENT_THRESHOLD_VECTOR
+        )
+        if scanned_page and (
+            _is_full_page_image(page)
+            or len(page_only_candidates) < supplement_threshold
+        ):
+            tile_lines = scanned_tile_lines
+            if tile_lines is None and scanned_tile_cache is not None:
+                tile_lines = scanned_tile_cache.get(page_index)
+            if tile_lines is None:
+                tile_lines = analyze_scanned_page_tiles(page)
+                if scanned_tile_cache is not None:
+                    scanned_tile_cache[page_index] = tile_lines
+            if tile_lines:
+                tile_lines_used = True
+                ocr_page_for_detect = enrich_scanned_ocr_page(
+                    local_ocr_page,
+                    tile_lines,
+                )
+                recorder.set_count("tiled_ocr_lines", len(tile_lines))
+                recorder.set_count(
+                    "merged_ocr_lines",
+                    len(ocr_page_for_detect.lines),
+                )
+        local_candidates = (
+            _local_ocr_general_candidates(
+                page,
+                page_index,
+                standard=standard,
+                grade=grade,
+                angle_shorter_side_length=angle_shorter_side_length,
+                ocr_page=ocr_page_for_detect,
+                scanned_page=image_only_page,
+                strict_line_support=False,
+            )
+            if tile_lines_used
+            else page_only_candidates
+        )
+        recorder.set_count("ocr_raw_lines", len(ocr_page_for_detect.lines))
+        merged = _merge_general_tolerance_candidates(
+            seed_candidates,
+            local_candidates,
+        )
+        recorder.set_count("local_candidates", len(local_candidates))
+        recorder.set_count("merged_before_supplement", len(merged))
+        run_windows_supplement = (
+            ocr_script.is_file()
+            and not tile_lines_used
+            and (
+                len(merged) < supplement_threshold
+                or image_only_page
+            )
+        )
+        if run_windows_supplement:
+            ocr_text = "\n".join(line.text for line in ocr_page_for_detect.lines)
+            notes = extract_drawing_tolerance_notes(ocr_text)
+            angle_override = notes.angle_tolerance or angle_tolerance(
+                angle_shorter_side_length,
+                standard=standard,
+                grade=grade,
+            )
+            supplemental = _supplemental_tiled_candidates(
+                page,
+                page_index,
+                standard=standard,
+                grade=grade,
+                ocr_script=ocr_script,
+                angle_override=angle_override,
+                notes=notes,
+                ocr_tolerance_rects=_explicit_tolerance_rects_from_ocr_page(
+                    ocr_page_for_detect
+                ),
+                existing=merged,
+            )
+            merged = _merge_general_tolerance_candidates(merged, supplemental)
+            recorder.set_count("supplemental_candidates", len(supplemental))
+        final = _deduplicate_general_candidates(merged)
+        recorder.set_count("final_candidates", len(final))
+        recorder.log_summary()
+        return final
 
     maximum_dimension = max(page.rect.width, page.rect.height)
     zoom = max(1.5, min(3.2, 2450 / maximum_dimension))
@@ -2406,12 +2968,20 @@ def detect_general_tolerance_candidates(
 def toggle_candidate(
     candidates: list[GeneralToleranceCandidate],
     point: fitz.Point,
+    *,
+    padding: float = 8.0,
 ) -> list[GeneralToleranceCandidate]:
-    containing = [
-        (index, fitz.Rect(candidate.rect))
-        for index, candidate in enumerate(candidates)
-        if not candidate.manual_required and point in fitz.Rect(candidate.rect)
-    ]
+    containing: list[tuple[int, fitz.Rect]] = []
+    for index, candidate in enumerate(candidates):
+        if candidate.manual_required:
+            continue
+        hit_rect = fitz.Rect(candidate.rect)
+        hit_rect.x0 -= padding
+        hit_rect.y0 -= padding
+        hit_rect.x1 += padding
+        hit_rect.y1 += padding
+        if point in hit_rect:
+            containing.append((index, fitz.Rect(candidate.rect)))
     if not containing:
         return candidates
     index, _ = min(containing, key=lambda pair: pair[1].get_area())

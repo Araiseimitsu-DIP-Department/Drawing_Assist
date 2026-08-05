@@ -34,6 +34,7 @@
     zoomLabel: $("#zoomLabel"),
     zoomOut: $("#zoomOutButton"),
     zoomIn: $("#zoomInButton"),
+    buildLabel: $("#buildLabel"),
     toolName: $("#settingsToolName"),
     modeHelp: $("#modeHelp"),
     opacity: $("#opacityRange"),
@@ -104,12 +105,22 @@
     generalToleranceAngleLength: $("#generalToleranceAngleLength"),
     scanGeneralTolerance: $("#scanGeneralToleranceButton"),
     applyGeneralTolerance: $("#applyGeneralToleranceButton"),
+    removeAppliedTolerance: $("#removeAppliedToleranceButton"),
+    scanDimensionMarkings: $("#scanDimensionMarkingsButton"),
     applyDimensionMarkings: $("#applyDimensionMarkingsButton"),
+    removeDimensionMarking: $("#removeDimensionMarkingButton"),
     dimensionMarkingHint: $("#dimensionMarkingHint"),
+    dimensionMarkingCandidateCount: $("#dimensionMarkingCandidateCount"),
     dimensionFixTools: $(".dimension-fix-tools"),
     dimensionFixStatus: $("#dimensionFixStatus"),
     generalToleranceCandidateCount: $("#generalToleranceCandidateCount"),
     generalToleranceHint: $("#generalToleranceHint"),
+    toleranceFlowDetect: $("#toleranceFlowDetect"),
+    toleranceFlowReview: $("#toleranceFlowReview"),
+    toleranceFlowApply: $("#toleranceFlowApply"),
+    markingFlowDetect: $("#markingFlowDetect"),
+    markingFlowReview: $("#markingFlowReview"),
+    markingFlowApply: $("#markingFlowApply"),
     toast: $("#toast"),
     taskStep: $("#taskStep"),
     taskTitle: $("#taskTitle"),
@@ -121,8 +132,8 @@
 
   const toolInfo = {
     word: {
-      name: "寸法・公差を色分けする",
-      help: "寸法と公差をまとめて色分けし、必要な箇所だけ手動で調整します。",
+      name: "寸法を色分け",
+      help: "寸法と公差を基準色で一括色分けします。",
       cursor: "crosshair",
     },
     work_shape: {
@@ -141,8 +152,8 @@
       cursor: "text",
     },
     general_tolerance: {
-      name: "公差をまとめて入れる",
-      help: "規格を選び、検出した候補を確認してから一括反映します。",
+      name: "公差を入れる",
+      help: "規格を選び、検出した寸法に公差を一括反映します。",
       cursor: "pointer",
     },
     dimension: {
@@ -201,6 +212,86 @@
   };
   let editableItemDrag = null;
   let editableItemPreview = null;
+  let removeAppliedToleranceMode = false;
+  let removeDimensionMarkingMode = false;
+
+  function setRemoveAppliedToleranceMode(enabled) {
+    removeAppliedToleranceMode = Boolean(enabled);
+    elements.removeAppliedTolerance?.classList.toggle(
+      "active-toggle",
+      removeAppliedToleranceMode
+    );
+    if (elements.removeAppliedTolerance) {
+      elements.removeAppliedTolerance.textContent = removeAppliedToleranceMode
+        ? "解除モード ON（クリックで解除）"
+        : "不要な公差を解除";
+    }
+    updateButtons();
+  }
+
+  function setRemoveDimensionMarkingMode(enabled) {
+    removeDimensionMarkingMode = Boolean(enabled);
+    elements.removeDimensionMarking?.classList.toggle(
+      "active-toggle",
+      removeDimensionMarkingMode
+    );
+    if (elements.removeDimensionMarking) {
+      elements.removeDimensionMarking.textContent = removeDimensionMarkingMode
+        ? "解除モード ON（クリックで解除）"
+        : "不要な色を解除";
+    }
+    updateButtons();
+  }
+
+  function updateMarkingFlowSteps() {
+    const hasCandidates = Number(
+      currentState.dimension_marking_candidate_count || 0
+    ) > 0;
+    const marked = Boolean(currentState.general_tolerance_marked);
+    const steps = [
+      elements.markingFlowDetect,
+      elements.markingFlowReview,
+      elements.markingFlowApply,
+    ];
+    if (!steps[0]) return;
+    steps.forEach((step) => step.classList.remove("active", "done"));
+    if (marked) {
+      steps[0].classList.add("done");
+      steps[1].classList.add("done");
+      steps[2].classList.add("done");
+    } else if (hasCandidates) {
+      steps[0].classList.add("done");
+      steps[1].classList.add("active");
+    } else {
+      steps[0].classList.add("active");
+    }
+  }
+
+  function updateToleranceFlowSteps() {
+    const hasCandidates = Number(
+      currentState.general_tolerance_candidate_count || 0
+    ) > 0;
+    const hasApplied = Number(
+      currentState.general_tolerance_applied_count || 0
+    ) > 0;
+    const steps = [
+      elements.toleranceFlowDetect,
+      elements.toleranceFlowReview,
+      elements.toleranceFlowApply,
+    ];
+    if (!steps[0]) return;
+    steps.forEach((step) => step.classList.remove("active", "done"));
+    if (hasApplied) {
+      steps[0].classList.add("done");
+      steps[1].classList.add("done");
+      steps[2].classList.add("done");
+    } else if (hasCandidates) {
+      steps[0].classList.add("done");
+      steps[1].classList.add("active");
+    } else {
+      steps[0].classList.add("active");
+    }
+  }
 
   function settings() {
     return {
@@ -251,9 +342,13 @@
         "公差の配置を計算しています",
         "寸法線や文字との重なりを確認しています",
       ],
+      scan_dimension_markings: [
+        "色分け対象を検出しています",
+        "寸法値と公差の候補を整理しています",
+      ],
       apply_dimension_markings: [
-        "寸法・公差を色分けしています",
-        "画像PDFではOCR対象を追加検出しています",
+        "色分けを反映しています",
+        "選択した候補を図面へ追加しています",
       ],
       save_pdf: ["PDFを書き出しています", "編集内容を保存しています"],
       open_pdf: ["PDFを読み込んでいます", "ページを準備しています"],
@@ -279,6 +374,7 @@
       .concat([
         elements.scanGeneralTolerance,
         elements.applyGeneralTolerance,
+        elements.scanDimensionMarkings,
         elements.applyDimensionMarkings,
       ])
       .forEach((button) => { button.disabled = value; });
@@ -309,25 +405,35 @@
     if (!loaded) {
       step = "1";
       title = "PDFを開く";
-      detail = "中央の「PDFを選択」を押すか、PDFを画面へドロップしてください。";
+      detail = "画面へドロップするか「PDFを選択」を押します。";
     } else if (currentState.word_candidate) {
       step = "3";
-      title = "色の付いた範囲を確認";
-      detail = "合っていれば「マークを確定」、違っていれば「やり直す」を押します。";
+      title = "範囲を確認";
+      detail = "合っていれば「マークを確定」、違えば「やり直す」。";
     } else if (currentMode === "word") {
       const appliedCount = Number(
         currentState.general_tolerance_applied_count || 0
       );
-      if (appliedCount > 0 && !currentState.general_tolerance_marked) {
-        title = "修正した寸法も含めて基準色で塗る";
-        detail = "追加・書き直し・二重線の修正が終わったら、右のボタンでまとめて色分けします。";
+      const markingCandidateCount = Number(
+        currentState.dimension_marking_candidate_count || 0
+      );
+      if (removeDimensionMarkingMode && currentState.general_tolerance_marked) {
+        title = "不要な色をクリック";
+        detail = "ピンク・黄色のマーキング上を選びます。";
+      } else if (markingCandidateCount > 0 && !currentState.general_tolerance_marked) {
+        step = "2";
+        title = "色分け候補を確認";
+        detail = "ピンク・黄色＝対象、灰色＝除外。クリックで切替。";
+      } else if (appliedCount > 0 && !currentState.general_tolerance_marked) {
+        title = "対象寸法を検出";
+        detail = "右の「対象寸法を検出」を押します。";
       } else if (currentState.general_tolerance_marked) {
         step = "3";
-        title = "必要な箇所を手動で修正・追加";
-        detail = "文字をクリックします。うまく選べない箇所はドラッグで囲めます。";
+        title = "手動で追加・修正";
+        detail = "文字をクリック。選べないときはドラッグ。";
       } else {
-        title = "先に公差をまとめて入れる";
-        detail = "左の「公差をまとめて入れる」を完了してから、色分けへ進みます。";
+        title = "先に①公差を反映";
+        detail = "左の「① 公差を入れる」を完了してください。";
       }
     } else if (currentMode === "work_shape") {
       const style = elements.workShapeStyle.value;
@@ -379,16 +485,21 @@
         currentState.general_tolerance_candidate_count || 0
       );
       if (candidateCount > 0) {
-        step = "3";
-        title = "検出した寸法を確認";
-        detail = "水色は一括反映、灰色は除外です。オレンジ色がある場合は個別確認対象です。";
+        step = "2";
+        title = "候補を確認";
+        detail = "水色＝反映、灰色＝除外。クリックで切替。";
       } else if (Number(currentState.general_tolerance_applied_count || 0) > 0) {
         step = "3";
-        title = "公差の反映が完了";
-        detail = "必要な寸法があれば左の「必要な寸法を整える」で修正し、その後「寸法・公差を色分けする」へ進みます。";
+        title = removeAppliedToleranceMode
+          ? "不要な公差をクリック"
+          : "公差を反映済み";
+        detail = removeAppliedToleranceMode
+          ? "寸法値または追加公差の近くを選びます。"
+          : "次は左の「③ 寸法を色分け」へ進みます。";
       } else {
-        title = "使う規格を選んで寸法を確認";
-        detail = "右の「対象寸法を検出・確認」を押してください。";
+        step = "1";
+        title = "規格を選んで検出";
+        detail = "右の「対象寸法を検出」を押します。";
       }
     } else if (currentMode === "strike") {
       title = "消したい寸法をクリック";
@@ -451,23 +562,23 @@
 
     if (elements.dimensionFixStatus) {
       elements.dimensionFixStatus.textContent = !toleranceDone
-        ? "公差反映後に行います"
+        ? "①のあと"
         : marked
-          ? "確認済み"
+          ? "完了"
           : correctionCount > 0
-            ? `${correctionCount}件を修正済み`
-            : "必要な場合のみ";
+            ? `${correctionCount}件修正済み`
+            : "必要なときだけ";
     }
 
     const markingCaption = markingTool?.querySelector("small");
     if (markingCaption) {
       markingCaption.textContent = !toleranceDone
-        ? "公差反映後に進みます"
+        ? "①のあと"
         : marked
-          ? "色分け済み・手動調整"
+          ? "色分け済み"
           : correctionCount > 0
-            ? `修正${correctionCount}件を含めて一括色分け`
-            : "寸法と公差を一括色分け";
+            ? `修正${correctionCount}件を含む`
+            : "一括色分け";
     }
 
     if (
@@ -500,13 +611,21 @@
       toleranceCandidateCount - toleranceManualCount
     );
     const hasToleranceCandidates = toleranceCandidateCount > 0;
+    const markingCandidateCount = Number(
+      currentState.dimension_marking_candidate_count || 0
+    );
+    const markingSelectedCount = Number(
+      currentState.dimension_marking_selected_count || 0
+    );
+    const hasMarkingCandidates = markingCandidateCount > 0;
+    const marked = Boolean(currentState.general_tolerance_marked);
     elements.save.disabled =
       busy || !loaded || hasAutoCandidate || hasWordCandidate ||
-      hasToleranceCandidates;
+      hasToleranceCandidates || hasMarkingCandidates;
     elements.undo.disabled =
       busy || !loaded ||
       (!currentState.item_count && !hasAutoCandidate && !hasWordCandidate &&
-        !hasToleranceCandidates);
+        !hasToleranceCandidates && !hasMarkingCandidates);
     elements.clearPage.disabled = busy || !loaded || !currentState.page_item_count;
     elements.clearAll.disabled = busy || !loaded || !currentState.item_count;
     elements.previous.disabled = busy || !loaded || currentState.page_index <= 0;
@@ -541,34 +660,59 @@
     elements.scanGeneralTolerance.disabled = busy || !loaded;
     elements.applyGeneralTolerance.disabled =
       busy || !loaded || toleranceSelectedCount < 1;
+    const appliedToleranceCount = Number(
+      currentState.general_tolerance_applied_count || 0
+    );
+    const hasAppliedTolerance = appliedToleranceCount > 0;
+    elements.removeAppliedTolerance?.classList.toggle(
+      "hidden",
+      !loaded || hasToleranceCandidates || !hasAppliedTolerance
+    );
+    elements.removeAppliedTolerance.disabled = busy || !loaded;
+    elements.scanDimensionMarkings.disabled =
+      busy || !loaded || appliedToleranceCount < 1 || marked;
     elements.applyDimensionMarkings.disabled =
-      busy || !loaded ||
-      Number(currentState.general_tolerance_applied_count || 0) < 1 ||
-      Boolean(currentState.general_tolerance_marked);
-    const correctionCount =
-      Number(currentState.added_dimension_count || 0) +
-      Number(currentState.replacement_dimension_count || 0) +
-      Number(currentState.struck_dimension_count || 0);
+      busy || !loaded || markingSelectedCount < 1 || marked;
+    elements.removeDimensionMarking?.classList.toggle(
+      "hidden",
+      !loaded || !marked
+    );
+    elements.removeDimensionMarking.disabled = busy || !loaded;
+    elements.dimensionMarkingCandidateCount.textContent = marked
+      ? `${appliedToleranceCount}件 反映済み`
+      : hasMarkingCandidates
+        ? `${markingSelectedCount} / ${markingCandidateCount}件`
+        : appliedToleranceCount > 0
+          ? "未検出"
+          : "—";
     elements.dimensionMarkingHint.textContent =
-      Boolean(currentState.general_tolerance_marked)
-        ? "一括で色分け済みです。続けて図面上の文字をクリックまたはドラッグし、手動で修正・追加できます。"
-        : Number(currentState.general_tolerance_applied_count || 0) > 0
-          ? correctionCount > 0
-            ? `公差反映分と修正${correctionCount}件を、基準色でまとめて色分けします。`
-            : `${currentState.general_tolerance_applied_count}件の寸法値と追加公差を色分けできます。`
-          : "先に「公差をまとめて入れる」で公差を反映してください。";
+      removeDimensionMarkingMode && marked
+        ? "解除モード中。不要な色をクリックしてください。"
+        : marked
+        ? "色分け済み。不要な色は上のボタンで解除できます。"
+        : hasMarkingCandidates
+          ? "ピンク・黄色＝対象、灰色＝除外。クリックで切替。"
+          : appliedToleranceCount > 0
+            ? "①検出 → ②クリックで確認 → ③一括反映"
+            : "先に①で公差を反映してください。";
+    updateMarkingFlowSteps();
     elements.generalToleranceCandidateCount.textContent = hasToleranceCandidates
       ? toleranceManualCount > 0
-        ? `${toleranceSelectedCount} / ${toleranceAutomaticCount}件（要確認 ${toleranceManualCount}件）`
+        ? `${toleranceSelectedCount} / ${toleranceAutomaticCount}件（要確認 ${toleranceManualCount}）`
         : `${toleranceSelectedCount} / ${toleranceAutomaticCount}件`
-      : "未検出";
+      : hasAppliedTolerance
+        ? `${appliedToleranceCount}件 反映済み`
+        : "未検出";
     elements.generalToleranceHint.textContent = hasToleranceCandidates
       ? toleranceManualCount > 0
-        ? "水色が反映対象、灰色が除外です。オレンジ色は個別確認が必要な候補です。"
-        : "水色が反映対象、灰色が除外です。候補をクリックして切り替えられます。"
-      : Number(currentState.general_tolerance_applied_count || 0) > 0
-        ? `${currentState.general_tolerance_applied_count}件を反映済みです。続けて「寸法・公差を色分けする」へ進んでください。`
-        : "検出後、水色の候補をクリックすると除外できます。灰色を再クリックすると戻せます。";
+        ? "水色＝反映、灰色＝除外。オレンジは個別確認。"
+        : "水色＝反映、灰色＝除外。クリックで切替。"
+      : hasAppliedTolerance
+        ? removeAppliedToleranceMode
+          ? "解除モード中。不要な箇所をクリックしてください。"
+          : "反映済み。次は③の色分けへ。不要な公差は上のボタンで解除。"
+        : "①検出 → ②クリックで確認 → ③一括反映";
+    updateToleranceFlowSteps();
     elements.wordCandidateBar.classList.toggle(
       "hidden",
       !hasWordCandidate
@@ -691,7 +835,9 @@
       elements.fileName.textContent = state.file_name;
       const kind = state.has_text
         ? "文字情報あり"
-        : "画像PDF・アウトラインPDF（クリック自動選択対応）";
+        : state.page_uses_local_ocr
+          ? "画像PDF（高解像度OCR）"
+          : "画像PDF・アウトラインPDF（クリック自動選択対応）";
       elements.fileMeta.textContent =
         `${kind} ・ このページの追加 ${state.page_item_count}件`;
       elements.pageLabel.textContent = `${state.page_number} / ${state.page_count}`;
@@ -705,6 +851,13 @@
     }
 
     setStatus(state.message || "準備完了");
+
+    if (elements.buildLabel) {
+      const buildId = state.build_id || "不明";
+      const ocrState = state.local_ocr_ready ? "OCR有効" : "OCR無効";
+      elements.buildLabel.textContent = `${buildId} / ${ocrState}`;
+      elements.buildLabel.title = `ビルド ${buildId} ・ ローカルOCR ${ocrState}`;
+    }
     const needsDecision = Boolean(
       state.word_candidate || state.work_region_candidate_count ||
       state.general_tolerance_candidate_count
@@ -806,6 +959,19 @@
       currentState.general_tolerance_candidate_count
     ) {
       callApi("cancel_general_tolerance_candidates");
+    }
+    if (
+      currentMode === "word" &&
+      mode !== "word" &&
+      currentState.dimension_marking_candidate_count
+    ) {
+      callApi("cancel_dimension_marking_candidates");
+    }
+    if (mode !== "general_tolerance") {
+      setRemoveAppliedToleranceMode(false);
+    }
+    if (mode !== "word") {
+      setRemoveDimensionMarkingMode(false);
     }
     currentMode = mode;
     const mainModes = ["general_tolerance", "word", "work_shape"];
@@ -1482,7 +1648,11 @@
         return;
       }
       if (currentMode === "general_tolerance") {
-        callApi("select_general_tolerance_addition", { x: point.x, y: point.y });
+        if (removeAppliedToleranceMode) {
+          callApi("remove_applied_general_tolerance", { x: point.x, y: point.y });
+        } else {
+          callApi("select_general_tolerance_addition", { x: point.x, y: point.y });
+        }
       } else {
         callApi(
           "apply_action",
@@ -1539,12 +1709,32 @@
     if (currentMode === "general_tolerance") {
       if (currentState.general_tolerance_candidate_count) {
         callApi("toggle_general_tolerance", { x: point.x, y: point.y });
+      } else if (removeAppliedToleranceMode) {
+        callApi("remove_applied_general_tolerance", { x: point.x, y: point.y });
       } else {
-        showToast("先に右側の「対象寸法を検出・確認」を押してください。");
+        showToast("先に「対象寸法を検出」を押してください。");
       }
       return;
     }
-    const dragMode = currentMode === "word" ||
+    if (
+      currentMode === "word" &&
+      removeDimensionMarkingMode &&
+      currentState.general_tolerance_marked
+    ) {
+      callApi("remove_dimension_marking", { x: point.x, y: point.y });
+      return;
+    }
+    if (
+      currentMode === "word" &&
+      Number(currentState.dimension_marking_candidate_count || 0) > 0 &&
+      !currentState.general_tolerance_marked
+    ) {
+      callApi("toggle_dimension_marking", { x: point.x, y: point.y });
+      return;
+    }
+    const dragMode =
+      (currentMode === "word" &&
+        !Number(currentState.dimension_marking_candidate_count || 0)) ||
       currentMode === "dimension" ||
       (currentMode === "replace" && !currentState.has_text);
     if (dragMode) {
@@ -1584,6 +1774,15 @@
         const x0 = Math.max(0, Math.min(currentState.pdf_width - width, initial[0] + deltaX));
         const y0 = Math.max(0, Math.min(currentState.pdf_height - height, initial[1] + deltaY));
         rect = [x0, y0, x0 + width, y0 + height];
+      } else if (currentMode === "general_tolerance") {
+        const initialWidth = Math.max(1, initial[2] - initial[0]);
+        const initialHeight = Math.max(1, initial[3] - initial[1]);
+        const widthScale = Math.max(0.35, (initialWidth + deltaX) / initialWidth);
+        const heightScale = Math.max(0.35, (initialHeight + deltaY) / initialHeight);
+        const scale = Math.min(widthScale, heightScale);
+        const width = initialWidth * scale;
+        const height = initialHeight * scale;
+        rect = [initial[0], initial[1], initial[0] + width, initial[1] + height];
       } else {
         let width = Math.max(12, initial[2] - initial[0] + deltaX);
         let height = Math.max(12, initial[3] - initial[1] + deltaY);
@@ -1807,12 +2006,22 @@
     callApi("confirm_replacement", settings()));
   elements.cancelReplacement.addEventListener("click", () =>
     callApi("cancel_replacement"));
-  elements.scanGeneralTolerance.addEventListener("click", () =>
-    callApi("scan_general_tolerances", settings()));
+  elements.scanGeneralTolerance.addEventListener("click", () => {
+    setRemoveAppliedToleranceMode(false);
+    callApi("scan_general_tolerances", settings());
+  });
   elements.applyGeneralTolerance.addEventListener("click", () =>
     callApi("apply_general_tolerances"));
+  elements.removeAppliedTolerance?.addEventListener("click", () =>
+    setRemoveAppliedToleranceMode(!removeAppliedToleranceMode));
+  elements.scanDimensionMarkings.addEventListener("click", () => {
+    setRemoveDimensionMarkingMode(false);
+    callApi("scan_dimension_markings");
+  });
   elements.applyDimensionMarkings.addEventListener("click", () =>
     callApi("apply_dimension_markings"));
+  elements.removeDimensionMarking?.addEventListener("click", () =>
+    setRemoveDimensionMarkingMode(!removeDimensionMarkingMode));
   function updateGeneralToleranceControls() {
     elements.generalToleranceGradeGroup.classList.toggle(
       "hidden",

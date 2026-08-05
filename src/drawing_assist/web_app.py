@@ -6,6 +6,7 @@ from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
+import logging
 import math
 import mimetypes
 from multiprocessing import freeze_support
@@ -24,10 +25,21 @@ import fitz
 from PIL import Image, ImageDraw, ImageFont
 import webview
 
-from drawing_assist.local_ocr import LocalOcrPage, analyze_page, local_ocr_available
+from drawing_assist.local_ocr import (
+    LocalOcrLine,
+    LocalOcrPage,
+    analyze_page,
+    analyze_scanned_page_tiles,
+    enrich_scanned_ocr_page,
+    local_ocr_available,
+)
+from drawing_assist.drawing_text_normalizer import is_tolerance_fragment
+from drawing_assist.ocr_config import APP_BUILD_ID
+from drawing_assist.ocr_debug_logger import OcrPipelineRecorder
 
 from drawing_assist.pdf_editor import (
     DimensionMarkingBatch,
+    DimensionMarkingCandidate,
     DimensionMarkingEntry,
     DimensionMark,
     DimensionStyle,
@@ -63,6 +75,7 @@ from drawing_assist.general_tolerance import (
     GeneralToleranceCandidate,
     _is_feature_control_frame,
     _is_full_page_image,
+    _is_non_dimension_region,
     _is_visual_parenthetical,
     _map_rotated_rect,
     _normalize_raster_dimension_text,
@@ -119,6 +132,19 @@ _MARKING_CONTEXT_PATTERN = re.compile(
 
 _MARKING_NOTE_CONTEXT_PATTERN = re.compile(
     r"(?:\u6307\u793a\u306a\u304d|\u307e\u305f\u306f|\u3068\u3059\u308b)"
+)
+
+_SURFACE_ROUGHNESS_PATTERN = re.compile(
+    r"(?:Rz\s*max|Rzmax|Ra\s*max|Ramax|Rmax|Rz|Ra)\s*",
+    re.IGNORECASE,
+)
+
+_ROUGHNESS_OCR_PATTERN = re.compile(
+    r"^\d\.\d\+0\.0\d$",
+)
+
+_FIT_TOLERANCE_PATTERN = re.compile(
+    r"H\d|G\d|[gG]\d",
 )
 
 
@@ -206,6 +232,32 @@ def _explicit_tolerance_range(
     if "+" in remainder and "-" in remainder:
         return abs(values[0]) + abs(values[1])
     return abs(max(values) - min(values))
+
+
+def _is_plausible_tolerance_marking(
+    text: str,
+    nominal: float,
+    tolerance_range: float | None,
+) -> bool:
+    """色分け対象として妥当な公差付き寸法かどうか。"""
+
+    if tolerance_range is None:
+        return False
+    if tolerance_range > max(nominal * 0.6, 3.0):
+        return False
+    if _FIT_TOLERANCE_PATTERN.search(text):
+        return False
+    if _ROUGHNESS_OCR_PATTERN.fullmatch(
+        unicodedata.normalize("NFKC", text).replace(" ", "")
+    ):
+        return False
+    if re.search(r"M\d", text, re.IGNORECASE):
+        return False
+    if re.search(r"[A-Z]{2,}\d", text) and "±" not in text and "+" not in text:
+        return False
+    if re.search(r"\+\d{2,}", text) and "±" not in text:
+        return False
+    return True
 
 
 def _dimension_marking_kind(prefix: str, degree: str) -> str:
@@ -548,6 +600,8 @@ def _detect_dimension_markings(
 def _detect_scanned_dimension_markings(
     page: fitz.Page,
     ocr_script: Path,
+    *,
+    include_plain_dimensions: bool = False,
 ) -> list[_DetectedDimensionMarking]:
     """Detect explicit dimension+tolerance groups in a raster drawing."""
 
@@ -853,6 +907,7 @@ def _detect_scanned_dimension_markings(
                 and not thread_callout
                 and limit_callout is None
                 and not reference
+                and not include_plain_dimensions
             ):
                 continue
             if tile is None:
@@ -949,22 +1004,34 @@ def _detect_scanned_dimension_markings(
 def _detect_local_dimension_markings(
     page: fitz.Page,
     ocr_page: LocalOcrPage,
+    *,
+    include_plain_dimensions: bool = False,
+    scanned_page: bool = False,
 ) -> list[_DetectedDimensionMarking]:
     """Parse dimension notation from the shared ONNX OCR page result."""
 
     detected: list[_DetectedDimensionMarking] = []
     for line in ocr_page.lines:
         text = unicodedata.normalize("NFKC", line.text)
+        if _SURFACE_ROUGHNESS_PATTERN.search(text):
+            continue
+        if re.search(r"[（(]", text) or re.search(r"[）)]", text):
+            continue
+        if re.search(r"[ぁ-んァ-ヶ一-龯]", text):
+            continue
+        if re.search(r"M\d", text, re.IGNORECASE):
+            continue
         compact = _normalize_raster_dimension_text(text).lstrip("△▲◆◇")
         # Filled triangular inspection markers are commonly read as A.
         compact = re.sub(r"^A(?=\d)", "", compact)
+        if is_tolerance_fragment(text) or is_tolerance_fragment(compact):
+            continue
         limit_callout = _MARKING_LIMIT_PATTERN.fullmatch(compact)
+        if limit_callout is not None:
+            continue
         if not compact or (
-            limit_callout is None
-            and (
-                _MARKING_CONTEXT_PATTERN.search(text)
-                or _MARKING_NOTE_CONTEXT_PATTERN.search(text)
-            )
+            _MARKING_CONTEXT_PATTERN.search(text)
+            or _MARKING_NOTE_CONTEXT_PATTERN.search(text)
         ):
             continue
         reference = bool(re.fullmatch(r"[（(].+[）)]", compact))
@@ -972,34 +1039,27 @@ def _detect_local_dimension_markings(
         working = working.replace("×", "X")
         thread_callout = bool(_MARKING_THREAD_PATTERN.fullmatch(working))
         match = _MARKING_NUMBER_PATTERN.search(working)
-        if limit_callout is None and match is None:
+        if match is None:
             continue
-        if (
-            limit_callout is None
-            and not thread_callout
-            and working[:1] in {"+", "-", "−", "±"}
-        ):
+        if working[:1] in {"+", "-", "−", "±"}:
             continue
         try:
-            nominal = float(
-                (
-                    limit_callout.group("number")
-                    if limit_callout is not None
-                    else match.group("number")
-                ).replace(",", ".")
-            )
+            nominal = float(match.group("number").replace(",", "."))
         except (AttributeError, ValueError):
             continue
         if nominal <= 0 or nominal > 4000:
             continue
-        if limit_callout is not None:
-            kind = "limit"
-        elif thread_callout:
-            kind = "thread"
-        else:
-            kind = _dimension_marking_kind(match.group("prefix"), match.group("degree"))
+        if thread_callout:
+            continue
+        kind = _dimension_marking_kind(match.group("prefix"), match.group("degree"))
         tolerance_range = _explicit_tolerance_range(working, nominal)
-        if tolerance_range is None and not thread_callout and limit_callout is None:
+        if tolerance_range is not None and not _is_plausible_tolerance_marking(
+            text,
+            nominal,
+            tolerance_range,
+        ):
+            continue
+        if tolerance_range is None and not include_plain_dimensions:
             continue
 
         rect = fitz.Rect(line.rect) & page.rect
@@ -1014,16 +1074,33 @@ def _detect_local_dimension_markings(
                 rect.x1 < page.rect.width * 0.22
                 and rect.y1 < page.rect.height * 0.32
             )
+            or (
+                scanned_page
+                and tolerance_range is None
+                and _is_non_dimension_region(
+                    rect,
+                    page.rect,
+                    bare_only=True,
+                )
+            )
         ):
             continue
         if not reference:
-            reference = _is_visual_parenthetical(
+            if _is_visual_parenthetical(
                 ocr_page.image,
                 rect,
                 direction,
                 scale_x=ocr_page.scale_x,
                 scale_y=ocr_page.scale_y,
-            )
+            ):
+                reference = True
+        if reference:
+            continue
+        if (
+            scanned_page
+            and tolerance_range is None
+        ):
+            continue
         quad = _marking_quad_from_points(
             [fitz.Point(point) for point in line.quad],
             direction,
@@ -1139,6 +1216,18 @@ def _is_scanned_page(page: fitz.Page) -> bool:
     )
 
 
+def _needs_local_ocr(page: fitz.Page) -> bool:
+    """RapidOCRの高解像度解析が必要な画像ベース図面かどうか。"""
+
+    if not local_ocr_available():
+        return False
+    # 抽出可能なテキストがあればネイティブ解析を優先する。
+    if page.get_text("words"):
+        return False
+    # core.pdf のように画像オブジェクトを持たないラスターPDFもOCR対象にする。
+    return True
+
+
 def _page_ink_density(
     image: Image.Image,
     page_rect: fitz.Rect,
@@ -1197,6 +1286,9 @@ class DrawingApi:
         self.general_tolerance_candidates: list[
             GeneralToleranceCandidate
         ] = []
+        self.dimension_marking_candidates: list[
+            DimensionMarkingCandidate
+        ] = []
         self.last_general_tolerance_batch: list[
             GeneralToleranceCandidate
         ] = []
@@ -1223,27 +1315,54 @@ class DrawingApi:
             tuple[_DetectedDimensionMarking, ...],
         ] = {}
         self.local_ocr_cache: dict[int, LocalOcrPage] = {}
+        self.scanned_tile_cache: dict[int, tuple[LocalOcrLine, ...]] = {}
         self.lock = RLock()
         self.upload_directory = tempfile.TemporaryDirectory(
             prefix="DrawingAssist-"
         )
 
+    def _clear_review_candidates(self) -> None:
+        self.general_tolerance_candidates.clear()
+        self.dimension_marking_candidates.clear()
+
     def set_window(self, window: webview.Window) -> None:
         self.window = window
 
     def _shared_local_ocr(self, page: fitz.Page) -> LocalOcrPage | None:
-        if not _is_scanned_page(page) or not local_ocr_available():
+        if not _needs_local_ocr(page):
             return None
         cached = self.local_ocr_cache.get(self.page_index)
         if cached is None:
             try:
-                cached = analyze_page(page)
-            except Exception:
+                cached = analyze_page(page, scanned=True)
+            except Exception as exc:
                 # Retain the Windows OCR fallback for unusual CPUs or a
                 # damaged packaged model instead of blocking the workflow.
+                logging.getLogger(__name__).warning(
+                    "RapidOCRの初期化または解析に失敗しました: %s",
+                    exc,
+                )
                 return None
             self.local_ocr_cache[self.page_index] = cached
         return cached
+
+    def _shared_scanned_tiles(self, page: fitz.Page) -> tuple[LocalOcrLine, ...] | None:
+        return self.scanned_tile_cache.get(self.page_index)
+
+    def _enriched_local_ocr(self, page: fitz.Page) -> LocalOcrPage | None:
+        base = self._shared_local_ocr(page)
+        if base is None:
+            return None
+        if not _needs_local_ocr(page):
+            return base
+        tiles = self.scanned_tile_cache.get(self.page_index)
+        if tiles is None:
+            try:
+                tiles = analyze_scanned_page_tiles(page)
+                self.scanned_tile_cache[self.page_index] = tiles
+            except Exception:
+                tiles = ()
+        return enrich_scanned_ocr_page(base, tiles)
 
     def drawing_assist_command(
         self,
@@ -1280,6 +1399,13 @@ class DrawingApi:
             "toggle_general_tolerance": self.toggle_general_tolerance,
             "cancel_general_tolerance_candidates": self.cancel_general_tolerance_candidates,
             "apply_general_tolerances": self.apply_general_tolerances,
+            "remove_applied_general_tolerance": self.remove_applied_general_tolerance,
+            "scan_dimension_markings": self.scan_dimension_markings,
+            "toggle_dimension_marking": self.toggle_dimension_marking,
+            "cancel_dimension_marking_candidates": (
+                self.cancel_dimension_marking_candidates
+            ),
+            "remove_dimension_marking": self.remove_dimension_marking,
             "apply_dimension_markings": self.apply_dimension_markings,
             "save_pdf": self.save_pdf,
         }
@@ -1306,6 +1432,10 @@ class DrawingApi:
             "general_tolerance_manual_count": 0,
             "general_tolerance_applied_count": 0,
             "general_tolerance_marked": False,
+            "dimension_marking_candidate_count": 0,
+            "dimension_marking_selected_count": 0,
+            "build_id": APP_BUILD_ID,
+            "local_ocr_ready": local_ocr_available(),
         }
 
     def get_initial_state(self) -> dict[str, Any]:
@@ -1572,11 +1702,16 @@ class DrawingApi:
             requested_rect = fitz.Rect(
                 min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
             )
-            scale = max(
-                requested_rect.width / max(old_rect.width, 1.0),
-                requested_rect.height / max(old_rect.height, 1.0),
-            )
+            width_scale = requested_rect.width / max(old_rect.width, 1e-6)
+            height_scale = requested_rect.height / max(old_rect.height, 1e-6)
+            # 縦横比を保ったまま、選択枠に収まるよう小さい方に合わせる。
+            scale = min(width_scale, height_scale)
             font_size = max(4.0, min(24.0, addition.font_size * scale))
+            suffix_base = (
+                addition.suffix_font_size
+                if addition.suffix_font_size is not None
+                else addition.font_size
+            )
             moved = replace(
                 addition,
                 origin=(
@@ -1585,7 +1720,7 @@ class DrawingApi:
                 ),
                 font_size=font_size,
                 suffix_font_size=(
-                    max(4.0, min(24.0, addition.suffix_font_size * scale))
+                    max(4.0, min(24.0, suffix_base * scale))
                     if addition.suffix_font_size is not None
                     else None
                 ),
@@ -1633,6 +1768,22 @@ class DrawingApi:
             elif candidate.selected:
                 preview_color = "#42c7df"
                 preview_opacity = 0.34
+            else:
+                preview_color = "#c8cdd4"
+                preview_opacity = 0.18
+            preview_items.append(
+                Mark(
+                    self.page_index,
+                    candidate.rect,
+                    preview_color,
+                    preview_opacity,
+                    candidate.quad,
+                )
+            )
+        for candidate in self.dimension_marking_candidates:
+            if candidate.selected:
+                preview_color = candidate.color
+                preview_opacity = 0.38
             else:
                 preview_color = "#c8cdd4"
                 preview_opacity = 0.18
@@ -1755,6 +1906,13 @@ class DrawingApi:
                 self.general_tolerance_angle_length
             ),
             "general_tolerance_marked": self.last_general_tolerance_marked,
+            "dimension_marking_candidate_count": len(
+                self.dimension_marking_candidates
+            ),
+            "dimension_marking_selected_count": sum(
+                candidate.selected
+                for candidate in self.dimension_marking_candidates
+            ),
             "added_dimension_count": sum(
                 isinstance(item, DimensionMark)
                 and item.page_index == self.page_index
@@ -1779,6 +1937,9 @@ class DrawingApi:
                 if word_candidate_angle is not None
                 else None
             ),
+            "build_id": APP_BUILD_ID,
+            "local_ocr_ready": local_ocr_available(),
+            "page_uses_local_ocr": _needs_local_ocr(page),
         }
 
     def _error(self, message: str) -> dict[str, Any]:
@@ -1823,7 +1984,7 @@ class DrawingApi:
             self.items.clear()
             self.replacement_selection = None
             self.editable_item_index = None
-            self.general_tolerance_candidates.clear()
+            self._clear_review_candidates()
             self.last_general_tolerance_batch.clear()
             self.last_general_tolerance_additions.clear()
             self.last_general_tolerance_marked = False
@@ -1833,6 +1994,7 @@ class DrawingApi:
             self.general_tolerance_detection_cache.clear()
             self.scanned_marking_cache.clear()
             self.local_ocr_cache.clear()
+            self.scanned_tile_cache.clear()
             return self._state(
                 "PDFを読み込みました。使いたいツールを選んで図面をクリックしてください。"
             )
@@ -1866,7 +2028,7 @@ class DrawingApi:
                 self.page_index -= 1
                 self.replacement_selection = None
                 self.editable_item_index = None
-                self.general_tolerance_candidates.clear()
+                self._clear_review_candidates()
                 self.last_general_tolerance_batch.clear()
                 self.last_general_tolerance_additions.clear()
                 self.last_general_tolerance_marked = False
@@ -1882,7 +2044,7 @@ class DrawingApi:
                 self.page_index += 1
                 self.replacement_selection = None
                 self.editable_item_index = None
-                self.general_tolerance_candidates.clear()
+                self._clear_review_candidates()
                 self.last_general_tolerance_batch.clear()
                 self.last_general_tolerance_additions.clear()
                 self.last_general_tolerance_marked = False
@@ -1898,7 +2060,7 @@ class DrawingApi:
                 self.work_region_candidates.clear()
                 return self._state("ワークの候補選択を取り消しました。")
             if self.general_tolerance_candidates:
-                self.general_tolerance_candidates.clear()
+                self._clear_review_candidates()
                 return self._state("一般公差の検出候補を取り消しました。")
             if self.word_candidate is not None:
                 self.word_candidate = None
@@ -1928,7 +2090,7 @@ class DrawingApi:
             self.editable_item_index = None
             self.work_region_candidates.clear()
             self.word_candidate = None
-            self.general_tolerance_candidates.clear()
+            self._clear_review_candidates()
             self.last_general_tolerance_batch.clear()
             self.last_general_tolerance_additions.clear()
             self.last_general_tolerance_marked = False
@@ -1944,7 +2106,7 @@ class DrawingApi:
             self.editable_item_index = None
             self.work_region_candidates.clear()
             self.word_candidate = None
-            self.general_tolerance_candidates.clear()
+            self._clear_review_candidates()
             self.last_general_tolerance_batch.clear()
             self.last_general_tolerance_additions.clear()
             self.last_general_tolerance_marked = False
@@ -2343,7 +2505,7 @@ class DrawingApi:
             self.general_tolerance_standard = standard
             self.general_tolerance_grade = grade
             self.general_tolerance_angle_length = angle_length
-            self.general_tolerance_candidates.clear()
+            self._clear_review_candidates()
             self.last_general_tolerance_batch.clear()
             self.last_general_tolerance_additions.clear()
             self.last_general_tolerance_marked = False
@@ -2363,6 +2525,10 @@ class DrawingApi:
                         local_ocr_page=self._shared_local_ocr(
                             self.document[self.page_index]
                         ),
+                        scanned_tile_lines=self._shared_scanned_tiles(
+                            self.document[self.page_index]
+                        ),
+                        scanned_tile_cache=self.scanned_tile_cache,
                     )
                     self.general_tolerance_detection_cache[cache_key] = tuple(
                         detected_candidates
@@ -2379,6 +2545,9 @@ class DrawingApi:
                     f" Windowsの日本語OCR設定を確認してください: {exc}"
                 )
             count = len(self.general_tolerance_candidates)
+            OcrPipelineRecorder("scan_general_tolerances").set_count(
+                "final_candidates", count
+            ).log_summary()
             if not count:
                 return self._state(
                     "一般公差を安全に付与できる寸法候補が見つかりませんでした。"
@@ -2406,12 +2575,12 @@ class DrawingApi:
                     "指示無き隅"
                     f"R{notes.unindicated_radius_maximum:g}以下"
                 )
-            message = f"一括反映候補を{automatic_count}件、水色で表示しました。"
+            message = f"候補を{automatic_count}件表示しました。"
             if manual_count:
-                message += f" 個別公差の確認候補を{manual_count}件表示しています。"
+                message += f" 個別確認が必要な候補が{manual_count}件あります。"
             if recognized_notes:
                 message += " 図面注記を優先: " + "、".join(recognized_notes) + "。"
-            message += " 不要な水色候補はクリックして灰色にしてください。"
+            message += " 水色をクリックすると除外（灰色）できます。"
             return self._state(message)
 
     def toggle_general_tolerance(
@@ -2429,7 +2598,9 @@ class DrawingApi:
                 _number(payload.get("y"), 0, page.rect.y0, page.rect.y1),
             )
             if any(
-                candidate.manual_required and point in fitz.Rect(candidate.rect)
+                candidate.manual_required
+                and point
+                in fitz.Rect(candidate.rect) + (-8, -8, 8, 8)
                 for candidate in self.general_tolerance_candidates
             ):
                 return self._state(
@@ -2451,13 +2622,207 @@ class DrawingApi:
             if before == after:
                 return self._state("水色または灰色の候補をクリックしてください。")
             return self._state(
-                f"反映対象は{after}件です。水色が対象、灰色が除外です。"
+                f"反映対象 {after}件。水色＝反映、灰色＝除外。"
             )
 
     def cancel_general_tolerance_candidates(self) -> dict[str, Any]:
         with self.lock:
             self.general_tolerance_candidates.clear()
             return self._state("一般公差の検出候補を閉じました。")
+
+    def _applied_tolerance_hit(
+        self,
+        point: fitz.Point,
+    ) -> tuple[int, int] | None:
+        """Return (items_index, addition_index) for an applied tolerance."""
+
+        for index in range(len(self.items) - 1, -1, -1):
+            item = self.items[index]
+            if (
+                not isinstance(item, GeneralToleranceBatchMark)
+                or item.page_index != self.page_index
+            ):
+                continue
+            for addition_index, addition in enumerate(item.additions):
+                hit_rect = self._full_tolerance_addition_rect(addition)
+                hit_rect.x0 -= 6
+                hit_rect.y0 -= 6
+                hit_rect.x1 += 6
+                hit_rect.y1 += 6
+                if addition_index < len(self.last_general_tolerance_batch):
+                    nominal_rect = fitz.Rect(
+                        self.last_general_tolerance_batch[addition_index].rect
+                    )
+                    hit_rect |= nominal_rect
+                if point in hit_rect:
+                    return index, addition_index
+        return None
+
+    def _dimension_marking_hit(
+        self,
+        point: fitz.Point,
+    ) -> tuple[int, int] | None:
+        """Return (items_index, entry_index) for a color marking."""
+
+        for index in range(len(self.items) - 1, -1, -1):
+            item = self.items[index]
+            if (
+                not isinstance(item, DimensionMarkingBatch)
+                or item.page_index != self.page_index
+            ):
+                continue
+            for entry_index, entry in enumerate(item.entries):
+                hit_rect = fitz.Rect(entry.rect)
+                hit_rect.x0 -= 4
+                hit_rect.y0 -= 4
+                hit_rect.x1 += 4
+                hit_rect.y1 += 4
+                if point in hit_rect:
+                    return index, entry_index
+        return None
+
+    def _remove_applied_tolerance_at(
+        self,
+        item_index: int,
+        addition_index: int,
+    ) -> bool:
+        item = self.items[item_index]
+        if not isinstance(item, GeneralToleranceBatchMark):
+            return False
+        if not 0 <= addition_index < len(item.additions):
+            return False
+        removed_candidate = None
+        if addition_index < len(self.last_general_tolerance_batch):
+            removed_candidate = self.last_general_tolerance_batch[addition_index]
+        new_additions = tuple(
+            addition
+            for index, addition in enumerate(item.additions)
+            if index != addition_index
+        )
+        if new_additions:
+            self.items[item_index] = GeneralToleranceBatchMark(
+                item.page_index,
+                new_additions,
+            )
+        else:
+            self.items.pop(item_index)
+        if addition_index < len(self.last_general_tolerance_batch):
+            self.last_general_tolerance_batch.pop(addition_index)
+        if addition_index < len(self.last_general_tolerance_additions):
+            self.last_general_tolerance_additions.pop(addition_index)
+        if removed_candidate is not None and self.last_general_tolerance_marked:
+            self._remove_dimension_marking_for_candidate(removed_candidate)
+        self.editable_item_index = None
+        self.editable_tolerance_index = None
+        return True
+
+    def _remove_dimension_marking_for_candidate(
+        self,
+        candidate: GeneralToleranceCandidate,
+    ) -> None:
+        candidate_rect = fitz.Rect(candidate.rect)
+        for index in range(len(self.items) - 1, -1, -1):
+            item = self.items[index]
+            if (
+                not isinstance(item, DimensionMarkingBatch)
+                or item.page_index != self.page_index
+            ):
+                continue
+            kept_entries = []
+            for entry in item.entries:
+                entry_rect = fitz.Rect(entry.rect)
+                overlap = (candidate_rect & entry_rect).get_area()
+                if overlap >= min(
+                    candidate_rect.get_area(),
+                    entry_rect.get_area(),
+                ) * 0.35:
+                    continue
+                kept_entries.append(entry)
+            if kept_entries:
+                self.items[index] = DimensionMarkingBatch(
+                    item.page_index,
+                    tuple(kept_entries),
+                )
+            else:
+                self.items.pop(index)
+                self.last_general_tolerance_marked = False
+
+    def remove_applied_general_tolerance(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Remove one applied general-tolerance addition from the drawing."""
+
+        with self.lock:
+            if self.document is None:
+                return self._error("PDFを開いてください。")
+            if not self.last_general_tolerance_batch:
+                return self._state("解除できる反映済み公差がありません。")
+            page = self.document[self.page_index]
+            point = fitz.Point(
+                _number(payload.get("x"), 0, page.rect.x0, page.rect.x1),
+                _number(payload.get("y"), 0, page.rect.y0, page.rect.y1),
+            )
+            hit = self._applied_tolerance_hit(point)
+            if hit is None:
+                return self._state(
+                    "解除する公差をクリックしてください。"
+                    " 寸法値または追加した公差の近くを選びます。"
+                )
+            if not self._remove_applied_tolerance_at(*hit):
+                return self._state("公差の解除に失敗しました。")
+            remaining = len(self.last_general_tolerance_batch)
+            if remaining:
+                return self._state(
+                    f"公差を1件解除しました。残り{remaining}件です。"
+                    " 色分け済みの場合は、対応する色も外れます。"
+                )
+            self.last_general_tolerance_marked = False
+            return self._state(
+                "反映済み公差をすべて解除しました。"
+                " 必要なら再度「対象寸法を検出」からやり直してください。"
+            )
+
+    def remove_dimension_marking(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Remove one automatic dimension/tolerance color marking."""
+
+        with self.lock:
+            if self.document is None:
+                return self._error("PDFを開いてください。")
+            page = self.document[self.page_index]
+            point = fitz.Point(
+                _number(payload.get("x"), 0, page.rect.x0, page.rect.x1),
+                _number(payload.get("y"), 0, page.rect.y0, page.rect.y1),
+            )
+            hit = self._dimension_marking_hit(point)
+            if hit is None:
+                return self._state(
+                    "解除する色分けをクリックしてください。"
+                    " ピンクまたは黄色のマーキング上を選びます。"
+                )
+            item_index, entry_index = hit
+            item = self.items[item_index]
+            if not isinstance(item, DimensionMarkingBatch):
+                return self._state("色分けの解除に失敗しました。")
+            kept_entries = tuple(
+                entry
+                for index, entry in enumerate(item.entries)
+                if index != entry_index
+            )
+            if kept_entries:
+                self.items[item_index] = DimensionMarkingBatch(
+                    item.page_index,
+                    kept_entries,
+                )
+            else:
+                self.items.pop(item_index)
+                self.last_general_tolerance_marked = False
+            return self._state(
+                f"色分けを1件解除しました。残り{len(kept_entries)}件です。"
+            )
 
     def _tolerance_addition(
         self,
@@ -3033,7 +3398,7 @@ class DrawingApi:
             self.last_general_tolerance_batch = selected
             self.last_general_tolerance_additions = list(additions)
             self.last_general_tolerance_marked = False
-            self.general_tolerance_candidates.clear()
+            self._clear_review_candidates()
             return self._state(
                 f"一般公差を{len(selected)}件、一括反映しました。"
             )
@@ -3209,37 +3574,34 @@ class DrawingApi:
             )
         ]
         self.last_general_tolerance_marked = False
+        self.dimension_marking_candidates.clear()
 
-    def apply_dimension_markings(self) -> dict[str, Any]:
-        with self.lock:
-            if self.document is None:
-                return self._error("PDFを開いてください。")
-            if not self.last_general_tolerance_batch:
-                return self._state(
-                    "先に一般公差を一括反映してください。"
-                )
-            if self.last_general_tolerance_marked:
-                return self._state(
-                    "この一括公差の寸法値と追加公差はマーキング済みです。"
-                )
-            page = self.document[self.page_index]
+    def _build_dimension_marking_entries(
+        self,
+        page: fitz.Page,
+    ) -> list[DimensionMarkingEntry]:
             detected = _detect_dimension_markings(page)
-            if _is_scanned_page(page):
+            marking_recorder = OcrPipelineRecorder("dimension_markings")
+            marking_recorder.set_count("vector_detected", len(detected))
+            if _needs_local_ocr(page):
                 try:
                     cached_scanned = self.scanned_marking_cache.get(
                         self.page_index
                     )
                     if cached_scanned is None:
-                        shared_ocr = self._shared_local_ocr(page)
+                        shared_ocr = self._enriched_local_ocr(page)
                         if shared_ocr is not None:
                             scanned_detected = _detect_local_dimension_markings(
                                 page,
                                 shared_ocr,
+                                include_plain_dimensions=False,
+                                scanned_page=True,
                             )
                         else:
                             scanned_detected = _detect_scanned_dimension_markings(
                                 page,
                                 _resource_path("windows_ocr.ps1"),
+                                include_plain_dimensions=True,
                             )
                         self.scanned_marking_cache[self.page_index] = tuple(
                             scanned_detected
@@ -3261,6 +3623,7 @@ class DrawingApi:
                     ):
                         continue
                     detected.append(scanned_marking)
+            marking_recorder.set_count("detected_total", len(detected))
             entries: list[DimensionMarkingEntry] = []
             additions = self.last_general_tolerance_additions
             page_replacements = [
@@ -3371,7 +3734,6 @@ class DrawingApi:
                 if (
                     matched is None
                     and marking.tolerance_range is None
-                    and marking.kind not in {"thread", "limit"}
                 ):
                     continue
                 # Batch candidates are appended below as one continuous quad
@@ -3570,13 +3932,124 @@ class DrawingApi:
                     joined_quad,
                 )
                 marked_dimension_count += 1
+            marking_recorder.set_count("matched_batch", len(matched_markings))
+            marking_recorder.set_count("colored_entries", len(entries))
+            marking_recorder.log_summary()
+            return entries
+
+    def scan_dimension_markings(self) -> dict[str, Any]:
+        with self.lock:
+            if self.document is None:
+                return self._error("PDFを開いてください。")
+            if not self.last_general_tolerance_batch:
+                return self._state("先に①で公差を反映してください。")
+            if self.last_general_tolerance_marked:
+                return self._state("色分けは反映済みです。")
+            page = self.document[self.page_index]
+            entries = self._build_dimension_marking_entries(page)
+            if not entries:
+                self.dimension_marking_candidates.clear()
+                return self._state("色分けできる寸法が見つかりませんでした。")
+            self.dimension_marking_candidates = [
+                DimensionMarkingCandidate(
+                    self.page_index,
+                    entry.rect,
+                    entry.color,
+                    entry.opacity,
+                    entry.quad,
+                    selected=True,
+                )
+                for entry in entries
+            ]
+            return self._state(
+                f"色分け候補を{len(entries)}件表示しました。"
+                " ピンク・黄色をクリックすると除外（灰色）できます。"
+            )
+
+    def toggle_dimension_marking(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self.lock:
+            if self.document is None:
+                return self._error("PDFを開いてください。")
+            if not self.dimension_marking_candidates:
+                return self._state("先に「対象寸法を検出」を押してください。")
+            page = self.document[self.page_index]
+            point = fitz.Point(
+                _number(payload.get("x"), 0, page.rect.x0, page.rect.x1),
+                _number(payload.get("y"), 0, page.rect.y0, page.rect.y1),
+            )
+            before = sum(
+                candidate.selected
+                for candidate in self.dimension_marking_candidates
+            )
+            updated: list[DimensionMarkingCandidate] = []
+            toggled = False
+            for candidate in self.dimension_marking_candidates:
+                hit_rect = fitz.Rect(candidate.rect)
+                hit_rect.x0 -= 8
+                hit_rect.y0 -= 8
+                hit_rect.x1 += 8
+                hit_rect.y1 += 8
+                if point in hit_rect:
+                    updated.append(
+                        replace(candidate, selected=not candidate.selected)
+                    )
+                    toggled = True
+                else:
+                    updated.append(candidate)
+            if not toggled:
+                return self._state("ピンク・黄色の候補をクリックしてください。")
+            self.dimension_marking_candidates = updated
+            after = sum(
+                candidate.selected
+                for candidate in self.dimension_marking_candidates
+            )
+            if before == after:
+                return self._state("ピンク・黄色の候補をクリックしてください。")
+            return self._state(
+                f"色分け対象 {after}件。ピンク・黄色＝対象、灰色＝除外。"
+            )
+
+    def cancel_dimension_marking_candidates(self) -> dict[str, Any]:
+        with self.lock:
+            self.dimension_marking_candidates.clear()
+            return self._state("色分けの検出候補を閉じました。")
+
+    def apply_dimension_markings(self) -> dict[str, Any]:
+        with self.lock:
+            if self.document is None:
+                return self._error("PDFを開いてください。")
+            if not self.last_general_tolerance_batch:
+                return self._state("先に①で公差を反映してください。")
+            if self.last_general_tolerance_marked:
+                return self._state("色分けは反映済みです。")
+            if not self.dimension_marking_candidates:
+                return self._state("先に「対象寸法を検出」を押してください。")
+            selected = [
+                candidate
+                for candidate in self.dimension_marking_candidates
+                if candidate.selected
+            ]
+            if not selected:
+                return self._state("色分けする候補がありません。")
+            entries = tuple(
+                DimensionMarkingEntry(
+                    candidate.rect,
+                    candidate.color,
+                    candidate.opacity,
+                    candidate.quad,
+                )
+                for candidate in selected
+            )
             self.items.append(
-                DimensionMarkingBatch(self.page_index, tuple(entries))
+                DimensionMarkingBatch(self.page_index, entries)
             )
             self.last_general_tolerance_marked = True
+            self.dimension_marking_candidates.clear()
             return self._state(
-                f"寸法値{marked_dimension_count}件と公差を、"
-                "基準どおり一括で色分けしました。"
+                f"寸法値{len(selected)}件を基準どおり色分けしました。"
             )
 
     def apply_action(
