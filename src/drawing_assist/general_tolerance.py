@@ -1292,8 +1292,8 @@ def _is_visual_parenthetical(
         # Parentheses sit immediately beside the value. A wider probe can
         # mistake inspection diamonds and nearby angular arcs for brackets
         # (notably the detail-view 0.12 callout).
-        side_width = max(2.2, rect.height * 0.35)
-        y_padding = rect.height * 0.07
+        side_width = max(3.2, rect.height * 0.72)
+        y_padding = rect.height * 0.12
         left = fitz.Rect(
             rect.x0 - side_width,
             rect.y0 - y_padding,
@@ -1325,8 +1325,8 @@ def _is_visual_parenthetical(
             >= 0.55
         )
     if abs(dy) >= 0.92:
-        side_height = max(2.2, rect.width * 0.35)
-        x_padding = rect.width * 0.07
+        side_height = max(3.2, rect.width * 0.72)
+        x_padding = rect.width * 0.12
         top = fitz.Rect(
             rect.x0 - x_padding,
             rect.y0 - side_height,
@@ -1466,8 +1466,6 @@ def _has_dimension_line_support(
             ),
         )
     else:
-        if kind in {"chamfer", "radius", "angle"}:
-            return True
         # 斜め配置の長さ寸法は水平・垂直の両方で寸法線を探す。
         text_height = max(1.0, rect.height)
         text_width = max(1.0, rect.width)
@@ -2099,6 +2097,7 @@ def _local_ocr_general_candidates(
     """Build reviewable general-tolerance candidates from shared ONNX OCR."""
 
     ocr_text = "\n".join(line.text for line in ocr_page.lines)
+    reference_rects = _ocr_reference_rects(ocr_page)
     notes = extract_drawing_tolerance_notes("\n".join((page.get_text(), ocr_text)))
     angle_override = notes.angle_tolerance or angle_tolerance(
         angle_shorter_side_length,
@@ -2157,6 +2156,8 @@ def _local_ocr_general_candidates(
             continue
         rect = fitz.Rect(line.rect) & page.rect
         direction = line.direction
+        if _overlaps_reference_evidence(rect, reference_rects):
+            continue
         has_line_support = _has_dimension_line_support(
             ocr_page.image,
             rect,
@@ -2330,6 +2331,50 @@ def _local_ocr_general_candidates(
         if not any(_same_candidate(candidate, existing) for existing in candidates):
             candidates.append(candidate)
     return sorted(candidates, key=lambda item: (item.rect[1], item.rect[0]))
+
+
+def _ocr_reference_rects(ocr_page: LocalOcrPage) -> tuple[fitz.Rect, ...]:
+    """Return regions any OCR pass identified as a reference dimension."""
+
+    regions: list[fitz.Rect] = []
+    for line in ocr_page.lines:
+        text = unicodedata.normalize("NFKC", line.text)
+        parsed = parse_dimension_token(text)
+        if not (
+            (parsed is not None and parsed.reference)
+            or (re.search(r"[（(]", text) and re.search(r"[）)]", text))
+        ):
+            continue
+        rect = fitz.Rect(line.rect)
+        if not rect.is_empty:
+            regions.append(rect)
+    return tuple(regions)
+
+
+def _overlaps_reference_evidence(
+    rect: fitz.Rect,
+    reference_rects: tuple[fitz.Rect, ...],
+) -> bool:
+    """Use OCR ensemble agreement to suppress alternate reads of ``(n)``."""
+
+    if rect.is_empty:
+        return False
+    center = ((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+    for reference_rect in reference_rects:
+        intersection = (rect & reference_rect).get_area()
+        if intersection >= min(rect.get_area(), reference_rect.get_area()) * 0.22:
+            return True
+        reference_center = (
+            (reference_rect.x0 + reference_rect.x1) / 2,
+            (reference_rect.y0 + reference_rect.y1) / 2,
+        )
+        if math.dist(center, reference_center) <= max(
+            3.0,
+            min(rect.width, rect.height, reference_rect.width, reference_rect.height)
+            * 0.8,
+        ):
+            return True
+    return False
 
 
 def _merge_general_tolerance_candidates(
@@ -2588,7 +2633,10 @@ def detect_general_tolerance_candidates(
 
     if local_ocr_page is not None:
         image_only_page = len(page_words) == 0
-        scanned_page = image_only_page
+        # Some scanned PDFs retain a sparse OCR text layer. Treat a full-page
+        # raster as scanned even in that case; otherwise its small dimensions
+        # are subjected to the overly strict vector-PDF candidate filters.
+        scanned_page = image_only_page or _is_full_page_image(page)
         ocr_page_for_detect = local_ocr_page
         tile_lines_used = False
         page_only_candidates = _local_ocr_general_candidates(
@@ -2651,9 +2699,11 @@ def detect_general_tolerance_candidates(
         recorder.set_count("merged_before_supplement", len(merged))
         run_windows_supplement = (
             ocr_script.is_file()
-            and not tile_lines_used
+            and scanned_page
             and (
-                len(merged) < supplement_threshold
+                tile_lines_used
+                or _is_full_page_image(page)
+                or len(merged) < supplement_threshold
                 or image_only_page
             )
         )
@@ -2681,6 +2731,15 @@ def detect_general_tolerance_candidates(
             merged = _merge_general_tolerance_candidates(merged, supplemental)
             recorder.set_count("supplemental_candidates", len(supplemental))
         final = _deduplicate_general_candidates(merged)
+        reference_evidence = _ocr_reference_rects(ocr_page_for_detect)
+        final = [
+            candidate
+            for candidate in final
+            if not _overlaps_reference_evidence(
+                fitz.Rect(candidate.rect),
+                reference_evidence,
+            )
+        ]
         recorder.set_count("final_candidates", len(final))
         recorder.log_summary()
         return final

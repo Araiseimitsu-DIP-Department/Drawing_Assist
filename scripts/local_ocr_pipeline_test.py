@@ -36,6 +36,8 @@ def main() -> None:
             ((x0, y0), (x1, y0), (x1, y1), (x0, y1)),
         )
 
+    # 矩形サイズは実図面の寸法文字相当（過大な枠は幾何フィルタで除外される）
+    # 画像PDFの素の整数は 8 未満をラベル扱いするため、候補確認は 12 を使う。
     ocr_page = LocalOcrPage(
         800,
         500,
@@ -43,12 +45,12 @@ def main() -> None:
         2.0,
         image,
         (
-            line("7", (190, 85, 210, 100)),
-            line("810", (190, 155, 230, 170)),
-            line("50.6±0.05", (100, 110, 190, 128)),
-            line("C0.2以下", (250, 110, 310, 128)),
+            line("12", (190, 92, 210, 100)),
+            line("810", (190, 148, 218, 156)),
+            line("50.6±0.05", (120, 100, 175, 108)),
+            line("C0.2以下", (250, 100, 298, 108)),
             line("2. 指示なき角部はC0.2またはR0.2とする", (80, 190, 340, 208)),
-            line("φ0.02", (330, 110, 380, 128)),
+            line("φ0.02", (330, 100, 362, 108)),
         ),
     )
 
@@ -85,7 +87,7 @@ def main() -> None:
                 local_ocr_page=ocr_page,
             )
             values = [item.nominal_value for item in candidates]
-            assert 7.0 in values
+            assert 12.0 in values
             assert 810.0 not in values
         finally:
             document.close()

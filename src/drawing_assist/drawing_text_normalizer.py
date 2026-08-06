@@ -70,9 +70,6 @@ def normalize_drawing_text(value: str) -> str:
         text = prefix_match.group("prefix") + body
     text = re.sub(r"^(?P<prefix>[CR])O(?=\.)", r"\g<prefix>0", text, flags=re.IGNORECASE)
     text = re.sub(r"^(?P<prefix>[CR])0(?=\d)", r"\g<prefix>0.", text, flags=re.IGNORECASE)
-    paren = re.fullmatch(r"[（(]0*(\d{1,4}(?:[.,]\d+)?)[）)]", text)
-    if paren is not None:
-        text = f"φ{paren.group(1)}"
     text = _NOTE_SUFFIX.sub("", text)
     return text.upper()
 

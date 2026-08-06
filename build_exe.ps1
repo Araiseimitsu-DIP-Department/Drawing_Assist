@@ -34,6 +34,7 @@ New-Item -ItemType Directory -Path $specOutputPath -Force | Out-Null
     --add-data "$projectRoot\src\drawing_assist\web;drawing_assist\web" `
     --add-data "$projectRoot\src\drawing_assist\windows_ocr.ps1;drawing_assist" `
     --collect-all webview `
+    --collect-all cv2 `
     --exclude-module PyQt5 `
     --exclude-module PyQt6 `
     --exclude-module PySide2 `

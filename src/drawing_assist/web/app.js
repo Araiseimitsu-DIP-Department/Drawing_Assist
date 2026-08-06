@@ -433,7 +433,7 @@
         detail = "文字をクリック。選べないときはドラッグ。";
       } else {
         title = "先に①公差を反映";
-        detail = "左の「① 公差を入れる」を完了してください。";
+        detail = "左の「公差未記載の寸法」を完了してください。";
       }
     } else if (currentMode === "work_shape") {
       const style = elements.workShapeStyle.value;
@@ -495,7 +495,7 @@
           : "公差を反映済み";
         detail = removeAppliedToleranceMode
           ? "寸法値または追加公差の近くを選びます。"
-          : "次は左の「③ 寸法を色分け」へ進みます。";
+          : "次は左の「寸法を色分け」へ進みます。";
       } else {
         step = "1";
         title = "規格を選んで検出";
@@ -531,7 +531,7 @@
       detail = "右で測定具記号または測定順番号を選びます。";
     }
 
-    elements.taskStep.textContent = step;
+    elements.taskStep.textContent = `STEP ${step}`;
     elements.taskTitle.textContent = title;
     elements.modeHelp.textContent = detail;
     elements.canvasCoachStep.textContent = step;
@@ -547,9 +547,9 @@
       Number(currentState.replacement_dimension_count || 0) +
       Number(currentState.struck_dimension_count || 0);
     const marked = Boolean(currentState.general_tolerance_marked);
-    const toleranceTool = $(".flow-tool[data-mode='general_tolerance']");
-    const markingTool = $(".flow-tool[data-mode='word']");
-    const workTool = $(".flow-tool[data-mode='work_shape']");
+    const toleranceTool = $(".workflow-tool[data-mode='general_tolerance']");
+    const markingTool = $(".workflow-tool[data-mode='word']");
+    const workTool = $(".workflow-tool[data-mode='work_shape']");
 
     toleranceTool?.classList.toggle("complete", toleranceDone);
     elements.dimensionFixTools?.classList.toggle(
@@ -562,7 +562,7 @@
 
     if (elements.dimensionFixStatus) {
       elements.dimensionFixStatus.textContent = !toleranceDone
-        ? "①のあと"
+        ? "必要なときだけ"
         : marked
           ? "完了"
           : correctionCount > 0
@@ -573,7 +573,7 @@
     const markingCaption = markingTool?.querySelector("small");
     if (markingCaption) {
       markingCaption.textContent = !toleranceDone
-        ? "①のあと"
+        ? "一括色分け"
         : marked
           ? "色分け済み"
           : correctionCount > 0

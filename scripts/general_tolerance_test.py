@@ -291,9 +291,9 @@ def _verify_current_ui_flow() -> None:
         'data-mode="word"'
     )
     for text in (
-        "① 公差を入れる",
-        "③ 寸法を色分け",
-        "④ 製品を塗る",
+        "公差未記載の寸法",
+        "寸法を色分け",
+        "製品を塗る",
         "その他の機能",
         "二重線で消す",
         "寸法と矢印を追加",
@@ -301,11 +301,13 @@ def _verify_current_ui_flow() -> None:
         "印・必要な注記を入れる",
         "測定具・測定順を入れる",
         "一括反映",
+        "公差未記載寸法を検出",
         "scanDimensionMarkingsButton",
         "detect-button",
         "厳しい公差（0.03以内・角度1°以内）",
         "角度公差の設定",
         "operation-steps",
+        "workflow-tool",
     ):
         assert text in html
     for marker in (
@@ -328,7 +330,7 @@ def _verify_current_ui_flow() -> None:
     assert "zoomWithMouseWheel" in script
     assert 'addEventListener("wheel"' in script
     assert "clamp(220px, 14vw, 250px)" in styles
-    assert ".flow-tool { padding-right: 34px; }" in styles
+    assert ".workflow-tool { padding-right: 9px; }" in styles
     assert "grid-template-columns: 196px minmax(280px, 1fr) 250px" in styles
     assert "@media (max-height: 760px)" in styles
 

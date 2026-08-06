@@ -73,10 +73,13 @@ from drawing_assist.pdf_editor import (
 )
 from drawing_assist.general_tolerance import (
     GeneralToleranceCandidate,
+    _has_dimension_line_support,
     _is_feature_control_frame,
     _is_full_page_image,
     _is_non_dimension_region,
     _is_visual_parenthetical,
+    _ocr_reference_rects,
+    _overlaps_reference_evidence,
     _map_rotated_rect,
     _normalize_raster_dimension_text,
     _prepare_raster_for_ocr,
@@ -245,11 +248,20 @@ def _is_plausible_tolerance_marking(
         return False
     if tolerance_range > max(nominal * 0.6, 3.0):
         return False
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    # OCR途中切れ（末尾が 0. や記号で終わる、先頭が小数点のみ、など）を除外する。
+    if (
+        compact.startswith(".")
+        or compact.endswith((".", ":", ",", "+", "-", "±"))
+        or re.search(r"[±+\-]0\.$", compact)
+        or re.search(r"^\d+[±+\-]", compact) and not re.search(r"\d", compact.split("±")[-1] if "±" in compact else "")
+        or re.fullmatch(r"\d{1,2}[±+\-]\d", compact)
+        or re.search(r"\d\.[±+\-]", compact)
+    ):
+        return False
     if _FIT_TOLERANCE_PATTERN.search(text):
         return False
-    if _ROUGHNESS_OCR_PATTERN.fullmatch(
-        unicodedata.normalize("NFKC", text).replace(" ", "")
-    ):
+    if _ROUGHNESS_OCR_PATTERN.fullmatch(compact):
         return False
     if re.search(r"M\d", text, re.IGNORECASE):
         return False
@@ -954,7 +966,9 @@ def _detect_scanned_dimension_markings(
                 scale_y=scale_y,
             ):
                 continue
-            if not reference:
+            # 明示公差がある寸法は、OCR枠のずれで括弧・寸法線判定が外れやすい。
+            # 素の数値だけ厳密に幾何確認し、公差付きは誤除外を避ける。
+            if not reference and tolerance_range is None:
                 reference = _is_visual_parenthetical(
                     image,
                     rect,
@@ -962,6 +976,16 @@ def _detect_scanned_dimension_markings(
                     scale_x=scale_x,
                     scale_y=scale_y,
                 )
+            if tolerance_range is None and not _has_dimension_line_support(
+                image,
+                rect,
+                direction,
+                kind if kind in {"linear", "diameter", "angle", "chamfer", "radius"} else "linear",
+                scale_x=scale_x,
+                scale_y=scale_y,
+                strict=False,
+            ):
+                continue
             quad = _marking_quad_from_points(
                 [
                     rect.top_left,
@@ -998,7 +1022,21 @@ def _detect_scanned_dimension_markings(
             ):
                 continue
             detected.append(candidate)
-    return sorted(detected, key=lambda item: (item.rect[1], item.rect[0]))
+    reference_rects = tuple(
+        fitz.Rect(candidate.rect)
+        for candidate in detected
+        if candidate.reference
+    )
+    verified = [
+        candidate
+        for candidate in detected
+        if not candidate.reference
+        and not _overlaps_reference_evidence(
+            fitz.Rect(candidate.rect),
+            reference_rects,
+        )
+    ]
+    return sorted(verified, key=lambda item: (item.rect[1], item.rect[0]))
 
 
 def _detect_local_dimension_markings(
@@ -1011,6 +1049,7 @@ def _detect_local_dimension_markings(
     """Parse dimension notation from the shared ONNX OCR page result."""
 
     detected: list[_DetectedDimensionMarking] = []
+    reference_rects = _ocr_reference_rects(ocr_page)
     for line in ocr_page.lines:
         text = unicodedata.normalize("NFKC", line.text)
         if _SURFACE_ROUGHNESS_PATTERN.search(text):
@@ -1041,6 +1080,8 @@ def _detect_local_dimension_markings(
         match = _MARKING_NUMBER_PATTERN.search(working)
         if match is None:
             continue
+        if working.endswith(("+", "-")):
+            continue
         if working[:1] in {"+", "-", "−", "±"}:
             continue
         try:
@@ -1064,12 +1105,27 @@ def _detect_local_dimension_markings(
 
         rect = fitz.Rect(line.rect) & page.rect
         direction = line.direction
+        if _overlaps_reference_evidence(rect, reference_rects):
+            continue
+        quad_points = [fitz.Point(point) for point in line.quad]
+        edge_lengths = (
+            math.dist(line.quad[0], line.quad[1]),
+            math.dist(line.quad[0], line.quad[3]),
+        )
+        text_length = max(edge_lengths)
+        text_thickness = min(edge_lengths)
+        max_text_thickness = max(
+            9.0,
+            min(page.rect.width, page.rect.height) * 0.018,
+        )
         if (
             rect.is_empty
             or rect.y1 < page.rect.height * 0.08
             or rect.y0 > page.rect.height * 0.86
             or rect.width > page.rect.width * 0.34
             or rect.height > page.rect.height * 0.25
+            or text_thickness > max_text_thickness
+            or text_length > max(page.rect.width, page.rect.height) * 0.18
             or (
                 rect.x1 < page.rect.width * 0.22
                 and rect.y1 < page.rect.height * 0.32
@@ -1096,13 +1152,33 @@ def _detect_local_dimension_markings(
                 reference = True
         if reference:
             continue
+        has_line_support = _has_dimension_line_support(
+            ocr_page.image,
+            rect,
+            direction,
+            scale_x=ocr_page.scale_x,
+            scale_y=ocr_page.scale_y,
+            kind=kind,
+            strict=False,
+        )
+        if scanned_page and not has_line_support:
+            continue
+        if scanned_page and tolerance_range is None and line.score < 0.72:
+            continue
         if (
             scanned_page
             and tolerance_range is None
+            and kind == "linear"
+            and not match.group("prefix")
+            and not match.group("degree")
+            and nominal < 4.0
+            and float(nominal).is_integer()
         ):
+            # Isolated 1/2/3 are usually view labels, note numbers, or table
+            # cells in scanned drawings rather than actual dimensions.
             continue
         quad = _marking_quad_from_points(
-            [fitz.Point(point) for point in line.quad],
+            quad_points,
             direction,
             along_expand=max(1.5, min(5.0, max(rect.width, rect.height) * 0.07)),
             across_inset=max(0.08, min(rect.width, rect.height) * 0.025),
@@ -3597,6 +3673,31 @@ class DrawingApi:
                                 include_plain_dimensions=False,
                                 scanned_page=True,
                             )
+                            # RapidOCR is strong on small numeric text, while
+                            # Windows OCR recovers a different subset of faint
+                            # and rotated tolerance callouts. Run both and keep
+                            # only geometrically verified, non-overlapping hits.
+                            try:
+                                windows_detected = _detect_scanned_dimension_markings(
+                                    page,
+                                    _resource_path("windows_ocr.ps1"),
+                                    include_plain_dimensions=False,
+                                )
+                            except (OSError, subprocess.SubprocessError, ValueError):
+                                windows_detected = []
+                            for windows_marking in windows_detected:
+                                windows_rect = fitz.Rect(windows_marking.rect)
+                                if any(
+                                    (windows_rect & fitz.Rect(existing.rect)).get_area()
+                                    >= 0.45
+                                    * min(
+                                        windows_rect.get_area(),
+                                        fitz.Rect(existing.rect).get_area(),
+                                    )
+                                    for existing in scanned_detected
+                                ):
+                                    continue
+                                scanned_detected.append(windows_marking)
                         else:
                             scanned_detected = _detect_scanned_dimension_markings(
                                 page,

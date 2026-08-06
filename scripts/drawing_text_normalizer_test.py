@@ -31,7 +31,7 @@ def main() -> None:
     assert token is not None and token.nominal_value == 45.0
 
     token = parse_dimension_token("(026.5)")
-    assert token is not None and token.nominal_value == 26.5
+    assert token is not None and token.nominal_value == 26.5 and token.reference
 
     assert parse_dimension_token("05") is None
     assert parse_dimension_token("SCALE 1:1") is None

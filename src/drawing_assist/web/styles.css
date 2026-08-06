@@ -2,18 +2,18 @@
   color-scheme: light;
   --ink: #172033;
   --muted: #667085;
-  --line: #e3e8ef;
-  --panel: #ffffff;
-  --canvas: #222a37;
-  --accent: #2563eb;
-  --accent-soft: #eaf1ff;
-  --shadow: 0 12px 30px rgba(15, 23, 42, .13);
-  font-family: "Yu Gothic UI", "Meiryo UI", Meiryo, sans-serif;
+  --line: #e5e9f0;
+  --panel: #fdfefe;
+  --canvas: #202936;
+  --accent: #315fd4;
+  --accent-soft: #edf3ff;
+  --shadow: 0 14px 32px rgba(15, 23, 42, .10);
+  font-family: "Noto Sans JP", "BIZ UDPGothic", "Segoe UI Variable", sans-serif;
 }
 
 * { box-sizing: border-box; }
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-body { color: var(--ink); background: #f5f7fa; font-size: 14px; }
+body { color: var(--ink); background: #f3f5f8; font-size: 14px; }
 button, input { font: inherit; }
 button { color: inherit; }
 .hidden { display: none !important; }
@@ -29,12 +29,12 @@ summary::-webkit-details-marker { display: none; }
   padding: 10px 18px;
   background: #fff;
   border-bottom: 1px solid var(--line);
-  box-shadow: 0 2px 10px rgba(15, 23, 42, .04);
+  box-shadow: 0 2px 12px rgba(15, 23, 42, .035);
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 170px; }
 .brand-mark {
   display: grid; place-items: center; width: 39px; height: 39px;
-  border-radius: 11px; color: #fff; background: linear-gradient(145deg, #2563eb, #1746ad);
+  border-radius: 12px; color: #fff; background: linear-gradient(145deg, #3d6ddd, #244aa8);
   font-size: 12px; font-weight: 800; letter-spacing: -.5px;
   box-shadow: 0 5px 14px rgba(37, 99, 235, .28);
 }
@@ -48,7 +48,7 @@ summary::-webkit-details-marker { display: none; }
 }
 .primary-button {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  min-height: 42px; padding: 0 16px; border-radius: 9px;
+  min-height: 42px; padding: 0 16px; border-radius: 10px;
   color: #fff; background: var(--accent); font-weight: 700;
   box-shadow: 0 5px 12px rgba(37, 99, 235, .22);
 }
@@ -172,17 +172,15 @@ body:not(.document-loaded) .workspace { grid-template-columns: minmax(0, 1fr); }
 body:not(.document-loaded) .tool-panel,
 body:not(.document-loaded) .settings-panel { display: none; }
 .tool-panel, .settings-panel { z-index: 2; min-width: 0; min-height: 0; overflow-y: auto; background: var(--panel); }
-.tool-panel { padding: 13px 9px 14px; border-right: 1px solid var(--line); }
-.settings-panel { padding: 13px 11px 18px; border-left: 1px solid var(--line); }
+.tool-panel { padding: 15px 10px 16px; border-right: 1px solid var(--line); }
+.settings-panel { padding: 15px 12px 20px; border-left: 1px solid var(--line); }
 .panel-heading {
-  display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center;
-  gap: 8px; margin: 0 5px 11px;
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; margin: 0 6px 13px;
 }
 .panel-heading span { display: flex; min-width: 0; align-items: center; gap: 7px; font-size: 14px; font-weight: 800; white-space: nowrap; }
-.panel-heading span b {
-  display: grid; place-items: center; width: 23px; height: 23px;
-  border-radius: 50%; color: #fff; background: #2563eb; font-size: 11px;
-}
+.panel-heading span b { display: none; }
+.panel-heading span { color: #263752; letter-spacing: .035em; }
 .panel-heading small {
   min-width: 0; color: var(--muted); font-size: 10px; line-height: 1.35;
   overflow-wrap: anywhere; text-align: right;
@@ -190,28 +188,22 @@ body:not(.document-loaded) .settings-panel { display: none; }
 
 .tool-card {
   position: relative; display: grid; grid-template-columns: 42px minmax(0, 1fr);
-  align-items: center; width: 100%; min-height: 60px; margin: 5px 0; padding: 7px 8px;
-  border: 1px solid transparent; border-radius: 11px; text-align: left; background: transparent;
+  align-items: center; width: 100%; min-height: 60px; margin: 5px 0; padding: 8px 9px;
+  border: 1px solid transparent; border-radius: 12px; text-align: left; background: transparent;
 }
-.tool-card:hover { background: #f5f7fb; }
+.tool-card:hover { border-color: #e2e8f2; background: #f6f8fc; }
 .tool-card:focus { outline: none; }
 .tool-card:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 1px; }
-.tool-card.active { color: #1746ad; border-color: #b8ccff; background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
-.flow-tool { padding-right: 34px; }
-.flow-tool::after {
-  content: attr(data-flow-step); position: absolute; top: 7px; right: 8px;
-  display: grid; place-items: center; width: 18px; height: 18px;
-  border-radius: 50%; color: #526277; background: #edf1f6;
-  font-size: 9px; font-weight: 900;
-}
-.flow-tool.active::after, .flow-tool.next-step::after {
-  color: #fff; background: #2563eb;
-}
-.flow-tool.complete::after { content: "✓"; color: #fff; background: #16a36a; }
+.tool-card.active { color: #244fae; border-color: #bfd0fb; background: var(--accent-soft); box-shadow: inset 2px 0 var(--accent), 0 5px 12px rgba(48, 95, 212, .08); }
+/* Tool names already show the workflow step; a second badge was redundant. */
+.workflow-tool { padding-right: 9px; }
+.workflow-tool::after, .tool-card::after { content: none !important; display: none !important; }
 .tool-card > span:last-child { min-width: 0; }
 .tool-card strong, .tool-card small { display: block; max-width: 100%; overflow-wrap: anywhere; }
 .tool-card strong { font-size: 13px; line-height: 1.35; }
 .tool-card small { margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.35; }
+.tool-panel > .tool-card { min-height: 54px; }
+.tool-panel > .tool-card small { display: none; }
 .help-title kbd {
   padding: 2px 5px; border: 1px solid #d5dae2; border-bottom-width: 2px;
   border-radius: 5px; color: #7a8495; background: #fff; font: 10px/1.2 inherit; text-align: center;
@@ -262,13 +254,11 @@ body:not(.document-loaded) .settings-panel { display: none; }
   background: #f8fafc; overflow: hidden;
 }
 .dimension-fix-tools > summary {
-  display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center;
   gap: 8px; min-height: 54px; padding: 7px 10px; color: #334155;
 }
 .dimension-fix-tools > summary > b {
-  display: grid; place-items: center; width: 22px; height: 22px;
-  border-radius: 50%; color: #526277; background: #e7ecf3;
-  font-size: 10px;
+  display: none;
 }
 .dimension-fix-tools > summary strong,
 .dimension-fix-tools > summary small { display: block; }
@@ -425,9 +415,9 @@ body:not(.document-loaded) .settings-panel { display: none; }
 }
 .task-guide-heading { display: flex; align-items: center; gap: 8px; }
 .task-guide-heading span {
-  display: grid; place-items: center; width: 24px; height: 24px;
-  border-radius: 50%; color: #fff; background: #2563eb;
-  font-size: 12px; font-weight: 900;
+  display: inline-flex; align-items: center; min-width: 52px; height: 22px;
+  padding: 0 8px; border-radius: 6px; color: #1d4ed8; background: #e4efff;
+  font-size: 9px; font-weight: 900; letter-spacing: .06em;
 }
 .task-guide-heading small {
   color: #315ea8; font-size: 10px; font-weight: 900; letter-spacing: .04em;
@@ -715,7 +705,7 @@ body:not(.document-loaded) .settings-panel { display: none; }
   .workspace { grid-template-columns: 220px minmax(360px, 1fr) 278px; }
   .panel-heading > small { display: none; }
   .tool-card { grid-template-columns: 38px minmax(0, 1fr); padding-left: 6px; }
-  .flow-tool { padding-right: 32px; }
+  .workflow-tool { padding-right: 6px; }
   .tool-card strong { font-size: 12px; }
   .tool-card small { font-size: 9px; }
   .brand { min-width: auto; }
@@ -747,8 +737,7 @@ body:not(.document-loaded) .settings-panel { display: none; }
   .panel-heading { gap: 6px; margin-right: 3px; margin-left: 3px; }
   .panel-heading span { gap: 5px; font-size: 12px; }
   .tool-card { grid-template-columns: 34px minmax(0, 1fr); padding-right: 5px; padding-left: 5px; }
-  .flow-tool { padding-right: 28px; }
-  .flow-tool::after { right: 5px; }
+  .workflow-tool { padding-right: 5px; }
   .tool-card strong { font-size: 11px; }
   .tool-card small { font-size: 8px; }
   .candidate-confirm-bar {

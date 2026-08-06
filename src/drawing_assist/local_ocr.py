@@ -14,7 +14,10 @@ import numpy as np
 from PIL import Image
 
 from drawing_assist.drawing_text_normalizer import normalize_drawing_text
-from drawing_assist.image_preprocessor import prepare_raster_for_rapidocr
+from drawing_assist.image_preprocessor import (
+    prepare_raster_for_rapidocr,
+    prepare_raster_for_structure,
+)
 from drawing_assist.ocr_config import (
     DETAIL_ANGLE_ZOOM,
     LOCAL_OCR_MIN_CONFIDENCE,
@@ -87,6 +90,34 @@ def local_ocr_available() -> bool:
     return True
 
 
+def _restore_rotated_quad(
+    box,
+    rotation: int,
+    *,
+    source_width: int,
+    source_height: int,
+    scale_x: float,
+    scale_y: float,
+) -> tuple[tuple[float, float], ...]:
+    """Map OCR points from a PIL-rotated raster back to PDF coordinates."""
+
+    restored: list[tuple[float, float]] = []
+    for point in box[:4]:
+        rotated_x = float(point[0])
+        rotated_y = float(point[1])
+        if rotation == 90:
+            source_x = source_width - rotated_y
+            source_y = rotated_x
+        elif rotation == 270:
+            source_x = rotated_y
+            source_y = source_height - rotated_x
+        else:
+            source_x = rotated_x
+            source_y = rotated_y
+        restored.append((source_x / scale_x, source_y / scale_y))
+    return tuple(restored)
+
+
 def analyze_page(page: fitz.Page, *, scanned: bool = False) -> LocalOcrPage:
     """Run one reusable, fully local OCR pass for an image drawing page."""
 
@@ -110,33 +141,73 @@ def analyze_page(page: fitz.Page, *, scanned: bool = False) -> LocalOcrPage:
     source_image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
     # Windows OCR と同等のコントラスト補正を軽量版で適用する。
     image = prepare_raster_for_rapidocr(source_image)
+    structure_image = prepare_raster_for_structure(source_image)
     array = np.asarray(image)
     with _ENGINE_LOCK:
         result = _engine()(array, return_word_box=False)
 
-    boxes = result.boxes if result.boxes is not None else []
-    texts = result.txts if result.txts is not None else []
-    scores = result.scores if result.scores is not None else []
+        # Dimension text is commonly printed vertically. Explicitly rotate
+        # the complete page once so the recognizer sees those glyphs as an
+        # ordinary horizontal line. RapidOCR's angle classifier handles the
+        # remaining 180-degree direction, so a second vertical pass is not
+        # necessary.
+        rotated_result = (
+            _engine()(
+                np.asarray(image.rotate(90, expand=True, fillcolor="white")),
+                return_word_box=False,
+            )
+            if scanned
+            else None
+        )
+
+        # Long-line cleanup recovers text joined to drafting lines, while the
+        # conservative raster remains better for some faint or diagonal text.
+        # Keep both observations on scanned drawings and let the geometric
+        # candidate filter reject anything that is not a real dimension.
+        legacy_result = (
+            _engine()(np.asarray(structure_image), return_word_box=False)
+            if scanned
+            else None
+        )
+
     scale_x = image.width / page.rect.width
     scale_y = image.height / page.rect.height
     lines: list[LocalOcrLine] = []
-    for box, text, score in zip(boxes, texts, scores):
-        normalized = normalize_drawing_text(str(text or "").strip())
-        confidence = float(score or 0.0)
-        if not normalized or confidence < LOCAL_OCR_MIN_CONFIDENCE or len(box) < 4:
+    for ocr_result, rotation in (
+        (result, 0),
+        (legacy_result, 0),
+        (rotated_result, 90),
+    ):
+        if ocr_result is None:
             continue
-        quad = tuple(
-            (float(point[0]) / scale_x, float(point[1]) / scale_y)
-            for point in box[:4]
-        )
-        lines.append(LocalOcrLine(normalized, confidence, quad))
+        boxes = ocr_result.boxes if ocr_result.boxes is not None else []
+        texts = ocr_result.txts if ocr_result.txts is not None else []
+        scores = ocr_result.scores if ocr_result.scores is not None else []
+        for box, text, score in zip(boxes, texts, scores):
+            normalized = normalize_drawing_text(str(text or "").strip())
+            confidence = float(score or 0.0)
+            if (
+                not normalized
+                or confidence < LOCAL_OCR_MIN_CONFIDENCE
+                or len(box) < 4
+            ):
+                continue
+            quad = _restore_rotated_quad(
+                box,
+                rotation,
+                source_width=image.width,
+                source_height=image.height,
+                scale_x=scale_x,
+                scale_y=scale_y,
+            )
+            lines.append(LocalOcrLine(normalized, confidence, quad))
     return LocalOcrPage(
         image.width,
         image.height,
         scale_x,
         scale_y,
-        image,
-        tuple(lines),
+        structure_image,
+        merge_ocr_lines(tuple(lines)),
     )
 
 
@@ -504,13 +575,13 @@ def join_nearby_tolerance_ocr_lines(
             and right_rect.x0 >= left_rect.x0 - left_rect.height * 0.6
             and -left_rect.height * 0.5
             <= horizontal_gap
-            <= max(64.0, left_rect.height * 7.0)
+            <= max(18.0, left_rect.height * 3.2)
         )
         vertical_match = (
             horizontal_overlap >= min(left_rect.width, right_rect.width) * 0.35
             and -min_height * 0.35
             <= vertical_gap
-            <= max(52.0, left_rect.height * 5.5)
+            <= max(18.0, left_rect.height * 3.2)
             and abs((left_rect.x0 + left_rect.x1) / 2 - (right_rect.x0 + right_rect.x1) / 2)
             <= max(left_rect.width, right_rect.width) * 0.75
         )
@@ -605,9 +676,12 @@ def analyze_scanned_page_tiles(page: fitz.Page) -> tuple[LocalOcrLine, ...]:
         x = left
         while x < right:
             x1 = min(image.width, x + tile_width)
-            crop = np.asarray(image.crop((x, y, x1, y1)))
+            crop_image = image.crop((x, y, x1, y1))
+            crop = np.asarray(crop_image)
             with _ENGINE_LOCK:
                 result = _engine()(crop, return_word_box=False)
+            # 縦書き寸法はページ全体の90度パスで拾う。
+            # タイルごとの回転OCRは処理時間が倍増するため行わない。
             boxes = [] if result.boxes is None else result.boxes
             texts = [] if result.txts is None else result.txts
             scores = [] if result.scores is None else result.scores

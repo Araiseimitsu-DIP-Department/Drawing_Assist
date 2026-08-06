@@ -4,3 +4,4 @@ pywebview>=6.2,<7
 pyinstaller>=6,<7
 rapidocr>=3.8,<4
 onnxruntime>=1.20,<2
+opencv-python>=4.10,<6

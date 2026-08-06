@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>加工図面作成支援ツール</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=2026-08-06-ocr6b">
 </head>
 <body>
   <input id="pdfFileInput" type="file" accept=".pdf,application/pdf" hidden>
@@ -52,13 +52,12 @@
           <small>よく使う作業</small>
         </div>
 
-        <button class="tool-card active flow-tool" data-flow-step="1" data-mode="general_tolerance" type="button">
+        <button class="tool-card active workflow-tool" data-mode="general_tolerance" type="button">
           <span class="tool-icon tolerance-icon">±</span>
-          <span><strong>① 公差を入れる</strong><small>検出して一括反映</small></span>
+          <span><strong>公差未記載の寸法</strong><small>一般公差を適用</small></span>
         </button>
         <details class="dimension-fix-tools">
-          <summary><b>②</b><span><strong>寸法を直す</strong><small id="dimensionFixStatus">必要なときだけ</small></span><i>⌄</i></summary>
-          <p>修正が終わったら、③の色分けへ進みます。</p>
+          <summary><b aria-hidden="true"></b><span><strong>寸法を直す</strong><small id="dimensionFixStatus">必要なときだけ</small></span><i>⌄</i></summary>
           <button class="tool-card compact" data-mode="dimension" type="button">
             <span class="tool-icon dimension-icon"></span>
             <span><strong>寸法と矢印を追加</strong><small>追加・移動・矢先調整</small></span>
@@ -72,13 +71,13 @@
             <span><strong>二重線で消す</strong><small>寸法をクリック</small></span>
           </button>
         </details>
-        <button class="tool-card flow-tool" data-flow-step="3" data-mode="word" type="button">
+        <button class="tool-card workflow-tool" data-mode="word" type="button">
           <span class="tool-icon marker-icon"></span>
-          <span><strong>③ 寸法を色分け</strong><small>一括色分け・手動追加</small></span>
+          <span><strong>寸法を色分け</strong><small>一括色分け・手動追加</small></span>
         </button>
-        <button class="tool-card flow-tool" data-flow-step="4" data-mode="work_shape" type="button">
+        <button class="tool-card workflow-tool" data-mode="work_shape" type="button">
           <span class="tool-icon work-shape-icon"></span>
-          <span><strong>④ 製品を塗る</strong><small>断面・加工部の範囲</small></span>
+          <span><strong>製品を塗る</strong><small>断面・加工部の範囲</small></span>
         </button>
         <details class="more-tools">
           <summary><span><strong>その他の機能</strong><small>印・注記・測定記号</small></span><i>⌄</i></summary>
@@ -195,7 +194,7 @@
         </div>
 
         <section id="taskGuide" class="task-guide">
-          <div class="task-guide-heading"><span id="taskStep">1</span><small>いまやること</small></div>
+          <div class="task-guide-heading"><span id="taskStep">STEP 1</span><small>いまやること</small></div>
           <strong id="taskTitle">規格を選んで検出</strong>
           <p id="modeHelp">右の「対象寸法を検出」を押します。</p>
         </section>
@@ -203,9 +202,9 @@
         <section class="setting-group hidden marking-flow-panel" data-for="word">
           <h3 class="setting-title">色分け</h3>
           <div class="operation-steps" aria-hidden="true">
-            <span id="markingFlowDetect" class="operation-step active">①検出</span>
-            <span id="markingFlowReview" class="operation-step">②確認</span>
-            <span id="markingFlowApply" class="operation-step">③反映</span>
+            <span id="markingFlowDetect" class="operation-step active">Step 1 検出</span>
+            <span id="markingFlowReview" class="operation-step">Step 2 確認</span>
+            <span id="markingFlowApply" class="operation-step">Step 3 反映</span>
           </div>
           <button id="scanDimensionMarkingsButton" class="detect-button" type="button" disabled>
             対象寸法を検出
@@ -432,9 +431,9 @@
         <section class="setting-group hidden tolerance-panel" data-for="general_tolerance">
           <h3 class="setting-title">一般公差</h3>
           <div class="operation-steps" aria-hidden="true">
-            <span id="toleranceFlowDetect" class="operation-step active">①検出</span>
-            <span id="toleranceFlowReview" class="operation-step">②確認</span>
-            <span id="toleranceFlowApply" class="operation-step">③反映</span>
+            <span id="toleranceFlowDetect" class="operation-step active">Step 1 検出</span>
+            <span id="toleranceFlowReview" class="operation-step">Step 2 確認</span>
+            <span id="toleranceFlowApply" class="operation-step">Step 3 反映</span>
           </div>
           <label for="generalToleranceStandard">規格</label>
           <select id="generalToleranceStandard" class="text-input">
@@ -467,7 +466,7 @@
             <p>直線寸法・直径・C/R・角度を検出します。図面注記を優先し、括弧内の参考寸法と幾何公差は対象外です。0.099 mm以下は寸法値と同じ公差、0.1 mm以上0.5 mm未満は±0.1です。</p>
           </details>
           <button id="scanGeneralToleranceButton" class="detect-button" type="button">
-            対象寸法を検出
+            公差未記載寸法を検出
           </button>
           <div class="selection-progress tolerance-progress">
             <span>反映する件数</span>
@@ -573,6 +572,6 @@
     </main>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=2026-08-06-ocr6b"></script>
 </body>
 </html>
