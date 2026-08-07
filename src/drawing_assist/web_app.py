@@ -30,6 +30,7 @@ from drawing_assist.local_ocr import (
     LocalOcrPage,
     analyze_page,
     analyze_scanned_page_tiles,
+    build_tile_ocr_page,
     enrich_scanned_ocr_page,
     local_ocr_available,
 )
@@ -128,7 +129,13 @@ _MARKING_LIMIT_PATTERN = re.compile(
 )
 _MARKING_CONTEXT_PATTERN = re.compile(
     r"(?:以下|以上|超え|SCALE|DATE|DWG|DRAWING|PAGE|SHEET|REV|"
-    r"図番|品番|尺度|日付|材質|公差)",
+    r"図番|品番|尺度|日付|材質|公差|MODEL|PART|NO\.|型式|改訂|番号)",
+    re.IGNORECASE,
+)
+
+# 品番・改訂欄（例: WNBT-424-/A-C2）を寸法公差と誤認しない
+_PART_NUMBER_PATTERN = re.compile(
+    r"(?:[A-Z]{2,}[-_/]\d)|(?:\d[-_/][A-Z])|(?:[-/][A-Z]-\w)|(?:\w+-\d+[-/])",
     re.IGNORECASE,
 )
 
@@ -143,7 +150,8 @@ _SURFACE_ROUGHNESS_PATTERN = re.compile(
 )
 
 _ROUGHNESS_OCR_PATTERN = re.compile(
-    r"^\d\.\d\+0\.0\d$",
+    # Ra/Rz の典型値だけを対象にする（5.7+0.05 のような片側公差寸法は除外しない）
+    r"^(?:0\.[148]|1\.[68]|3\.2|6\.3|12\.5)\+0\.0\d$",
 )
 
 _FIT_TOLERANCE_PATTERN = re.compile(
@@ -220,6 +228,11 @@ def _explicit_tolerance_range(
     # ISO fit notation is part of the nominal (for example ``φ26g6``), not
     # a tolerance magnitude.  Ignore the grade digit before reading deviations.
     remainder = re.sub(r"^\s*[A-Za-z]\s*\d{1,2}", "", remainder)
+    # 改訂・品番（例: 424-/A-C2）を公差として読まない
+    if re.match(r"^\s*[-/][A-Za-z]", remainder):
+        return None
+    if _PART_NUMBER_PATTERN.search(normalized):
+        return None
     if not any(symbol in remainder for symbol in ("±", "+", "-")):
         return None
     values = [
@@ -237,6 +250,95 @@ def _explicit_tolerance_range(
     return abs(max(values) - min(values))
 
 
+def _marking_ocr_quality(text: str, score: float) -> tuple[int, int, float]:
+    """重複候補の採用判定用。公差の読みが整っている方を優先する。"""
+
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    quality = 0
+    if "±" in compact or "士" in compact or "土" in compact:
+        quality += 3
+    if re.search(r"[±士土]\d+\.\d+", compact):
+        quality += 2
+    # R0.2±01 のような公差小数点欠落を減点する
+    if re.search(r"[±士土]\d{2,}(?:\D|$)", compact):
+        quality -= 2
+    if re.match(r"^C\.\d", compact, flags=re.IGNORECASE):
+        quality -= 1
+    # 途中切れ公差は大きく減点する
+    if re.search(r"[±+\-]0\.?$", compact) or compact.endswith(("±", "+", "-")):
+        quality -= 4
+    # φ/Φ 付きを素の数値より優先する
+    if re.match(r"^[φΦØ⌀]", compact):
+        quality += 2
+    # 47.85 を 7.85 に潰すような桁欠けより、桁が多い読みを優先する
+    stem = re.split(r"[±+\-－−士土]", compact, maxsplit=1)[0]
+    digit_count = len(re.sub(r"\D", "", stem))
+    quality += min(5, digit_count)
+    return (quality, len(compact), float(score))
+
+
+def _merge_detected_markings(
+    base: list[_DetectedDimensionMarking],
+    extra: list[_DetectedDimensionMarking],
+    *,
+    extra_score: float = 0.7,
+) -> list[_DetectedDimensionMarking]:
+    """色分け候補を品質優先で統合する（重複・近接の同一寸法を1件にまとめる）。"""
+
+    merged = list(base)
+    for item in extra:
+        item_rect = fitz.Rect(item.rect)
+        item_center = fitz.Point(
+            (item_rect.x0 + item_rect.x1) / 2,
+            (item_rect.y0 + item_rect.y1) / 2,
+        )
+        item_quality = _marking_ocr_quality(item.source_text, extra_score)
+        overlapped = False
+        for index, existing in enumerate(merged):
+            existing_rect = fitz.Rect(existing.rect)
+            existing_center = fitz.Point(
+                (existing_rect.x0 + existing_rect.x1) / 2,
+                (existing_rect.y0 + existing_rect.y1) / 2,
+            )
+            overlap_area = (item_rect & existing_rect).get_area()
+            overlap_hit = overlap_area >= 0.45 * min(
+                item_rect.get_area(),
+                existing_rect.get_area(),
+            )
+            same_dimension = (
+                abs(existing.nominal_value - item.nominal_value) < 1e-6
+                and (
+                    existing.kind == item.kind
+                    or {existing.kind, item.kind} <= {"linear", "diameter"}
+                )
+                and (
+                    (existing.tolerance_range is None)
+                    == (item.tolerance_range is None)
+                )
+                and (
+                    existing.tolerance_range is None
+                    or abs(
+                        float(existing.tolerance_range)
+                        - float(item.tolerance_range)
+                    )
+                    < 1e-6
+                )
+            )
+            near_hit = same_dimension and math.dist(
+                (item_center.x, item_center.y),
+                (existing_center.x, existing_center.y),
+            ) <= 36.0
+            if not overlap_hit and not near_hit:
+                continue
+            overlapped = True
+            if item_quality > _marking_ocr_quality(existing.source_text, 0.0):
+                merged[index] = item
+            break
+        if not overlapped:
+            merged.append(item)
+    return merged
+
+
 def _is_plausible_tolerance_marking(
     text: str,
     nominal: float,
@@ -244,26 +346,56 @@ def _is_plausible_tolerance_marking(
 ) -> bool:
     """色分け対象として妥当な公差付き寸法かどうか。"""
 
+    if nominal <= 0 or nominal > 4000:
+        return False
     if tolerance_range is None:
         return False
-    if tolerance_range > max(nominal * 0.6, 3.0):
+    # 途中切れの ±0 / ±0. は公差として扱わない
+    if tolerance_range <= 0:
         return False
-    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    # 小寸法では下限 3.0 だと R0.2±01（range=2）などを通しすぎるため、
+    # 公称値に応じた上限で判定する。
+    if tolerance_range > max(nominal * 0.6, min(3.0, max(nominal, 0.5))):
+        return False
+    # 接頭辞なしで公差が公称の4割超は、一般公差表などとの誤結合が多い
+    compact_probe = unicodedata.normalize("NFKC", text).replace(" ", "")
+    if (
+        not re.search(r"[φΦØ⌀CR]", compact_probe, re.IGNORECASE)
+        and tolerance_range > nominal * 0.4
+    ):
+        return False
+    compact = compact_probe
     # OCR途中切れ（末尾が 0. や記号で終わる、先頭が小数点のみ、など）を除外する。
     if (
         compact.startswith(".")
-        or compact.endswith((".", ":", ",", "+", "-", "±"))
+        or compact.endswith((".", ":", ",", "+", "-", "±", "0±0", "±0"))
+        or re.search(r"[±+\-]0\.?$", compact)
         or re.search(r"[±+\-]0\.$", compact)
         or re.search(r"^\d+[±+\-]", compact) and not re.search(r"\d", compact.split("±")[-1] if "±" in compact else "")
         or re.fullmatch(r"\d{1,2}[±+\-]\d", compact)
         or re.search(r"\d\.[±+\-]", compact)
+        # 4.5-0.2022 のような桁崩れ
+        or re.search(r"-\d+\.\d{3,}$", compact)
     ):
         return False
+    # 130E~±0.2 のような OCR ゴミ（波線・寸法中の英字）を除外する
+    if re.search(r"[~〜～]", compact):
+        return False
+    stem = re.sub(r"^[φΦØ⌀CRcr]", "", compact)
+    if re.search(r"[A-Za-z]", stem):
+        # はめあい（例: 26g6±0.01）だけ許容し、130E± などは落とす
+        if not re.match(
+            r"^\d+(?:[.,]\d+)?[A-Za-z]\d{1,2}(?:[±+\-－−].*)?$",
+            stem,
+        ):
+            return False
     if _FIT_TOLERANCE_PATTERN.search(text):
         return False
     if _ROUGHNESS_OCR_PATTERN.fullmatch(compact):
         return False
     if re.search(r"M\d", text, re.IGNORECASE):
+        return False
+    if _PART_NUMBER_PATTERN.search(compact):
         return False
     if re.search(r"[A-Z]{2,}\d", text) and "±" not in text and "+" not in text:
         return False
@@ -618,7 +750,8 @@ def _detect_scanned_dimension_markings(
     """Detect explicit dimension+tolerance groups in a raster drawing."""
 
     maximum_dimension = max(page.rect.width, page.rect.height)
-    zoom = max(2.4, min(3.5, 2800 / maximum_dimension))
+    # 小寸法・公差付きの読み取り精度を優先して解像度を上げる
+    zoom = max(3.2, min(4.5, 3600 / maximum_dimension))
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(zoom, zoom),
         colorspace=fitz.csRGB,
@@ -891,6 +1024,13 @@ def _detect_scanned_dimension_markings(
                     match.group("degree"),
                 )
             tolerance_range = _explicit_tolerance_range(working, nominal)
+            if _PART_NUMBER_PATTERN.search(text) or _PART_NUMBER_PATTERN.search(working):
+                continue
+            if (
+                tolerance_range is not None
+                and not _is_plausible_tolerance_marking(text, nominal, tolerance_range)
+            ):
+                continue
             # OCR sometimes finds a number and a plus/minus character inside
             # an entire note or title-block row.  Those long strings caused
             # large, unrelated highlights.  A drawing dimension is a compact
@@ -949,12 +1089,15 @@ def _detect_scanned_dimension_markings(
             if (
                 rect.is_empty
                 or rect.y1 < page.rect.height * 0.08
-                or rect.y0 > page.rect.height * 0.86
+                or rect.y0 > page.rect.height * (
+                    0.93 if tolerance_range is not None else 0.86
+                )
                 or rect.width > page.rect.width * 0.32
                 or rect.height > page.rect.height * 0.25
                 or (
                     rect.x1 < page.rect.width * 0.22
                     and rect.y1 < page.rect.height * 0.32
+                    and tolerance_range is None
                 )
             ):
                 continue
@@ -1063,6 +1206,8 @@ def _detect_local_dimension_markings(
         compact = _normalize_raster_dimension_text(text).lstrip("△▲◆◇")
         # Filled triangular inspection markers are commonly read as A.
         compact = re.sub(r"^A(?=\d)", "", compact)
+        if _PART_NUMBER_PATTERN.search(text) or _PART_NUMBER_PATTERN.search(compact):
+            continue
         if is_tolerance_fragment(text) or is_tolerance_fragment(compact):
             continue
         limit_callout = _MARKING_LIMIT_PATTERN.fullmatch(compact)
@@ -1105,7 +1250,11 @@ def _detect_local_dimension_markings(
 
         rect = fitz.Rect(line.rect) & page.rect
         direction = line.direction
-        if _overlaps_reference_evidence(rect, reference_rects):
+        # 参照寸法 (n) の近傍抑制は、素の数値の重複読み向け。
+        # 明示公差付き寸法まで落とすと隣接寸法が欠けるため対象外にする。
+        if tolerance_range is None and _overlaps_reference_evidence(
+            rect, reference_rects
+        ):
             continue
         quad_points = [fitz.Point(point) for point in line.quad]
         edge_lengths = (
@@ -1114,14 +1263,19 @@ def _detect_local_dimension_markings(
         )
         text_length = max(edge_lengths)
         text_thickness = min(edge_lengths)
+        # 画像PDFの公差付き寸法は OCR 枠がやや厚く出ることが多い。
+        # 0.018 だと 16pt 前後の正規寸法まで落としてしまうため、公差付きは緩和する。
+        thickness_ratio = 0.030 if tolerance_range is not None else 0.018
         max_text_thickness = max(
             9.0,
-            min(page.rect.width, page.rect.height) * 0.018,
+            min(page.rect.width, page.rect.height) * thickness_ratio,
         )
+        # 公差付きは表題欄付近にも実寸法があるため、下端除外を緩める
+        bottom_limit = 0.93 if tolerance_range is not None else 0.86
         if (
             rect.is_empty
             or rect.y1 < page.rect.height * 0.08
-            or rect.y0 > page.rect.height * 0.86
+            or rect.y0 > page.rect.height * bottom_limit
             or rect.width > page.rect.width * 0.34
             or rect.height > page.rect.height * 0.25
             or text_thickness > max_text_thickness
@@ -1129,6 +1283,7 @@ def _detect_local_dimension_markings(
             or (
                 rect.x1 < page.rect.width * 0.22
                 and rect.y1 < page.rect.height * 0.32
+                and tolerance_range is None
             )
             or (
                 scanned_page
@@ -1141,7 +1296,8 @@ def _detect_local_dimension_markings(
             )
         ):
             continue
-        if not reference:
+        # 明示公差がある寸法は、OCR枠ずれで括弧誤判定しやすいため幾何括弧判定をスキップ
+        if not reference and tolerance_range is None:
             if _is_visual_parenthetical(
                 ocr_page.image,
                 rect,
@@ -1162,7 +1318,12 @@ def _detect_local_dimension_markings(
             strict=False,
         )
         if scanned_page and not has_line_support:
-            continue
+            # 公差付きで信頼度が高い場合は寸法線欠落での誤除外を避ける
+            if not (
+                tolerance_range is not None
+                and line.score >= 0.85
+            ):
+                continue
         if scanned_page and tolerance_range is None and line.score < 0.72:
             continue
         if (
@@ -1194,12 +1355,23 @@ def _detect_local_dimension_markings(
             reference=reference,
         )
         candidate_rect = fitz.Rect(candidate.rect)
-        if any(
-            (candidate_rect & fitz.Rect(existing.rect)).get_area()
-            >= 0.45
-            * min(candidate_rect.get_area(), fitz.Rect(existing.rect).get_area())
-            for existing in detected
-        ):
+        candidate_quality = _marking_ocr_quality(working, line.score)
+        overlapped = False
+        for index, existing in enumerate(detected):
+            existing_rect = fitz.Rect(existing.rect)
+            overlap_area = (candidate_rect & existing_rect).get_area()
+            if overlap_area < 0.45 * min(
+                candidate_rect.get_area(),
+                existing_rect.get_area(),
+            ):
+                continue
+            overlapped = True
+            existing_quality = _marking_ocr_quality(existing.source_text, 0.0)
+            # 同点では先勝ち（ページOCR側）を維持する
+            if candidate_quality > existing_quality:
+                detected[index] = candidate
+            break
+        if overlapped:
             continue
         detected.append(candidate)
     return sorted(detected, key=lambda item: (item.rect[1], item.rect[0]))
@@ -1439,6 +1611,71 @@ class DrawingApi:
             except Exception:
                 tiles = ()
         return enrich_scanned_ocr_page(base, tiles)
+
+    def _collect_scanned_dimension_markings(
+        self,
+        page: fitz.Page,
+        *,
+        recorder: OcrPipelineRecorder | None = None,
+    ) -> list[_DetectedDimensionMarking]:
+        """画像PDFの色分け候補をページ/タイル/Windows OCRから収集する。"""
+
+        scanned_detected: list[_DetectedDimensionMarking] = []
+        page_ocr = self._shared_local_ocr(page)
+        if page_ocr is not None:
+            page_detected = _detect_local_dimension_markings(
+                page,
+                page_ocr,
+                include_plain_dimensions=False,
+                scanned_page=True,
+            )
+            scanned_detected = list(page_detected)
+            if recorder is not None:
+                recorder.set_count("page_markings", len(page_detected))
+
+        tiles = self.scanned_tile_cache.get(self.page_index)
+        if tiles is None:
+            try:
+                tiles = analyze_scanned_page_tiles(page)
+                self.scanned_tile_cache[self.page_index] = tiles
+            except Exception:
+                tiles = ()
+        if tiles:
+            if page_ocr is not None:
+                ocr_for_tiles = enrich_scanned_ocr_page(page_ocr, tiles)
+            else:
+                ocr_for_tiles = build_tile_ocr_page(page, tiles)
+            tile_detected = _detect_local_dimension_markings(
+                page,
+                ocr_for_tiles,
+                include_plain_dimensions=False,
+                scanned_page=True,
+            )
+            scanned_detected = _merge_detected_markings(
+                scanned_detected,
+                tile_detected,
+                extra_score=0.7,
+            )
+            if recorder is not None:
+                recorder.set_count("tile_markings", len(tile_detected))
+
+        try:
+            windows_detected = _detect_scanned_dimension_markings(
+                page,
+                _resource_path("windows_ocr.ps1"),
+                include_plain_dimensions=False,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            windows_detected = []
+        scanned_detected = _merge_detected_markings(
+            scanned_detected,
+            windows_detected,
+            extra_score=0.6,
+        )
+        if recorder is not None:
+            recorder.set_count("windows_markings", len(windows_detected))
+            recorder.set_count("merged_markings", len(scanned_detected))
+        return scanned_detected
 
     def drawing_assist_command(
         self,
@@ -3661,54 +3898,10 @@ class DrawingApi:
             marking_recorder.set_count("vector_detected", len(detected))
             if _needs_local_ocr(page):
                 try:
-                    cached_scanned = self.scanned_marking_cache.get(
-                        self.page_index
+                    scanned_detected = self._collect_scanned_dimension_markings(
+                        page,
+                        recorder=marking_recorder,
                     )
-                    if cached_scanned is None:
-                        shared_ocr = self._enriched_local_ocr(page)
-                        if shared_ocr is not None:
-                            scanned_detected = _detect_local_dimension_markings(
-                                page,
-                                shared_ocr,
-                                include_plain_dimensions=False,
-                                scanned_page=True,
-                            )
-                            # RapidOCR is strong on small numeric text, while
-                            # Windows OCR recovers a different subset of faint
-                            # and rotated tolerance callouts. Run both and keep
-                            # only geometrically verified, non-overlapping hits.
-                            try:
-                                windows_detected = _detect_scanned_dimension_markings(
-                                    page,
-                                    _resource_path("windows_ocr.ps1"),
-                                    include_plain_dimensions=False,
-                                )
-                            except (OSError, subprocess.SubprocessError, ValueError):
-                                windows_detected = []
-                            for windows_marking in windows_detected:
-                                windows_rect = fitz.Rect(windows_marking.rect)
-                                if any(
-                                    (windows_rect & fitz.Rect(existing.rect)).get_area()
-                                    >= 0.45
-                                    * min(
-                                        windows_rect.get_area(),
-                                        fitz.Rect(existing.rect).get_area(),
-                                    )
-                                    for existing in scanned_detected
-                                ):
-                                    continue
-                                scanned_detected.append(windows_marking)
-                        else:
-                            scanned_detected = _detect_scanned_dimension_markings(
-                                page,
-                                _resource_path("windows_ocr.ps1"),
-                                include_plain_dimensions=True,
-                            )
-                        self.scanned_marking_cache[self.page_index] = tuple(
-                            scanned_detected
-                        )
-                    else:
-                        scanned_detected = list(cached_scanned)
                 except (OSError, subprocess.SubprocessError, ValueError):
                     scanned_detected = []
                 for scanned_marking in scanned_detected:

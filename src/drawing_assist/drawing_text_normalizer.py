@@ -45,11 +45,36 @@ def normalize_drawing_text(value: str) -> str:
 
     text = unicodedata.normalize("NFKC", value).strip()
     text = re.sub(r"\s+", "", text)
-    text = text.replace("＠", "φ").replace("@", "φ").replace("Φ", "φ").replace("Ø", "φ")
+    # 直径記号の誤読（Ω は RapidOCR で φ と取り違えやすい）
+    text = (
+        text.replace("＠", "φ")
+        .replace("@", "φ")
+        .replace("Φ", "φ")
+        .replace("Ø", "φ")
+        .replace("⌀", "φ")
+        .replace("Ω", "φ")
+        .replace("ω", "φ")
+    )
     text = re.sub(r"^[の劣効](?=\d)", "φ", text)
+    # 先頭ゴミ（例: .013.7±0.02 → 13.7±0.02）。.05 のような公差断片は残す
+    text = re.sub(r"^\.0(?=\d+\.\d)", "", text)
     text = re.sub(r"^[ー・](?=\d)", "", text)
+    # Windows OCR で φ12 が 0)12 / )12 と読まれることがある
+    text = re.sub(r"^0\)(?=\d)", "φ", text)
+    text = re.sub(r"^\)(?=\d)", "φ", text)
+    # 通貨・著作権記号などの先頭ゴミ
+    text = re.sub(r"^[$￥€£©®§]", "", text)
     text = text.replace("Ｃ", "C").replace("Ｒ", "R").replace("Ｍ", "M")
     text = text.replace("。", "°")
+    # 公差記号の異体・誤読を統一する
+    text = (
+        text.replace("士", "±")
+        .replace("土", "±")
+        .replace("亇", "±")
+        .replace("干", "±")
+    )
+    # R0.2±01 → R0.2±0.1（小数点欠落の典型パターン）
+    text = re.sub(r"(±)0([1-9])(?!\d)", r"\g<1>0.\2", text)
     text = re.sub(r"(?<=\d),(?=\d)", ".", text)
     text = re.sub(r"(?<=\d),[OＯ](?=\d)", ".0", text, flags=re.IGNORECASE)
     text = re.sub(r"(?<=\d)[、。・·](?=\d)", ".", text)

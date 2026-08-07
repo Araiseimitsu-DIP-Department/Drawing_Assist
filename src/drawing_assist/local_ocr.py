@@ -504,6 +504,50 @@ def merge_ocr_lines(
 ) -> tuple[LocalOcrLine, ...]:
     """複数OCR結果を重複除去して統合する。"""
 
+    def _text_quality(text: str) -> tuple[int, int, float]:
+        compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+        quality = 0
+        if "±" in compact or "士" in compact:
+            quality += 3
+        if re.search(r"[±士]\d+\.\d+", compact):
+            quality += 2
+        if re.search(r"[±士]\d{2,}(?:\D|$)", compact):
+            quality -= 2
+        if re.search(r"[±+\-]0\.?$", compact):
+            quality -= 3
+        stem = re.split(r"[±+\-－−士土]", compact, maxsplit=1)[0]
+        digit_count = len(re.sub(r"\D", "", stem))
+        quality += min(5, digit_count)
+        # 接頭辞付きは寸法らしい
+        if re.match(r"^[φΦØ⌀CR]", compact):
+            quality += 1
+        return (quality, len(compact), 0.0)
+
+    def _same_reading_family(left: str, right: str) -> bool:
+        """同一寸法の別読み（C.15 vs 0.15±0.025 等）かどうか。"""
+
+        left_nums = re.findall(r"\d+(?:\.\d+)?", left)
+        right_nums = re.findall(r"\d+(?:\.\d+)?", right)
+        if not left_nums or not right_nums:
+            return False
+        try:
+            return abs(float(left_nums[0]) - float(right_nums[0])) < 1e-6
+        except ValueError:
+            return False
+
+    def _likely_digit_truncation(left: str, right: str) -> bool:
+        """47.85 と 7.85 のように先頭桁が欠けた同一寸法かどうか。"""
+
+        left_nums = re.findall(r"\d+(?:\.\d+)?", left)
+        right_nums = re.findall(r"\d+(?:\.\d+)?", right)
+        if not left_nums or not right_nums:
+            return False
+        left_digits = left_nums[0].replace(".", "")
+        right_digits = right_nums[0].replace(".", "")
+        if left_digits == right_digits:
+            return False
+        return left_digits.endswith(right_digits) or right_digits.endswith(left_digits)
+
     merged: list[LocalOcrLine] = []
     for group in groups:
         for line in group:
@@ -511,11 +555,36 @@ def merge_ocr_lines(
             duplicate = False
             for index, existing in enumerate(merged):
                 existing_center = _line_center(existing)
-                if (
-                    existing.text == line.text
-                    and math.dist(center, existing_center) <= 18.0
-                ):
+                distance = math.dist(center, existing_center)
+                if existing.text == line.text and distance <= 18.0:
                     if line.score > existing.score:
+                        merged[index] = line
+                    duplicate = True
+                    break
+                # ほぼ同位置かつ同一寸法の別読みは、公差表記が整っている方を残す
+                if (
+                    distance <= 10.0
+                    and _same_reading_family(existing.text, line.text)
+                ):
+                    line_quality = (
+                        _text_quality(line.text)[0],
+                        len(line.text),
+                        line.score,
+                    )
+                    existing_quality = (
+                        _text_quality(existing.text)[0],
+                        len(existing.text),
+                        existing.score,
+                    )
+                    if line_quality > existing_quality:
+                        merged[index] = line
+                    duplicate = True
+                    break
+                # 同位置の桁欠け（47.85 vs 7.85）だけを統合する
+                if distance <= 8.0 and _likely_digit_truncation(
+                    existing.text, line.text
+                ):
+                    if _text_quality(line.text) > _text_quality(existing.text):
                         merged[index] = line
                     duplicate = True
                     break
@@ -554,9 +623,23 @@ def join_nearby_tolerance_ocr_lines(
             return None
         if not _NOMINAL_START.search(left_text.lstrip("△▲A")):
             return None
-        if not _EXPLICIT_TOLERANCE_IN_LINE.search(right_text):
-            if not _TOLERANCE_ONLY_LINE.fullmatch(right_text.strip()):
-                return None
+        right_stripped = right_text.strip()
+        # 右辺は公差断片のみ。Φ16±0.1 のような完成寸法は巻き込まない
+        if _NOMINAL_START.search(right_stripped.lstrip("△▲A")) and (
+            _EXPLICIT_TOLERANCE_IN_LINE.search(right_stripped)
+            or len(right_stripped) > 6
+        ):
+            return None
+        left_needs_tol_digits = bool(
+            re.search(r"[±士土亇干]0?\.$", left_text)
+            or left_text.rstrip().endswith(("±", "士", "土"))
+        )
+        if not (
+            right_stripped.startswith(("±", "+", "-", "＋", "－", "士", "土", "亇", "干"))
+            or _TOLERANCE_ONLY_LINE.fullmatch(right_stripped)
+            or (left_needs_tol_digits and re.fullmatch(r"\d{1,3}", right_stripped))
+        ):
+            return None
         left_rect = _line_rect(left)
         right_rect = _line_rect(right)
         if left_rect.is_empty or right_rect.is_empty:
@@ -628,7 +711,10 @@ def join_nearby_tolerance_ocr_lines(
         )
         consumed.add(left_index)
         consumed.add(right_index)
-    return tuple(joined)
+
+    # 結合済み断片は落とすが、未結合の完成寸法は必ず残す
+    retained = [line for index, line in indexed if index not in consumed]
+    return tuple(retained + joined)
 
 
 def enrich_scanned_ocr_page(
@@ -638,8 +724,41 @@ def enrich_scanned_ocr_page(
     """ページOCRとタイルOCRを統合し、分離公差を結合する。"""
 
     merged = merge_ocr_lines(ocr_page.lines, tile_lines or ())
-    joined = join_nearby_tolerance_ocr_lines(merged)
-    return replace(ocr_page, lines=merge_ocr_lines(merged, joined))
+    # 数値 + ± + 公差値 の3分割にも対応するため2回結合する
+    combined = join_nearby_tolerance_ocr_lines(merged)
+    combined = join_nearby_tolerance_ocr_lines(combined)
+    return replace(ocr_page, lines=combined)
+
+
+def build_tile_ocr_page(
+    page: fitz.Page,
+    tile_lines: tuple[LocalOcrLine, ...],
+) -> LocalOcrPage:
+    """ページOCRが使えないとき、タイル結果だけで検出用ページを作る。"""
+
+    maximum_dimension = max(page.rect.width, page.rect.height)
+    zoom = max(
+        SCANNED_OCR_ZOOM_MIN,
+        min(SCANNED_OCR_ZOOM_MAX, SCANNED_OCR_ZOOM_NUMERATOR / maximum_dimension),
+    )
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(zoom, zoom),
+        colorspace=fitz.csRGB,
+        alpha=False,
+        annots=False,
+    )
+    source_image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    image = prepare_raster_for_rapidocr(source_image)
+    combined = join_nearby_tolerance_ocr_lines(tile_lines)
+    combined = join_nearby_tolerance_ocr_lines(combined)
+    return LocalOcrPage(
+        width=image.width,
+        height=image.height,
+        scale_x=image.width / page.rect.width,
+        scale_y=image.height / page.rect.height,
+        image=image,
+        lines=combined,
+    )
 
 
 def analyze_scanned_page_tiles(page: fitz.Page) -> tuple[LocalOcrLine, ...]:
@@ -667,7 +786,8 @@ def analyze_scanned_page_tiles(page: fitz.Page) -> tuple[LocalOcrLine, ...]:
     left = int(image.width * 0.03)
     right = int(image.width * 0.95)
     top = int(image.height * 0.08)
-    bottom = int(image.height * 0.83)
+    # 下端付近の公差付き寸法も拾う（色分け側の bottom_limit=0.93 と揃える）
+    bottom = int(image.height * 0.93)
 
     lines: list[LocalOcrLine] = []
     y = top

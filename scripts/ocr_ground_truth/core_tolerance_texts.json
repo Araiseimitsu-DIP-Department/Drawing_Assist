@@ -1,0 +1,78 @@
+{
+  "name": "core",
+  "description": "公差付き寸法のテキスト再現率用正解（Text Extractor目標・ユーザー提示例を含む）",
+  "items": [
+    {
+      "text": "φ13.7±0.02",
+      "key": "φ13.7±0.02",
+      "aliases": ["13.7±0.02", "φ13.7+0.02"],
+      "source": "user"
+    },
+    {
+      "text": "12.7±0.05",
+      "key": "12.7±0.05",
+      "aliases": ["φ12.7±0.05", "12±0.05", "φ12±0.05"],
+      "source": "user"
+    },
+    {
+      "text": "60°",
+      "key": "angle:60",
+      "aliases": ["60"],
+      "source": "user"
+    },
+    {
+      "text": "7.9±0.05",
+      "key": "7.9±0.05",
+      "aliases": ["φ7.9±0.05", "7.9±0.01"],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "0.2±0.02",
+      "key": "0.2±0.02",
+      "aliases": [],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "0.15±0.025",
+      "key": "0.15±0.025",
+      "aliases": [],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "φ16±0.1",
+      "key": "φ16±0.1",
+      "aliases": ["16±0.1"],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "φ22±0.1",
+      "key": "φ22±0.1",
+      "aliases": ["φ22+0.1", "22±0.1"],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "φ2.5±0.1",
+      "key": "φ2.5±0.1",
+      "aliases": ["2.5±0.1"],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "φ4.5±0.1",
+      "key": "φ4.5±0.1",
+      "aliases": ["4.5±0.1"],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "R0.2±0.1",
+      "key": "R0.2±0.1",
+      "aliases": [],
+      "source": "drawing_candidate"
+    },
+    {
+      "text": "φ12-0.35",
+      "key": "φ12-0.35",
+      "aliases": ["12-0.35", "φ12±0.35"],
+      "source": "drawing_candidate"
+    }
+  ]
+}

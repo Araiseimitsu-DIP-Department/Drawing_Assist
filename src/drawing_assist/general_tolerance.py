@@ -65,6 +65,7 @@ _EXPLICIT_TOLERANCE = re.compile(
 )
 _NON_DIMENSION_CONTEXT = re.compile(
     r"(?:SCALE|DATE|DWG|DRAWING|PAGE|SHEET|REV|図番|品番|尺度|日付|材質|"
+    r"MODEL|PART|NO\.|型式|改訂|番号|公差|以上|超え|"
     r"Rz\s*max|Rzmax|Ra\s*max|Ramax|Rmax)",
     re.IGNORECASE,
 )
@@ -514,7 +515,7 @@ def _deep_cr_candidates(
     left = int(image.width * 0.04)
     right = int(image.width * 0.80)
     top = int(image.height * 0.16)
-    bottom = int(image.height * 0.84)
+    bottom = int(image.height * 0.90)
     tile_width = max(480, int(125 * scale_x))
     tile_height = max(440, int(112 * scale_y))
     step_x = max(360, int(tile_width * 0.72))
@@ -914,7 +915,7 @@ def _tiled_dimension_candidates(
     left = int(image.width * 0.025)
     right = int(image.width * 0.94)
     top = int(image.height * 0.09)
-    bottom = int(image.height * 0.84)
+    bottom = int(image.height * 0.90)
 
     tiles: list[tuple[tuple[int, int, int, int], float, Image.Image]] = []
     y = top
@@ -2157,7 +2158,9 @@ def _local_ocr_general_candidates(
         rect = fitz.Rect(line.rect) & page.rect
         direction = line.direction
         if _overlaps_reference_evidence(rect, reference_rects):
-            continue
+            # 参照寸法近傍の抑制は素の数値向け。φ/C/R は隣接でも残す。
+            if not prefix and not degree:
+                continue
         has_line_support = _has_dimension_line_support(
             ocr_page.image,
             rect,
@@ -2167,10 +2170,12 @@ def _local_ocr_general_candidates(
             scale_y=ocr_page.scale_y,
             strict=strict_line_support,
         )
+        # 接頭辞付き寸法は下端付近にも実寸法があるため除外を緩める
+        bottom_limit = 0.93 if prefix else 0.86
         if (
             rect.is_empty
             or (not parsed.reference and rect.y1 < page.rect.height * 0.08)
-            or rect.y0 > page.rect.height * 0.86
+            or rect.y0 > page.rect.height * bottom_limit
             or rect.width > 85
             or rect.height > 85
             or (
@@ -2246,7 +2251,9 @@ def _local_ocr_general_candidates(
             scale_x=ocr_page.scale_x,
             scale_y=ocr_page.scale_y,
         ):
-            continue
+            # 接頭辞付きで寸法線がある場合は括弧誤判定を無視（C0.2 など）
+            if not (prefix and has_line_support):
+                continue
         elif not is_detail_angle and _is_feature_control_frame(
             ocr_page.image,
             rect,
@@ -2270,12 +2277,23 @@ def _local_ocr_general_candidates(
         ):
             continue
         if not is_detail_angle and not has_line_support:
-            if not (
+            # 画像PDFでは寸法線検出が欠けることがある。
+            # 小数付きの φ/C/R は高信頼度なら候補に残す。
+            allow_without_line = (
                 scanned_page
-                and prefix in {"φ", "Φ", "Ø", "⌀"}
                 and "." in compact
-                and line.score >= 0.88
-            ):
+                and (
+                    (
+                        prefix in {"φ", "Φ", "Ø", "⌀"}
+                        and line.score >= 0.88
+                    )
+                    or (
+                        prefix.upper() in {"C", "R"}
+                        and line.score >= 0.90
+                    )
+                )
+            )
+            if not allow_without_line:
                 continue
         if scanned_page and kind == "linear" and not prefix and not degree:
             if line.score < 0.78:
@@ -2382,13 +2400,25 @@ def _merge_general_tolerance_candidates(
 ) -> list[GeneralToleranceCandidate]:
     """Merge candidate lists while removing overlapping duplicates."""
 
+    def _quality(candidate: GeneralToleranceCandidate) -> tuple[int, int, float]:
+        text = unicodedata.normalize("NFKC", candidate.source_text)
+        has_prefix = 1 if re.match(r"^[φΦØ⌀CR]", text) else 0
+        has_degree = 1 if "°" in text or "。" in text else 0
+        digit_count = len(re.sub(r"\D", "", re.split(r"[±+\-]", text, maxsplit=1)[0]))
+        return (
+            has_prefix + has_degree + min(5, digit_count),
+            len(text),
+            abs(candidate.nominal_value),
+        )
+
     merged: list[GeneralToleranceCandidate] = []
     for group in groups:
         for candidate in group:
             candidate_rect = fitz.Rect(candidate.rect)
-            if any(
-                _same_candidate(candidate, existing)
-                or (
+            overlap_index = -1
+            for index, existing in enumerate(merged):
+                same = _same_candidate(candidate, existing)
+                overlap_ratio = (
                     (candidate_rect & fitz.Rect(existing.rect)).get_area()
                     / max(
                         1e-9,
@@ -2397,12 +2427,16 @@ def _merge_general_tolerance_candidates(
                             fitz.Rect(existing.rect).get_area(),
                         ),
                     )
-                    >= 0.2
                 )
-                for existing in merged
-            ):
+                if same or overlap_ratio >= 0.2:
+                    overlap_index = index
+                    break
+            if overlap_index < 0:
+                merged.append(candidate)
                 continue
-            merged.append(candidate)
+            # 接頭辞・表記が整っている方を残す
+            if _quality(candidate) >= _quality(merged[overlap_index]):
+                merged[overlap_index] = candidate
     return merged
 
 
@@ -2646,7 +2680,7 @@ def detect_general_tolerance_candidates(
             grade=grade,
             angle_shorter_side_length=angle_shorter_side_length,
             ocr_page=local_ocr_page,
-            scanned_page=image_only_page,
+            scanned_page=scanned_page,
             strict_line_support=False,
         )
         supplement_threshold = (
@@ -2676,20 +2710,24 @@ def detect_general_tolerance_candidates(
                     "merged_ocr_lines",
                     len(ocr_page_for_detect.lines),
                 )
-        local_candidates = (
-            _local_ocr_general_candidates(
+        local_candidates = page_only_candidates
+        if tile_lines_used:
+            # タイル統合だけでページOCRを捨てると桁欠けが残る。
+            # ページ候補とタイル候補を品質優先で統合する。
+            tiled_candidates = _local_ocr_general_candidates(
                 page,
                 page_index,
                 standard=standard,
                 grade=grade,
                 angle_shorter_side_length=angle_shorter_side_length,
                 ocr_page=ocr_page_for_detect,
-                scanned_page=image_only_page,
+                scanned_page=scanned_page,
                 strict_line_support=False,
             )
-            if tile_lines_used
-            else page_only_candidates
-        )
+            local_candidates = _merge_general_tolerance_candidates(
+                page_only_candidates,
+                tiled_candidates,
+            )
         recorder.set_count("ocr_raw_lines", len(ocr_page_for_detect.lines))
         merged = _merge_general_tolerance_candidates(
             seed_candidates,
@@ -2735,7 +2773,8 @@ def detect_general_tolerance_candidates(
         final = [
             candidate
             for candidate in final
-            if not _overlaps_reference_evidence(
+            if re.match(r"^[φΦØ⌀CR]", candidate.source_text)
+            or not _overlaps_reference_evidence(
                 fitz.Rect(candidate.rect),
                 reference_evidence,
             )

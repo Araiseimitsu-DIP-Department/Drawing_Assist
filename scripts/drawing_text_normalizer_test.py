@@ -19,6 +19,12 @@ def main() -> None:
     assert phi_token is not None and phi_token.nominal_value == 10.0
     assert normalize_drawing_text("12,O5") == "12.05"
     assert normalize_drawing_text("45 MIN") == "45"
+    # RapidOCR の φ 誤読・先頭ゴミ補正
+    assert normalize_drawing_text("Ω13.7±0.02") == "Φ13.7±0.02"
+    assert normalize_drawing_text(".013.7±0.02") == "13.7±0.02"
+    assert normalize_drawing_text("R0.2±01") == "R0.2±0.1"
+    assert normalize_drawing_text("0)12士0.05") == "Φ12±0.05"
+    assert normalize_drawing_text("$7.9±0.05") == "7.9±0.05"
 
     assert is_tolerance_fragment("05")
     assert is_tolerance_fragment("0.05")
