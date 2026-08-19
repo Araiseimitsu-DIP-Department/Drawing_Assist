@@ -34,9 +34,27 @@ from drawing_assist.pdf_editor import (
     dimension_label_rect,
     export_pdf,
 )
+from drawing_assist.drawing_text_normalizer import normalize_drawing_text
+from drawing_assist.local_ocr import (
+    LocalOcrLine,
+    LocalOcrPage,
+    join_nearby_tolerance_ocr_lines,
+    join_split_dimension_ocr_lines,
+    select_vertical_dimension_clips,
+)
 from drawing_assist.web_app import (
+    _DetectedDimensionMarking,
+    _FIT_TOLERANCE_PATTERN,
     _detect_dimension_markings,
+    _detect_local_dimension_markings,
     _detect_scanned_dimension_markings,
+    _explicit_tolerance_range,
+    _is_fit_deviation_fragment,
+    _is_plausible_tolerance_marking,
+    _marking_highlight_color,
+    _marking_paint_parts,
+    _merge_detected_markings,
+    _unify_dimension_marking_entries,
 )
 
 
@@ -910,10 +928,11 @@ def _verify_scanned_drawing_detection() -> None:
         abs(marking.nominal_value - 3.9) < 1e-9
         for marking in explicit_markings
     ), [(marking.source_text, marking.nominal_value) for marking in markings]
-    assert not any(
+    assert any(
         abs(marking.nominal_value - 0.03) < 1e-9
+        and marking.kind == "geometric"
         for marking in markings
-    )
+    ), [(marking.source_text, marking.nominal_value, marking.kind) for marking in markings]
 
 
 def _verify_applied_tolerance_removal() -> None:
@@ -999,6 +1018,817 @@ def _verify_dimension_marking_removal() -> None:
         api.upload_directory.cleanup()
 
 
+def _verify_vertical_tolerance_postprocessing() -> None:
+    nominal = LocalOcrLine(
+        "Φ16.05",
+        0.95,
+        ((10, 10), (10, 60), (18, 60), (18, 10)),
+    )
+    tolerance = LocalOcrLine(
+        "+0.05",
+        0.98,
+        ((10, 62), (10, 90), (18, 90), (18, 62)),
+    )
+    joined = join_nearby_tolerance_ocr_lines((nominal, tolerance))
+    assert len(joined) == 1
+    assert joined[0].text == "Φ16.05+0.05"
+    assert abs(joined[0].direction[1]) > 0.99
+
+    incomplete = LocalOcrLine(
+        "2.5+",
+        0.90,
+        ((30, 30), (50, 30), (50, 40), (30, 40)),
+    )
+    lone_zero = LocalOcrLine(
+        "0",
+        0.99,
+        ((52, 30), (58, 30), (58, 40), (52, 40)),
+    )
+    not_joined = join_nearby_tolerance_ocr_lines((incomplete, lone_zero))
+    assert {line.text for line in not_joined} == {"2.5+", "0"}
+
+    incomplete_dot = LocalOcrLine(
+        "2.",
+        0.95,
+        ((30, 50), (42, 50), (42, 60), (30, 60)),
+    )
+    plus_025 = LocalOcrLine(
+        "+0.25",
+        0.99,
+        ((48, 50), (70, 50), (70, 58), (48, 58)),
+    )
+    incomplete_plus = LocalOcrLine(
+        "2.5+",
+        0.90,
+        ((28, 48), (50, 48), (50, 62), (28, 62)),
+    )
+    recovered = join_split_dimension_ocr_lines(
+        (incomplete_dot, plus_025, incomplete_plus)
+    )
+    texts = {line.text for line in recovered}
+    assert any(text.startswith("2.5+0.2") for text in texts)
+    assert "2.+0.25" not in texts
+
+    phi = LocalOcrLine(
+        "Φ",
+        0.83,
+        ((10, 80), (10, 90), (18, 90), (18, 80)),
+    )
+    twelve_dot = LocalOcrLine(
+        "12.",
+        0.99,
+        ((9, 58), (9, 78), (19, 78), (19, 58)),
+    )
+    nine = LocalOcrLine(
+        "9",
+        0.98,
+        ((10, 50), (10, 56), (18, 56), (18, 50)),
+    )
+    plus_02 = LocalOcrLine(
+        "+0.2",
+        0.99,
+        ((10, 34), (10, 50), (17, 50), (17, 34)),
+    )
+    neighbor = LocalOcrLine(
+        "16.05",
+        0.99,
+        ((40, 50), (40, 90), (52, 90), (52, 50)),
+    )
+    stacked = join_split_dimension_ocr_lines(
+        (plus_02, nine, twelve_dot, phi, neighbor)
+    )
+    stacked_texts = {line.text for line in stacked}
+    assert any("12.9+0.2" in text for text in stacked_texts)
+    assert "12.16.05" not in stacked_texts
+    assert "9+0.2" not in stacked_texts
+    assert any(line.text == "16.05" for line in stacked)
+    recovered_12 = next(line for line in stacked if "12.9+0.2" in line.text)
+    assert abs(recovered_12.direction[1]) > 0.9
+    assert fitz.Rect(recovered_12.rect).width < 30
+
+    nearby_radius = LocalOcrLine(
+        "R0.2",
+        0.99,
+        ((55, 48), (78, 48), (78, 60), (55, 60)),
+    )
+    preferred = join_split_dimension_ocr_lines(
+        (incomplete_dot, plus_025, incomplete_plus, nearby_radius)
+    )
+    preferred_texts = {line.text for line in preferred}
+    assert any(text.startswith("2.5+0.2") for text in preferred_texts)
+    assert not any(text.startswith("R0.2+") for text in preferred_texts)
+
+    image = Image.new("L", (400, 400), 255)
+    document = fitz.open()
+    page = document.new_page(width=200, height=200)
+    ocr_page = LocalOcrPage(
+        400,
+        400,
+        2.0,
+        2.0,
+        image,
+        (
+            LocalOcrLine(
+                "Φ14.",
+                0.90,
+                ((30, 90), (42, 90), (42, 120), (30, 120)),
+            ),
+            LocalOcrLine(
+                "50.6±0.05",
+                0.99,
+                ((80, 40), (140, 40), (140, 52), (80, 52)),
+            ),
+            LocalOcrLine(
+                "Φ24.95G6",
+                0.95,
+                ((90, 90), (102, 90), (102, 150), (90, 150)),
+            ),
+        ),
+    )
+    try:
+        clips = select_vertical_dimension_clips(page, ocr_page, limit=8)
+        assert len(clips) <= 8
+        assert any(clip.x0 < 50 for clip in clips)
+        assert any(80 <= (clip.x0 + clip.x1) / 2 <= 120 for clip in clips)
+        assert not any(clip.y1 < 60 and clip.width > clip.height for clip in clips)
+    finally:
+        document.close()
+
+
+def _verify_scanned_ocr_tolerance_recovery() -> None:
+    repaired = normalize_drawing_text("2.8+01")
+    assert repaired == "2.8+0.1"
+    range_28 = _explicit_tolerance_range(repaired, 2.8)
+    assert range_28 is not None and abs(range_28 - 0.1) < 1e-9
+    assert _is_plausible_tolerance_marking(repaired, 2.8, range_28)
+
+    repaired_fit = normalize_drawing_text("Φ16H7+0018")
+    assert repaired_fit == "Φ16H7+0.018"
+    range_fit = _explicit_tolerance_range(repaired_fit, 16.0)
+    assert range_fit is not None and abs(range_fit - 0.018) < 1e-9
+    assert _is_plausible_tolerance_marking(repaired_fit, 16.0, range_fit)
+
+    image = Image.new("L", (2382, 1684), 255)
+    document = fitz.open()
+    page = document.new_page(width=1191, height=842)
+    ocr_page = LocalOcrPage(
+        2382,
+        1684,
+        2.0,
+        2.0,
+        image,
+        (
+            LocalOcrLine(
+                "0.5-0.1",
+                0.99,
+                ((340, 49), (378, 49), (378, 64), (340, 64)),
+            ),
+            LocalOcrLine(
+                "2.8+01",
+                0.90,
+                ((888, 91), (927, 91), (927, 109), (888, 109)),
+            ),
+            LocalOcrLine(
+                "Φ16H7+0018",
+                0.90,
+                ((806, 348), (821, 348), (821, 409), (806, 409)),
+            ),
+        ),
+    )
+    try:
+        markings = _detect_local_dimension_markings(
+            page,
+            ocr_page,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        texts = {item.source_text.replace(" ", "") for item in markings}
+        assert "0.5-0.1" in texts
+        assert "2.8+0.1" in texts
+        assert "Φ16H7+0.018" in texts
+        phi_12 = [
+            item
+            for item in markings
+            if abs(item.nominal_value - 12.9) < 1e-9
+        ]
+        assert not phi_12
+    finally:
+        document.close()
+
+    def vertical_line(
+        text: str,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+    ) -> LocalOcrLine:
+        return LocalOcrLine(
+            text,
+            0.99,
+            ((x0, y0), (x0, y1), (x1, y1), (x1, y0)),
+        )
+
+    fit_image = Image.new("L", (2382, 1684), 255)
+    fit_document = fitz.open()
+    fit_page = fit_document.new_page(width=1191, height=842)
+    fit_ocr = LocalOcrPage(
+        2382,
+        1684,
+        2.0,
+        2.0,
+        fit_image,
+        (
+            vertical_line("Φ18.5±0.05", 438, 429, 456, 490),
+            vertical_line("Φ24.95G6", 461, 429, 481, 485),
+            LocalOcrLine(
+                "-0.007",
+                0.99,
+                ((483, 428), (496, 428), (496, 444), (483, 444)),
+            ),
+            LocalOcrLine(
+                "-0.020",
+                0.99,
+                ((483, 444), (496, 444), (496, 460), (483, 460)),
+            ),
+            vertical_line("Φ26G6", 482, 439, 499, 475),
+            LocalOcrLine(
+                "-0.007",
+                0.99,
+                ((501, 438), (514, 438), (514, 454), (501, 454)),
+            ),
+            LocalOcrLine(
+                "-0.020",
+                0.99,
+                ((501, 454), (514, 454), (514, 470), (501, 470)),
+            ),
+        ),
+    )
+    try:
+        fit_markings = _detect_local_dimension_markings(
+            fit_page,
+            fit_ocr,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        fits = [
+            item
+            for item in fit_markings
+            if "G6" in item.source_text.replace(" ", "")
+        ]
+        assert len(fits) == 2
+        left = next(item for item in fits if abs(item.nominal_value - 24.95) < 1e-9)
+        right = next(item for item in fits if abs(item.nominal_value - 26.0) < 1e-9)
+        assert left.rect[2] < right.rect[0] + 4
+        overlap = (
+            fitz.Rect(left.rect) & fitz.Rect(right.rect)
+        ).get_area()
+        assert overlap < 0.45 * min(
+            fitz.Rect(left.rect).get_area(),
+            fitz.Rect(right.rect).get_area(),
+        )
+        assert left.tolerance_rect is not None
+        assert right.tolerance_rect is not None
+        assert left.tolerance_rect[2] >= 494
+        assert right.tolerance_rect[2] >= 512
+        yellow = next(
+            item
+            for item in fit_markings
+            if abs(item.nominal_value - 18.5) < 1e-9
+        )
+        left_overlap_yellow = (
+            fitz.Rect(left.rect) & fitz.Rect(yellow.rect)
+        ).get_area()
+        assert left_overlap_yellow < 0.2 * fitz.Rect(yellow.rect).get_area()
+        if left.tolerance_rect is not None:
+            tol_overlap_yellow = (
+                fitz.Rect(left.tolerance_rect) & fitz.Rect(yellow.rect)
+            ).get_area()
+            assert tol_overlap_yellow < 0.2 * fitz.Rect(yellow.rect).get_area()
+        paint_parts = _marking_paint_parts(left)
+        widths = [part[0][2] - part[0][0] for part in paint_parts]
+        assert max(widths) - min(widths) < 3.0
+    finally:
+        fit_document.close()
+
+    column_image = Image.new("L", (2382, 1684), 255)
+    column_document = fitz.open()
+    column_page = column_document.new_page(width=1191, height=842)
+    column_ocr = LocalOcrPage(
+        2382,
+        1684,
+        2.0,
+        2.0,
+        column_image,
+        (
+            vertical_line("Φ12.9+0.2", 485, 635, 496, 688),
+            vertical_line("0", 486, 628, 494, 636),
+            vertical_line("Φ16H7+0.018", 518, 626, 529, 691),
+            vertical_line("0", 519, 618, 527, 626),
+            vertical_line("16.05+0.05", 540, 626, 551, 686),
+            vertical_line("0", 541, 618, 549, 626),
+        ),
+    )
+    try:
+        column_markings = _detect_local_dimension_markings(
+            column_page,
+            column_ocr,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        h7 = next(
+            item
+            for item in column_markings
+            if "H7" in item.source_text.replace(" ", "")
+        )
+        assert h7.rect[2] - h7.rect[0] < 28
+        assert h7.rect[0] > 500
+        texts = {item.source_text.replace(" ", "") for item in column_markings}
+        assert any("12.9" in text for text in texts)
+        assert any("16.05" in text for text in texts)
+        phi_12 = next(
+            item
+            for item in column_markings
+            if abs(item.nominal_value - 12.9) < 1e-9
+        )
+        assert phi_12.tolerance_range is not None
+        assert phi_12.tolerance_range > 0.03
+        assert _marking_highlight_color(phi_12.kind, phi_12.tolerance_range) == (
+            "#ffff00"
+        )
+        assert not _FIT_TOLERANCE_PATTERN.search(phi_12.source_text.replace(" ", ""))
+        if h7.tolerance_rect is not None:
+            overlap_12 = (
+                fitz.Rect(h7.tolerance_rect) & fitz.Rect(phi_12.rect)
+            ).get_area()
+            assert overlap_12 < 0.35 * fitz.Rect(phi_12.rect).get_area()
+    finally:
+        column_document.close()
+
+    roughness_image = Image.new("L", (2382, 1684), 255)
+    roughness_document = fitz.open()
+    roughness_page = roughness_document.new_page(width=1191, height=842)
+    roughness_ocr = LocalOcrPage(
+        2382,
+        1684,
+        2.0,
+        2.0,
+        roughness_image,
+        (
+            LocalOcrLine(
+                "(Rzmax 5.7 , Rzmax 2.9)",
+                0.99,
+                ((800, 46), (965, 46), (965, 61), (800, 61)),
+            ),
+        ),
+    )
+    try:
+        roughness_markings = _detect_local_dimension_markings(
+            roughness_page,
+            roughness_ocr,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        roughness = [
+            item for item in roughness_markings if item.kind == "roughness"
+        ]
+        assert len(roughness) == 2
+        widths = sorted(item.rect[2] - item.rect[0] for item in roughness)
+        assert widths[-1] < 120
+        left_r, right_r = sorted(roughness, key=lambda item: item.rect[0])
+        assert left_r.rect[2] <= right_r.rect[0] + 1.0
+        overlap = fitz.Rect(left_r.rect) & fitz.Rect(right_r.rect)
+        assert overlap.is_empty or overlap.get_area() < 0.5
+        dotted = _detect_local_dimension_markings(
+            roughness_page,
+            LocalOcrPage(
+                2382,
+                1684,
+                2.0,
+                2.0,
+                roughness_image,
+                (
+                    LocalOcrLine(
+                        "Rzmax 11.3・Rzmax 5.7・Rzmax 2.9",
+                        0.99,
+                        ((800, 100), (980, 100), (980, 114), (800, 114)),
+                    ),
+                ),
+            ),
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        dotted_items = [item for item in dotted if item.kind == "roughness"]
+        assert len(dotted_items) == 3
+        ordered = sorted(dotted_items, key=lambda item: item.rect[0])
+        assert ordered[0].rect[2] < ordered[1].rect[0]
+        assert ordered[1].rect[2] < ordered[2].rect[0]
+        heights = [item.rect[3] - item.rect[1] for item in ordered]
+        assert max(heights) - min(heights) < 1.5
+        paren_heights = [item.rect[3] - item.rect[1] for item in roughness]
+        assert max(paren_heights) - min(paren_heights) < 1.5
+        duplicate_roughness = _detect_local_dimension_markings(
+            roughness_page,
+            LocalOcrPage(
+                2382,
+                1684,
+                2.0,
+                2.0,
+                roughness_image,
+                (
+                    LocalOcrLine(
+                        "Rzmax 6.3",
+                        0.92,
+                        ((700, 300), (820, 300), (820, 318), (700, 318)),
+                    ),
+                    LocalOcrLine(
+                        "Rzmax 6.3",
+                        0.99,
+                        ((760, 302), (830, 302), (830, 322), (760, 322)),
+                    ),
+                ),
+            ),
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        same_value = [
+            item
+            for item in duplicate_roughness
+            if item.kind == "roughness" and abs(item.nominal_value - 6.3) < 1e-9
+        ]
+        assert len(same_value) == 1
+        split_fit = _detect_local_dimension_markings(
+            roughness_page,
+            LocalOcrPage(
+                2382,
+                1684,
+                2.0,
+                2.0,
+                roughness_image,
+                (
+                    LocalOcrLine(
+                        "Φ16",
+                        0.99,
+                        ((200, 400), (230, 400), (230, 414), (200, 414)),
+                    ),
+                    LocalOcrLine(
+                        "Φ16H7+0.018",
+                        0.99,
+                        ((228, 400), (310, 400), (310, 416), (228, 416)),
+                    ),
+                ),
+            ),
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        sixteen = [
+            item
+            for item in split_fit
+            if abs(item.nominal_value - 16.0) < 1e-9
+        ]
+        assert len(sixteen) == 1
+        assert sixteen[0].rect[2] - sixteen[0].rect[0] >= 70
+        from drawing_assist.pdf_editor import DimensionMarkingEntry as PaintEntry
+
+        broken = [
+            PaintEntry(
+                (100, 40, 148, 52),
+                "#ff76bf",
+                0.42,
+                ((100, 42), (148, 42), (148, 50), (100, 50)),
+            ),
+            PaintEntry(
+                (150, 39, 188, 55),
+                "#ff76bf",
+                0.42,
+                ((150, 39), (188, 39), (188, 55), (150, 55)),
+            ),
+        ]
+        unified = _unify_dimension_marking_entries(broken)
+        assert len(unified) == 1
+        assert unified[0].rect[2] - unified[0].rect[0] >= 85
+        height = unified[0].rect[3] - unified[0].rect[1]
+        assert 7.5 <= height <= 17.0
+        diagonal = PaintEntry(
+            (90, 100, 160, 159),
+            "#ffff00",
+            0.42,
+            ((100, 100), (160, 145), (150, 159), (90, 114)),
+        )
+        diagonal_out = _unify_dimension_marking_entries([diagonal])[0]
+        diagonal_edge = (
+            diagonal_out.quad[1][0] - diagonal_out.quad[0][0],
+            diagonal_out.quad[1][1] - diagonal_out.quad[0][1],
+        )
+        assert abs(diagonal_edge[1] / diagonal_edge[0]) > 0.4
+        complete_pair = [
+            PaintEntry(
+                (800, 46, 878, 61),
+                "#ff76bf",
+                0.42,
+                ((800, 46), (878, 46), (878, 61), (800, 61)),
+            ),
+            PaintEntry(
+                (890, 48, 968, 60),
+                "#ff76bf",
+                0.42,
+                ((890, 48), (968, 48), (968, 60), (890, 60)),
+            ),
+        ]
+        aligned = _unify_dimension_marking_entries(complete_pair)
+        assert len(aligned) == 2
+        aligned_heights = [item.rect[3] - item.rect[1] for item in aligned]
+        assert max(aligned_heights) - min(aligned_heights) < 1.2
+        overlapping_complete_pair = [
+            PaintEntry(
+                (800, 46, 878, 61),
+                "#ff76bf",
+                0.42,
+                ((800, 46), (878, 46), (878, 61), (800, 61)),
+            ),
+            PaintEntry(
+                (876, 48, 954, 60),
+                "#ff76bf",
+                0.42,
+                ((876, 48), (954, 48), (954, 60), (876, 60)),
+            ),
+        ]
+        overlapping_complete = _unify_dimension_marking_entries(
+            overlapping_complete_pair
+        )
+        assert len(overlapping_complete) == 2
+        overlap = fitz.Rect(overlapping_complete[0].rect) & fitz.Rect(
+            overlapping_complete[1].rect
+        )
+        assert overlap.is_empty or overlap.get_area() < 1.0
+        yellow = PaintEntry(
+            (438, 429, 456, 490),
+            "#ffff00",
+            0.42,
+            ((438, 429), (456, 429), (456, 490), (438, 490)),
+        )
+        pink = PaintEntry(
+            (448, 428, 514, 470),
+            "#ff76bf",
+            0.42,
+            ((448, 428), (514, 428), (514, 470), (448, 470)),
+        )
+        separated = _unify_dimension_marking_entries([yellow, pink])
+        pink_out = next(item for item in separated if item.color == "#ff76bf")
+        yellow_out = next(item for item in separated if item.color == "#ffff00")
+        overlap_area = (
+            fitz.Rect(pink_out.rect) & fitz.Rect(yellow_out.rect)
+        ).get_area()
+        assert overlap_area < 0.12 * fitz.Rect(yellow_out.rect).get_area()
+        punct = _detect_local_dimension_markings(
+            roughness_page,
+            LocalOcrPage(
+                2382,
+                1684,
+                2.0,
+                2.0,
+                roughness_image,
+                (
+                    LocalOcrLine(
+                        "(",
+                        0.99,
+                        ((792, 46), (800, 46), (800, 61), (792, 61)),
+                    ),
+                ),
+            ),
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        assert punct == []
+        tall = _detect_local_dimension_markings(
+            roughness_page,
+            LocalOcrPage(
+                2382,
+                1684,
+                2.0,
+                2.0,
+                roughness_image,
+                (
+                    LocalOcrLine(
+                        "Rmax 5.7",
+                        0.99,
+                        ((700, 200), (708, 200), (708, 280), (700, 280)),
+                    ),
+                ),
+            ),
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        assert all(item.kind != "roughness" for item in tall)
+        overlapping_roughness = _detect_local_dimension_markings(
+            roughness_page,
+            LocalOcrPage(
+                2382,
+                1684,
+                2.0,
+                2.0,
+                roughness_image,
+                (
+                    LocalOcrLine(
+                        "Rmax 5.7",
+                        0.99,
+                        ((800, 80), (890, 80), (890, 95), (800, 95)),
+                    ),
+                    LocalOcrLine(
+                        "Rmax 2.9",
+                        0.99,
+                        ((870, 80), (965, 80), (965, 95), (870, 95)),
+                    ),
+                ),
+            ),
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        split_roughness = [
+            item for item in overlapping_roughness if item.kind == "roughness"
+        ]
+        assert len(split_roughness) == 2
+        left_s, right_s = sorted(split_roughness, key=lambda item: item.rect[0])
+        split_overlap = fitz.Rect(left_s.rect) & fitz.Rect(right_s.rect)
+        assert split_overlap.is_empty or split_overlap.get_area() < 0.5
+    finally:
+        roughness_document.close()
+
+    joined_roughness = join_split_dimension_ocr_lines(
+        (
+            LocalOcrLine(
+                "Rzmax 5.",
+                0.95,
+                ((100, 80), (160, 80), (160, 94), (100, 94)),
+            ),
+            LocalOcrLine(
+                "7",
+                0.98,
+                ((162, 80), (170, 80), (170, 94), (162, 94)),
+            ),
+        )
+    )
+    assert any("5.7" in line.text.replace(" ", "") for line in joined_roughness)
+
+    horizontal_image = Image.new("L", (2382, 1684), 255)
+    horizontal_document = fitz.open()
+    horizontal_page = horizontal_document.new_page(width=1191, height=842)
+    horizontal_ocr = LocalOcrPage(
+        2382,
+        1684,
+        2.0,
+        2.0,
+        horizontal_image,
+        (
+            LocalOcrLine(
+                "Φ18G6",
+                0.99,
+                ((120, 200), (168, 200), (168, 214), (120, 214)),
+            ),
+            LocalOcrLine(
+                "(+0.012/+0.001)",
+                0.99,
+                ((170, 200), (248, 200), (248, 214), (170, 214)),
+            ),
+        ),
+    )
+    try:
+        horizontal_markings = _detect_local_dimension_markings(
+            horizontal_page,
+            horizontal_ocr,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        fit18 = next(
+            item
+            for item in horizontal_markings
+            if abs(item.nominal_value - 18.0) < 1e-9
+        )
+        assert fit18.rect[2] >= 240
+    finally:
+        horizontal_document.close()
+
+    split_paren_image = Image.new("L", (2382, 1684), 255)
+    split_paren_document = fitz.open()
+    split_paren_page = split_paren_document.new_page(width=1191, height=842)
+    split_paren_ocr = LocalOcrPage(
+        2382,
+        1684,
+        2.0,
+        2.0,
+        split_paren_image,
+        (
+            LocalOcrLine(
+                "Φ18G6",
+                0.99,
+                ((120, 300), (168, 300), (168, 314), (120, 314)),
+            ),
+            LocalOcrLine(
+                "(",
+                0.99,
+                ((169, 300), (176, 300), (176, 314), (169, 314)),
+            ),
+            LocalOcrLine(
+                "+0.012/+0.001",
+                0.99,
+                ((176, 300), (240, 300), (240, 314), (176, 314)),
+            ),
+            LocalOcrLine(
+                ")",
+                0.99,
+                ((240, 300), (248, 300), (248, 314), (240, 314)),
+            ),
+        ),
+    )
+    try:
+        split_paren_markings = _detect_local_dimension_markings(
+            split_paren_page,
+            split_paren_ocr,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        split18 = next(
+            item
+            for item in split_paren_markings
+            if abs(item.nominal_value - 18.0) < 1e-9
+        )
+        assert split18.rect[2] >= 246
+        assert all(
+            item.source_text.strip() not in {"(", ")"}
+            for item in split_paren_markings
+        )
+    finally:
+        split_paren_document.close()
+
+    combined_image = Image.new("L", (2382, 1684), 255)
+    combined_document = fitz.open()
+    combined_page = combined_document.new_page(width=1191, height=842)
+    combined_ocr = LocalOcrPage(
+        2382,
+        1684,
+        2.0,
+        2.0,
+        combined_image,
+        (
+            LocalOcrLine(
+                "Φ18G6(+0.012/+0.001)",
+                0.99,
+                ((120, 260), (248, 260), (248, 274), (120, 274)),
+            ),
+        ),
+    )
+    try:
+        combined_markings = _detect_local_dimension_markings(
+            combined_page,
+            combined_ocr,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        combined18 = next(
+            item
+            for item in combined_markings
+            if abs(item.nominal_value - 18.0) < 1e-9
+        )
+        assert combined18.rect[2] >= 240
+    finally:
+        combined_document.close()
+
+    def marking(
+        x0: float,
+        x1: float,
+        text: str,
+        nominal_value: float,
+    ) -> _DetectedDimensionMarking:
+        return _DetectedDimensionMarking(
+            rect=(x0, 10, x1, 90),
+            quad=((x0, 10), (x1, 10), (x1, 90), (x0, 90)),
+            direction=(0, 1),
+            source_text=text,
+            nominal_value=nominal_value,
+            kind="diameter",
+            tolerance_range=0.02,
+        )
+
+    assert not _is_fit_deviation_fragment("+0.2")
+    assert not _is_fit_deviation_fragment("+0.1")
+    assert _is_fit_deviation_fragment("+0.018")
+    assert _is_fit_deviation_fragment("-0.007")
+    assert _is_fit_deviation_fragment("0")
+    assert _FIT_TOLERANCE_PATTERN.search("Φ16H7")
+    assert _FIT_TOLERANCE_PATTERN.search("Φ26g6")
+    assert not _FIT_TOLERANCE_PATTERN.search("Φ12.9+0.2")
+    assert not _FIT_TOLERANCE_PATTERN.search("H12.9")
+
+    merged = _merge_detected_markings(
+        [marking(10, 22, "Φ12.9+0.2", 12.9)],
+        [
+            marking(18, 30, "Φ16H7", 16),
+            marking(27, 39, "Φ16.05+0.05", 16.05),
+        ],
+    )
+    assert len(merged) == 3
+
+
+
 def main() -> None:
     _verify_tables()
     _verify_toggle()
@@ -1012,6 +1842,8 @@ def main() -> None:
     _verify_tolerance_resize_shrink()
     _verify_applied_tolerance_removal()
     _verify_dimension_marking_removal()
+    _verify_vertical_tolerance_postprocessing()
+    _verify_scanned_ocr_tolerance_recovery()
     _verify_hidden_ocr_window()
     _verify_native_drawing_detection()
     _verify_scanned_drawing_detection()

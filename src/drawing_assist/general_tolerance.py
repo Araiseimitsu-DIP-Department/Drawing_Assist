@@ -17,6 +17,9 @@ from PIL import Image, ImageOps
 from drawing_assist.image_preprocessor import prepare_raster_for_ocr
 from drawing_assist.ocr_config import (
     BARE_NUMBER_MIN_CONFIDENCE,
+    SCANNED_AGREED_BARE_NUMBER_MIN_CONFIDENCE,
+    SCANNED_BARE_NUMBER_MIN_CONFIDENCE,
+    SCANNED_REVIEW_CONFIDENCE,
     SUPPLEMENT_THRESHOLD_SCANNED,
     SUPPLEMENT_THRESHOLD_VECTOR,
 )
@@ -91,6 +94,7 @@ def _normalize_raster_dimension_text(value: str) -> str:
 
 
 from drawing_assist.local_ocr import (
+    LocalOcrLine,
     LocalOcrPage,
     analyze_detail_angles,
     analyze_scanned_page_tiles,
@@ -809,11 +813,12 @@ def _deep_cr_candidates(
             for _candidate, bounds, angle in group
         }
         representative = group[0][0]
-        # Small C/R labels are the most frequently omitted dimensions in an
-        # image PDF.  Their prefix makes a single read substantially safer
-        # than a bare number, and every result remains reviewable before
-        # applying.  Larger values still require overlapping-tile consensus.
-        minimum_reads = 1 if representative.nominal_value <= 0.5 else 2
+        # Require overlapping-tile consensus for the sensitive deep pass as
+        # well.  A single C/R-shaped OCR hallucination is common around
+        # outlines and hatching; real callouts are normally seen again in an
+        # adjacent crop.  This is intentionally geometry/consensus based and
+        # does not depend on a drawing-specific value or coordinate.
+        minimum_reads = 2
         if len(independent_reads) < minimum_reads:
             continue
         candidates.append(
@@ -828,9 +833,26 @@ def _deep_cr_candidates(
     # The same raster label is often read once with and once without its
     # decimal point (for example 14.7 / 147). Prefer the decimal reading at
     # an overlapping location and keep only one physical label.
+    # The Windows supplemental path has no calibrated confidence score.
+    # Require repeated spatial agreement for all sensitive small callouts,
+    # while retaining larger prefixed dimensions after the normal geometry
+    # checks below.
+    consensus: list[GeneralToleranceCandidate] = []
+    for candidate in candidates:
+        if candidate.kind in {"linear", "angle"} and not re.match(
+            r"^[ﾏ・ｦﾃ倪劇CR]", candidate.source_text
+        ):
+            repeats = sum(
+                _same_candidate(candidate, other)
+                for other in candidates
+            )
+            if repeats < 2:
+                continue
+        consensus.append(candidate)
+
     deduplicated: list[GeneralToleranceCandidate] = []
     for candidate in sorted(
-        candidates,
+        consensus,
         key=lambda item: (
             "." not in item.source_text and "," not in item.source_text,
             fitz.Rect(item.rect).get_area(),
@@ -1006,6 +1028,7 @@ def _tiled_dimension_candidates(
                 nominal=nominal,
                 compact=compact,
                 supplemental=True,
+                bare_min_confidence=SCANNED_BARE_NUMBER_MIN_CONFIDENCE,
             ):
                 continue
             if not prefix and not degree and nominal >= 1000:
@@ -1122,6 +1145,8 @@ def _tiled_dimension_candidates(
                 kind,
                 scale_x=scale_x,
                 scale_y=scale_y,
+                strict=(kind == "linear" and not prefix and not degree),
+                scanned=True,
             ):
                 continue
             candidate = GeneralToleranceCandidate(
@@ -1404,6 +1429,7 @@ def _has_dimension_line_support(
     scale_x: float,
     scale_y: float,
     strict: bool = False,
+    scanned: bool = False,
 ) -> bool:
     dx, dy = direction
     if abs(dx) >= 0.92:
@@ -1530,7 +1556,16 @@ def _has_dimension_line_support(
         # ハッチングの片側線だけで誤検出しないよう、両側に寸法線の痕跡を要求する。
         return min(scores) >= 0.10 and max(scores) >= 0.22
     # スキャン図面では片側の寸法線しか拾えないことが多い。
-    return max(scores) >= 0.17
+    # A faint scan frequently preserves only one side of an extension line.
+    # The surrounding candidate filters still reject title-block noise.
+    # Bare integer dimensions are the most common source of false positives
+    # in notes, revision blocks, and zone labels.  Keep their line evidence
+    # threshold conservative; the scanned relaxation is for prefixed,
+    # decimal, and angular callouts where the token itself is informative.
+    line_threshold = 0.17
+    if scanned and kind != "linear":
+        line_threshold = 0.12
+    return max(scores) >= line_threshold
 
 
 def _is_feature_control_frame(
@@ -2047,12 +2082,22 @@ def _reject_unreliable_dimension(
     compact: str,
     score: float = 1.0,
     supplemental: bool = False,
+    bare_min_confidence: float = BARE_NUMBER_MIN_CONFIDENCE,
+    agreement_count: int = 1,
 ) -> bool:
     """明らかな誤検出を除外する共通判定。"""
 
     if is_tolerance_fragment(compact):
         return True
-    if not prefix and not degree and score < BARE_NUMBER_MIN_CONFIDENCE:
+    if (
+        not prefix
+        and not degree
+        and score < (
+            SCANNED_AGREED_BARE_NUMBER_MIN_CONFIDENCE
+            if agreement_count >= 2
+            else bare_min_confidence
+        )
+    ):
         return True
     if not prefix and not degree and nominal >= 500:
         return True
@@ -2065,8 +2110,6 @@ def _reject_unreliable_dimension(
     if supplemental and kind == "diameter" and nominal > 100:
         return True
     if kind == "diameter" and nominal > 80:
-        return True
-    if supplemental and not prefix and not degree and nominal < 15 and "." not in compact:
         return True
     if kind == "diameter" and nominal < 1.0:
         return True
@@ -2084,6 +2127,34 @@ def _reject_unreliable_dimension(
     return False
 
 
+def _scanned_candidate_quality(
+    *,
+    score: float,
+    agreement_count: int,
+    has_line_support: bool,
+    compact: str,
+    prefix: str,
+    degree: str,
+) -> float:
+    """Combine weak but independent scanned-page evidence.
+
+    RapidOCR confidence alone is not calibrated for faint engineering scans.
+    Agreement and geometry are therefore treated as supporting evidence, not
+    as replacements for the OCR score.
+    """
+
+    quality = float(score)
+    if agreement_count >= 2:
+        quality += 0.12
+    if has_line_support:
+        quality += 0.10
+    if "." in compact or "," in compact:
+        quality += 0.05
+    if prefix or degree:
+        quality += 0.05
+    return min(1.0, quality)
+
+
 def _local_ocr_general_candidates(
     page: fitz.Page,
     page_index: int,
@@ -2094,6 +2165,7 @@ def _local_ocr_general_candidates(
     ocr_page: LocalOcrPage,
     scanned_page: bool = False,
     strict_line_support: bool = False,
+    detail_callouts: tuple[LocalOcrLine, ...] | None = None,
 ) -> list[GeneralToleranceCandidate]:
     """Build reviewable general-tolerance candidates from shared ONNX OCR."""
 
@@ -2107,9 +2179,35 @@ def _local_ocr_general_candidates(
     )
     ocr_tolerance_rects = _explicit_tolerance_rects_from_ocr_page(ocr_page)
     candidates: list[GeneralToleranceCandidate] = []
-    detail_angles = analyze_detail_angles(page, ocr_page)
-    for line in (*ocr_page.lines, *detail_angles):
-        is_detail_angle = line in detail_angles
+    if detail_callouts is None:
+        detail_callouts = analyze_detail_angles(page, ocr_page)
+    richer_ocr_evidence: list[tuple[fitz.Rect, str]] = []
+    for evidence_line in (*ocr_page.lines, *detail_callouts):
+        evidence_text = unicodedata.normalize("NFKC", evidence_line.text)
+        evidence_parsed = parse_dimension_token(evidence_text)
+        if (
+            _EXPLICIT_TOLERANCE.search(evidence_text)
+            or re.search(
+                r"[CR]\s*[O0]?\d*[.,]\d+|(?:以下|MAX|MIN)",
+                evidence_text,
+                re.IGNORECASE,
+            )
+            or (
+                evidence_parsed is not None
+                and (
+                    evidence_parsed.prefix
+                    or evidence_parsed.degree
+                    or evidence_parsed.reference
+                    or "." in evidence_parsed.normalized_text
+                    or "," in evidence_parsed.normalized_text
+                )
+            )
+        ):
+            evidence_rect = fitz.Rect(evidence_line.rect)
+            if not evidence_rect.is_empty:
+                richer_ocr_evidence.append((evidence_rect, evidence_text))
+    for line in (*ocr_page.lines, *detail_callouts):
+        is_detail_supplement = line in detail_callouts
         line_text = unicodedata.normalize("NFKC", line.text)
         if is_tolerance_fragment(line_text):
             continue
@@ -2123,6 +2221,7 @@ def _local_ocr_general_candidates(
             ):
                 continue
             continue
+        is_detail_angle = is_detail_supplement and bool(parsed.degree)
         if parsed.reference and not is_detail_angle:
             continue
         if re.search(r"[（(]", line_text) or re.search(r"[）)]", line_text):
@@ -2136,6 +2235,20 @@ def _local_ocr_general_candidates(
         kind = _candidate_kind(prefix, degree)
         if kind is None:
             continue
+        if is_detail_supplement and kind == "diameter":
+            # Tight detail crops frequently separate an already-toleranced
+            # vertical diameter from its tolerance stack. The normal page and
+            # tiled OCR paths retain responsibility for diameter dimensions.
+            continue
+        if (
+            is_detail_supplement
+            and kind in {"chamfer", "radius"}
+            and "." not in compact
+            and "," not in compact
+        ):
+            # Integer C/R reads from rotated detail crops are commonly partial
+            # reads of R0.x/C0.x callouts. Decimal C/R labels remain eligible.
+            continue
         if nominal <= 0 or nominal > 4000:
             continue
         if kind == "diameter" and nominal < 1.0:
@@ -2148,6 +2261,10 @@ def _local_ocr_general_candidates(
             nominal=nominal,
             compact=compact,
             score=line.score,
+            bare_min_confidence=(
+                SCANNED_BARE_NUMBER_MIN_CONFIDENCE if scanned_page else BARE_NUMBER_MIN_CONFIDENCE
+            ),
+            agreement_count=line.agreement_count,
         ):
             continue
         if not prefix and not degree and nominal >= 500:
@@ -2157,6 +2274,75 @@ def _local_ocr_general_candidates(
             continue
         rect = fitz.Rect(line.rect) & page.rect
         direction = line.direction
+        if any(
+            (
+                _EXPLICIT_TOLERANCE.search(evidence_text)
+                or re.search(
+                    r"(?:\u4ee5\u4e0b|\u4ee5\u4e0a|\u4ee5\u5185|MAX|MIN)",
+                    evidence_text,
+                    re.IGNORECASE,
+                )
+            )
+            and (
+                (rect & evidence_rect).get_area()
+                / max(1e-9, min(rect.get_area(), evidence_rect.get_area()))
+                >= 0.18
+            )
+            for evidence_rect, evidence_text in richer_ocr_evidence
+            if evidence_rect != rect or evidence_text != line_text
+        ):
+            # A tile/rotation pass can read only the nominal part of a larger
+            # explicitly-toleranced or limit label (for example Φ20 from
+            # Φ20.5±0.1, or R0.2 from R0.2以下). The richer overlapping read
+            # proves that this is not a general-tolerance candidate.
+            continue
+        if not prefix and not degree and "." not in compact and "," not in compact:
+            center = ((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2)
+            digit_text = str(int(nominal)) if nominal.is_integer() else compact
+            if any(
+                digit_text in normalize_raster_dimension_text(evidence_text)
+                and (
+                    (rect & evidence_rect).get_area()
+                    / max(1e-9, min(rect.get_area(), evidence_rect.get_area()))
+                    >= 0.18
+                    or math.dist(
+                        center,
+                        (
+                            (evidence_rect.x0 + evidence_rect.x1) / 2,
+                            (evidence_rect.y0 + evidence_rect.y1) / 2,
+                        ),
+                    )
+                    <= max(5.0, min(14.0, max(rect.width, rect.height) * 1.5))
+                )
+                for evidence_rect, evidence_text in richer_ocr_evidence
+            ):
+                continue
+            stacked_fragments = 0
+            for fragment_line in ocr_page.lines:
+                if fragment_line is line:
+                    continue
+                fragment_text = unicodedata.normalize(
+                    "NFKC", fragment_line.text
+                ).strip()
+                if not re.fullmatch(r"[0-9.+\-一十]{1,3}", fragment_text):
+                    continue
+                fragment_rect = fitz.Rect(fragment_line.rect)
+                fragment_center = (
+                    (fragment_rect.x0 + fragment_rect.x1) / 2,
+                    (fragment_rect.y0 + fragment_rect.y1) / 2,
+                )
+                if (
+                    abs(fragment_center[0] - center[0])
+                    <= max(4.0, rect.width * 1.2)
+                    and abs(fragment_center[1] - center[1])
+                    <= max(18.0, rect.height * 3.0)
+                ):
+                    stacked_fragments += 1
+            if stacked_fragments >= 2:
+                # Vertical fits and stacked tolerances are often split into
+                # individual digits/signs by OCR. A lone nominal dimension
+                # does not normally have this dense aligned fragment stack.
+                continue
         if _overlaps_reference_evidence(rect, reference_rects):
             # 参照寸法近傍の抑制は素の数値向け。φ/C/R は隣接でも残す。
             if not prefix and not degree:
@@ -2168,8 +2354,26 @@ def _local_ocr_general_candidates(
             kind,
             scale_x=ocr_page.scale_x,
             scale_y=ocr_page.scale_y,
-            strict=strict_line_support,
+            strict=(
+                strict_line_support
+                or (scanned_page and kind == "linear" and not prefix and not degree)
+            ),
+            scanned=scanned_page,
         )
+        if (
+            scanned_page
+            and kind == "linear"
+            and not prefix
+            and not degree
+            and "." not in compact
+            and "," not in compact
+            and line.agreement_count < 2
+            and line.score < 0.92
+        ):
+            # A single medium-confidence integer read is usually a note,
+            # zone number, or revision digit.  A real detail dimension is
+            # normally observed again by the rotated/tiled OCR pass.
+            continue
         # 接頭辞付き寸法は下端付近にも実寸法があるため除外を緩める
         bottom_limit = 0.93 if prefix else 0.86
         if (
@@ -2298,12 +2502,6 @@ def _local_ocr_general_candidates(
         if scanned_page and kind == "linear" and not prefix and not degree:
             if line.score < 0.78:
                 continue
-            if (
-                "." not in compact
-                and "," not in compact
-                and nominal < 8.0
-            ):
-                continue
         if (
             scanned_page
             and kind == "diameter"
@@ -2342,7 +2540,21 @@ def _local_ocr_general_candidates(
             kind=kind,
             tolerance=tolerance or 0.0,
             tolerance_text=tolerance_text,
-            selected=not manual_required,
+            selected=(
+                not manual_required
+                and not (
+                    scanned_page
+                    and _scanned_candidate_quality(
+                        score=line.score,
+                        agreement_count=line.agreement_count,
+                        has_line_support=has_line_support,
+                        compact=compact,
+                        prefix=prefix,
+                        degree=degree,
+                    )
+                    < SCANNED_REVIEW_CONFIDENCE
+                )
+            ),
             quad=line.quad,
             manual_required=manual_required,
         )
@@ -2673,6 +2885,10 @@ def detect_general_tolerance_candidates(
         scanned_page = image_only_page or _is_full_page_image(page)
         ocr_page_for_detect = local_ocr_page
         tile_lines_used = False
+        # High-resolution, rotated detail crops are intentionally expensive.
+        # Their geometry is independent of the later page/tile OCR merge, so
+        # compute them once and reuse the result for both candidate passes.
+        detail_callouts = analyze_detail_angles(page, local_ocr_page)
         page_only_candidates = _local_ocr_general_candidates(
             page,
             page_index,
@@ -2682,13 +2898,41 @@ def detect_general_tolerance_candidates(
             ocr_page=local_ocr_page,
             scanned_page=scanned_page,
             strict_line_support=False,
+            detail_callouts=detail_callouts,
+        )
+        trusted_detail_candidates = sum(
+            1
+            for candidate in page_only_candidates
+            if any(
+                (
+                    fitz.Rect(candidate.rect) & fitz.Rect(callout.rect)
+                ).get_area()
+                / max(
+                    1e-9,
+                    min(
+                        fitz.Rect(candidate.rect).get_area(),
+                        fitz.Rect(callout.rect).get_area(),
+                    ),
+                )
+                >= 0.45
+                and callout.score >= 0.90
+                for callout in detail_callouts
+            )
+        )
+        # A page-wide OCR pass plus several high-confidence detail-view reads
+        # already covers both ordinary and difficult callouts. Avoid repeating
+        # the entire page through tiled and Windows OCR in that case. Drawings
+        # without this evidence continue through the supplemental pipeline.
+        detail_evidence_complete = (
+            len(page_only_candidates) >= 4
+            and trusted_detail_candidates >= 3
         )
         supplement_threshold = (
             SUPPLEMENT_THRESHOLD_SCANNED
             if scanned_page
             else SUPPLEMENT_THRESHOLD_VECTOR
         )
-        if scanned_page and (
+        if scanned_page and not detail_evidence_complete and (
             _is_full_page_image(page)
             or len(page_only_candidates) < supplement_threshold
         ):
@@ -2723,7 +2967,26 @@ def detect_general_tolerance_candidates(
                 ocr_page=ocr_page_for_detect,
                 scanned_page=scanned_page,
                 strict_line_support=False,
+                detail_callouts=detail_callouts,
             )
+            tiled_candidates = [
+                candidate
+                for candidate in tiled_candidates
+                if not any(
+                    (
+                        fitz.Rect(candidate.rect) & fitz.Rect(existing.rect)
+                    ).get_area()
+                    / max(
+                        1e-9,
+                        min(
+                            fitz.Rect(candidate.rect).get_area(),
+                            fitz.Rect(existing.rect).get_area(),
+                        ),
+                    )
+                    >= 0.2
+                    for existing in page_only_candidates
+                )
+            ]
             local_candidates = _merge_general_tolerance_candidates(
                 page_only_candidates,
                 tiled_candidates,
@@ -2738,6 +3001,7 @@ def detect_general_tolerance_candidates(
         run_windows_supplement = (
             ocr_script.is_file()
             and scanned_page
+            and not detail_evidence_complete
             and (
                 tile_lines_used
                 or _is_full_page_image(page)

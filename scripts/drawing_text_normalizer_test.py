@@ -23,6 +23,10 @@ def main() -> None:
     assert normalize_drawing_text("Ω13.7±0.02") == "Φ13.7±0.02"
     assert normalize_drawing_text(".013.7±0.02") == "13.7±0.02"
     assert normalize_drawing_text("R0.2±01") == "R0.2±0.1"
+    assert normalize_drawing_text("2.8+01") == "2.8+0.1"
+    assert normalize_drawing_text("φ16H7+0018") == "Φ16H7+0.018"
+    assert normalize_drawing_text("16H7+0.018") == "16H7+0.018"
+    assert normalize_drawing_text("5.7+0.05") == "5.7+0.05"
     assert normalize_drawing_text("0)12士0.05") == "Φ12±0.05"
     assert normalize_drawing_text("$7.9±0.05") == "7.9±0.05"
 

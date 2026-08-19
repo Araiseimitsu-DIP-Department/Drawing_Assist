@@ -179,6 +179,7 @@ class DimensionMarkingEntry:
     color: str
     opacity: float = 0.42
     quad: tuple[tuple[float, float], ...] | None = None
+    kind: str = ""
 
 
 @dataclass
@@ -190,6 +191,7 @@ class DimensionMarkingCandidate:
     color: str
     opacity: float = 0.42
     quad: tuple[tuple[float, float], ...] | None = None
+    kind: str = ""
     selected: bool = True
 
 

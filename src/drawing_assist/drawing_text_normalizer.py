@@ -73,8 +73,10 @@ def normalize_drawing_text(value: str) -> str:
         .replace("亇", "±")
         .replace("干", "±")
     )
-    # R0.2±01 → R0.2±0.1（小数点欠落の典型パターン）
-    text = re.sub(r"(±)0([1-9])(?!\d)", r"\g<1>0.\2", text)
+    # 片側・両側公差で小数点が落ちた先頭0を復元する。
+    # 例: R0.2±01 → R0.2±0.1、2.8+01 → 2.8+0.1、φ16H7+0018 → φ16H7+0.018
+    # すでに小数点がある +0.05 や、+10 のような先頭0なしは変更しない。
+    text = re.sub(r"([±+\-])0(\d{1,3})(?![\d.])", r"\g<1>0.\2", text)
     text = re.sub(r"(?<=\d),(?=\d)", ".", text)
     text = re.sub(r"(?<=\d),[OＯ](?=\d)", ".0", text, flags=re.IGNORECASE)
     text = re.sub(r"(?<=\d)[、。・·](?=\d)", ".", text)

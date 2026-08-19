@@ -28,10 +28,14 @@ import webview
 from drawing_assist.local_ocr import (
     LocalOcrLine,
     LocalOcrPage,
+    analyze_detail_angles,
+    analyze_incomplete_dimension_regions,
     analyze_page,
     analyze_scanned_page_tiles,
+    analyze_vertical_dimension_regions,
     build_tile_ocr_page,
     enrich_scanned_ocr_page,
+    join_split_dimension_ocr_lines,
     local_ocr_available,
 )
 from drawing_assist.drawing_text_normalizer import is_tolerance_fragment
@@ -148,6 +152,11 @@ _SURFACE_ROUGHNESS_PATTERN = re.compile(
     r"(?:Rz\s*max|Rzmax|Ra\s*max|Ramax|Rmax|Rz|Ra)\s*",
     re.IGNORECASE,
 )
+_ROUGHNESS_VALUE_PATTERN = re.compile(
+    r"(?:Rz\s*max|Rzmax|Ra\s*max|Ramax|Rmax|Rz|Ra)\s*"
+    r"(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
 
 _ROUGHNESS_OCR_PATTERN = re.compile(
     # Ra/Rz の典型値だけを対象にする（5.7+0.05 のような片側公差寸法は除外しない）
@@ -155,8 +164,362 @@ _ROUGHNESS_OCR_PATTERN = re.compile(
 )
 
 _FIT_TOLERANCE_PATTERN = re.compile(
-    r"H\d|G\d|[gG]\d",
+    # 公称の直後のはめあい（16H7 / 26g6 / 18g 6）。H12.9 のような誤読は対象外。
+    r"\d(?:\.\d+)?[ \t]*[A-Za-z][ \t]?[0-9]{1,2}(?![0-9.])",
 )
+# はめあいの括弧内偏差。1件でも、上下に積んだ2件でも、結合された1行でも対象にする。
+_FIT_DEVIATION_LINE = re.compile(
+    r"^[()（）]*"
+    r"(?:[+\-−－]\s*0?(?:[.,]\d+)?|0|0[.,]\d+)"
+    r"(?:[()（）/\s]*[+\-−－]\s*0?(?:[.,]\d+)?)*"
+    r"[()（）]*$"
+)
+_FIT_DEVIATION_MAX_VALUE = 0.099
+
+
+def _is_fit_deviation_fragment(text: str) -> bool:
+    """はめあい寸法に付く括弧内公差のOCR断片かどうか。"""
+
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    if not compact or not any(character.isdigit() for character in compact):
+        return False
+    if _FIT_DEVIATION_LINE.fullmatch(compact) is None:
+        return False
+    values = [
+        float(value.replace(",", "."))
+        for value in re.findall(r"\d+(?:[.,]\d+)?", compact)
+    ]
+    # +0.2 / +0.1 は片側公差であり、g6/H7 の括弧内偏差ではない
+    if any(value >= _FIT_DEVIATION_MAX_VALUE for value in values):
+        return False
+    return True
+
+
+def _is_fit_paren_glyph(text: str) -> bool:
+    """はめあい公差の括弧だけを読んだOCR行かどうか。"""
+
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    return bool(re.fullmatch(r"[()（）]+", compact))
+
+
+def _is_fit_cluster_line(text: str) -> bool:
+    """はめあい本体に付ける括弧・偏差のOCR行かどうか。"""
+
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    return (
+        _is_fit_deviation_fragment(compact)
+        or _is_fit_paren_glyph(compact)
+        # 縦書きの括弧内偏差は、先頭のマイナス記号を落として
+        # ``(2)`` のように読まれることがある。括弧を伴う短い断片だけ
+        # を本体候補へ渡し、空白領域を推定して塗ることはしない。
+        or bool(re.fullmatch(r"[()（）][0-9.,+\-()（）]{0,8}", compact))
+    )
+
+
+def _ocr_lines_near(
+    left: LocalOcrLine,
+    right: LocalOcrLine,
+    *,
+    gap: float = 16.0,
+) -> bool:
+    """2つのOCR枠が近接しているか。"""
+
+    left_rect = fitz.Rect(left.rect)
+    right_rect = fitz.Rect(right.rect)
+    grown = fitz.Rect(
+        left_rect.x0 - gap,
+        left_rect.y0 - gap,
+        left_rect.x1 + gap,
+        left_rect.y1 + gap,
+    )
+    return not (grown & right_rect).is_empty
+
+
+def _is_dimension_owner_line(text: str) -> bool:
+    """括弧内公差の帰属先になる、完成した寸法行かどうか。"""
+
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    if not compact or _is_fit_deviation_fragment(compact):
+        return False
+    if _FIT_TOLERANCE_PATTERN.search(compact):
+        return True
+    if re.match(r"^[φΦØ⌀]\d", compact):
+        return True
+    return bool(
+        re.match(r"^\d", compact) and re.search(r"[±+\-]", compact)
+    )
+
+
+def _fit_line_is_columnar(line: LocalOcrLine) -> bool:
+    """縦寸法列かどうか。OCR方向が横でも、枠が縦長なら列として扱う。"""
+
+    rect = fitz.Rect(line.rect)
+    width = max(rect.width, 0.1)
+    height = max(rect.height, 0.1)
+    return abs(line.direction[1]) >= 0.72 or height / width >= 1.6
+
+
+def _fit_line_axis(line: LocalOcrLine) -> tuple[float, float]:
+    """はめあい本体の読み方向。縦長枠は列方向を優先する。"""
+
+    if _fit_line_is_columnar(line):
+        return (0.0, 1.0)
+    axis_x, axis_y = line.direction
+    length = math.hypot(axis_x, axis_y) or 1.0
+    return (axis_x / length, axis_y / length)
+
+
+def _stable_marking_quad(
+    points: list[fitz.Point],
+    direction: tuple[float, float],
+    rect: fitz.Rect,
+) -> tuple[tuple[float, float], ...]:
+    """検出当時の安定した塗り（文字方向に少し伸ばし、直交方向はほぼOCR枠のまま）。"""
+
+    thickness = min(rect.width, rect.height)
+    return _marking_quad_from_points(
+        points,
+        direction,
+        along_expand=max(2.0, min(4.0, thickness * 0.35)),
+        across_inset=max(0.08, thickness * 0.04),
+    )
+
+
+def _axis_bounds(
+    points: list[fitz.Point],
+    direction: tuple[float, float],
+) -> tuple[float, float, float, float, fitz.Point, fitz.Point]:
+    """点群の読み方向・直交方向の範囲を返す。"""
+
+    axis = fitz.Point(direction)
+    length = math.hypot(axis.x, axis.y) or 1.0
+    axis /= length
+    normal = fitz.Point(-axis.y, axis.x)
+    along = [point.x * axis.x + point.y * axis.y for point in points]
+    across = [point.x * normal.x + point.y * normal.y for point in points]
+    return min(along), max(along), min(across), max(across), axis, normal
+
+
+def _quad_from_axis_bounds(
+    along0: float,
+    along1: float,
+    across0: float,
+    across1: float,
+    axis: fitz.Point,
+    normal: fitz.Point,
+) -> tuple[tuple[float, float], ...]:
+    """読み方向の帯を、直交方向の幅を固定して作る。"""
+
+    def point(along_value: float, across_value: float) -> tuple[float, float]:
+        value = axis * along_value + normal * across_value
+        return (float(value.x), float(value.y))
+
+    return (
+        point(along0, across0),
+        point(along1, across0),
+        point(along1, across1),
+        point(along0, across1),
+    )
+
+
+def _extend_along_keep_across(
+    base_points: list[fitz.Point],
+    extra_points: list[fitz.Point],
+    direction: tuple[float, float],
+    *,
+    along_expand: float = 0.8,
+) -> tuple[tuple[float, float], ...]:
+    """本体の塗り幅はそのまま、文字方向にだけ延長する。"""
+
+    along0, along1, across0, across1, axis, normal = _axis_bounds(
+        base_points, direction
+    )
+    extra_along = [
+        point.x * axis.x + point.y * axis.y for point in extra_points
+    ]
+    if extra_along:
+        along0 = min(along0, min(extra_along))
+        along1 = max(along1, max(extra_along))
+    return _quad_from_axis_bounds(
+        along0 - along_expand,
+        along1 + along_expand,
+        across0,
+        across1,
+        axis,
+        normal,
+    )
+
+
+def _quad_same_thickness(
+    points: list[fitz.Point],
+    direction: tuple[float, float],
+    thickness: float,
+    *,
+    along_expand: float = 0.6,
+) -> tuple[tuple[float, float], ...]:
+    """指定した塗り幅で、点群を覆う一本の帯を作る。"""
+
+    along0, along1, across0, across1, axis, normal = _axis_bounds(
+        points, direction
+    )
+    center = (across0 + across1) / 2
+    half = max(thickness, 2.8) / 2
+    return _quad_from_axis_bounds(
+        along0 - along_expand,
+        along1 + along_expand,
+        center - half,
+        center + half,
+        axis,
+        normal,
+    )
+
+
+def _fit_owns_parenthetical(
+    fit_line: LocalOcrLine,
+    nearby_line: LocalOcrLine,
+    owner_lines: tuple[LocalOcrLine, ...],
+) -> str | None:
+    """括弧内公差の帰属。読み方向の直後なら after、横並びなら beside。"""
+
+    def offsets(owner: LocalOcrLine) -> tuple[float, float, float] | None:
+        axis_x, axis_y = _fit_line_axis(owner)
+        normal_x, normal_y = -axis_y, axis_x
+        owner_along = [
+            point[0] * axis_x + point[1] * axis_y for point in owner.quad
+        ]
+        nearby_along = [
+            point[0] * axis_x + point[1] * axis_y for point in nearby_line.quad
+        ]
+        owner_across = [
+            point[0] * normal_x + point[1] * normal_y for point in owner.quad
+        ]
+        nearby_across = [
+            point[0] * normal_x + point[1] * normal_y for point in nearby_line.quad
+        ]
+        owner_along0, owner_along1 = min(owner_along), max(owner_along)
+        nearby_along0, nearby_along1 = min(nearby_along), max(nearby_along)
+        along_overlap = min(owner_along1, nearby_along1) - max(
+            owner_along0, nearby_along0
+        )
+        after_gap = nearby_along0 - owner_along1
+        across_dist = abs(
+            (sum(nearby_across) / len(nearby_across))
+            - (sum(owner_across) / len(owner_across))
+        )
+        thickness = max(max(owner_across) - min(owner_across), 1.0)
+        after_ok = -6.0 <= after_gap <= 56.0 and across_dist <= max(
+            12.0, thickness * 1.5
+        )
+        before_gap = owner_along0 - nearby_along1
+        before_ok = -6.0 <= before_gap <= 56.0 and across_dist <= max(
+            12.0, thickness * 1.5
+        )
+        beside_ok = along_overlap > 0 and 1.5 <= across_dist <= 30.0
+        if _fit_line_is_columnar(owner):
+            owner_rect = fitz.Rect(owner.rect)
+            nearby_rect = fitz.Rect(nearby_line.rect)
+            gap_x = nearby_rect.x0 - owner_rect.x1
+            beside_ok = along_overlap > 0 and -4.0 <= gap_x <= 30.0
+            if beside_ok:
+                across_dist = max(gap_x, 0.0)
+        if not after_ok and not before_ok and not beside_ok:
+            return None
+        rank = 0 if after_ok or before_ok else 1
+        if after_ok:
+            key = after_gap
+        elif before_ok:
+            key = before_gap
+        else:
+            key = across_dist
+        return (rank, key, across_dist)
+
+    ranked: list[tuple[float, float, float, LocalOcrLine]] = []
+    for other in owner_lines:
+        measured = offsets(other)
+        if measured is None:
+            continue
+        rank, key, across_dist = measured
+        ranked.append((rank, key, across_dist, other))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    if ranked[0][3] is not fit_line:
+        return None
+    return "after" if ranked[0][0] == 0 else "beside"
+
+
+def _iso_fit_tolerance_width(nominal: float, grade: int) -> float | None:
+    """Approximate an ISO 286 IT-zone width in millimetres.
+
+    The letter controls the position of the zone, while the IT grade controls
+    its total width.  Colour classification only needs the latter.
+    """
+
+    factors = {
+        1: 0.8,
+        2: 1.2,
+        3: 2.0,
+        4: 3.0,
+        5: 7.0,
+        6: 10.0,
+        7: 16.0,
+        8: 25.0,
+        9: 40.0,
+        10: 64.0,
+        11: 100.0,
+        12: 160.0,
+        13: 250.0,
+        14: 400.0,
+        15: 640.0,
+        16: 1000.0,
+        17: 1600.0,
+        18: 2500.0,
+    }
+    factor = factors.get(grade)
+    if factor is None or nominal <= 0:
+        return None
+    tolerance_unit_micrometres = 0.45 * nominal ** (1.0 / 3.0) + 0.001 * nominal
+    return factor * tolerance_unit_micrometres / 1000.0
+
+
+def _is_dense_table_region(
+    image: Image.Image,
+    rect: fitz.Rect,
+    *,
+    scale_x: float,
+    scale_y: float,
+) -> bool:
+    """Detect a dense grid around a token without relying on page position."""
+
+    pad_x = max(28.0, rect.width * 2.2)
+    pad_y = max(24.0, rect.height * 3.5)
+    x0 = max(0, int((rect.x0 - pad_x) * scale_x))
+    y0 = max(0, int((rect.y0 - pad_y) * scale_y))
+    x1 = min(image.width, int((rect.x1 + pad_x) * scale_x))
+    y1 = min(image.height, int((rect.y1 + pad_y) * scale_y))
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return False
+    crop = image.crop((x0, y0, x1, y1)).convert("L")
+    if max(crop.size) > 420:
+        factor = 420.0 / max(crop.size)
+        crop = crop.resize(
+            (max(1, round(crop.width * factor)), max(1, round(crop.height * factor))),
+            Image.Resampling.BILINEAR,
+        )
+    pixels = crop.load()
+    row_hits = [
+        sum(pixels[x, y] < 135 for x in range(crop.width)) / crop.width >= 0.42
+        for y in range(crop.height)
+    ]
+    column_hits = [
+        sum(pixels[x, y] < 135 for y in range(crop.height)) / crop.height >= 0.42
+        for x in range(crop.width)
+    ]
+
+    def clusters(flags: list[bool]) -> int:
+        return sum(flag and (index == 0 or not flags[index - 1]) for index, flag in enumerate(flags))
+
+    return clusters(row_hits) >= 4 and clusters(column_hits) >= 3
 
 
 def _marking_quad_from_points(
@@ -192,6 +555,45 @@ def _marking_quad_from_points(
     )
 
 
+def _slice_ocr_line_quad(
+    line: LocalOcrLine,
+    start_ratio: float,
+    end_ratio: float,
+    *,
+    along_inset: float = 0.0,
+) -> tuple[tuple[float, float], ...]:
+    """1行OCRを文字位置の比率で分割し、複数の表面粗さを分けて塗る。"""
+
+    points = [fitz.Point(point) for point in line.quad]
+    axis = fitz.Point(line.direction)
+    length = math.hypot(axis.x, axis.y) or 1.0
+    axis /= length
+    normal = fitz.Point(-axis.y, axis.x)
+    along = [point.x * axis.x + point.y * axis.y for point in points]
+    across = [point.x * normal.x + point.y * normal.y for point in points]
+    along0, along1 = min(along), max(along)
+    span = max(along1 - along0, 1.0)
+    start = along0 + span * max(0.0, min(1.0, start_ratio))
+    end = along0 + span * max(0.0, min(1.0, end_ratio))
+    inset = min(max(along_inset, 0.0), span * 0.30)
+    start += inset
+    end -= inset
+    if end <= start:
+        end = start + span * 0.12
+    across0, across1 = min(across), max(across)
+
+    def point(along_value: float, across_value: float) -> tuple[float, float]:
+        value = axis * along_value + normal * across_value
+        return (float(value.x), float(value.y))
+
+    return (
+        point(start, across0),
+        point(end, across0),
+        point(end, across1),
+        point(start, across1),
+    )
+
+
 def _marking_quad_bounds(
     quad: tuple[tuple[float, float], ...],
 ) -> tuple[float, float, float, float]:
@@ -201,6 +603,1023 @@ def _marking_quad_bounds(
         max(point[0] for point in quad),
         max(point[1] for point in quad),
     )
+
+
+def _quad_from_axis_rect(
+    rect: fitz.Rect,
+    direction: tuple[float, float],
+) -> tuple[tuple[float, float], ...]:
+    """軸平行矩形から塗り用の四角形を作る。"""
+
+    return _marking_quad_from_points(
+        [
+            rect.top_left,
+            rect.top_right,
+            rect.bottom_right,
+            rect.bottom_left,
+        ],
+        direction,
+        along_expand=0.0,
+        across_inset=0.0,
+    )
+
+
+_ROUGHNESS_SEPARATORS = "・･·•∙,，、()（）[]【】 "
+
+
+def _roughness_match_span(text: str, match: re.Match[str]) -> tuple[int, int]:
+    """粗さ1件の塗る範囲。中点・括弧は含めない。"""
+
+    start_index = match.start()
+    end_index = match.end()
+    if start_index > 0 and text[start_index - 1] in "▽∇√✓△▲":
+        start_index -= 1
+    while start_index < end_index and text[start_index] in _ROUGHNESS_SEPARATORS:
+        start_index += 1
+    while end_index > start_index and text[end_index - 1] in _ROUGHNESS_SEPARATORS:
+        end_index -= 1
+    # 「5. 7」のように小数点が途中で切れたOCRを、同じ粗さとして塗る
+    matched = text[start_index:end_index]
+    if re.search(r"[.,]\s*$", matched):
+        trail = re.match(r"\s*\d\b", text[end_index:])
+        rest = text[end_index + (trail.end() if trail else 0) :]
+        if trail and not _SURFACE_ROUGHNESS_PATTERN.match(rest.lstrip()):
+            end_index += trail.end()
+    else:
+        trail_decimal = re.match(r"[.,]\s*\d\b", text[end_index:])
+        if trail_decimal:
+            rest = text[end_index + trail_decimal.end() :]
+            if not _SURFACE_ROUGHNESS_PATTERN.match(rest.lstrip()):
+                end_index += trail_decimal.end()
+    return start_index, end_index
+
+
+def _roughness_fragments_join(
+    left: _DetectedDimensionMarking,
+    right: _DetectedDimensionMarking,
+) -> bool:
+    """同一粗さのOCR断片だけを1本にまとめる。"""
+
+    if left.kind != "roughness" or right.kind != "roughness":
+        return False
+    if abs(left.nominal_value - right.nominal_value) > 1e-6:
+        return False
+    first = fitz.Rect(left.rect)
+    second = fitz.Rect(right.rect)
+    if (first & second).get_area() > 0.2:
+        return True
+    y_overlap = min(first.y1, second.y1) - max(first.y0, second.y0)
+    x_overlap = min(first.x1, second.x1) - max(first.x0, second.x0)
+    if y_overlap > min(first.height, second.height) * 0.35:
+        gap = max(0.0, max(first.x0, second.x0) - min(first.x1, second.x1))
+        return gap <= 8.0
+    if x_overlap > min(first.width, second.width) * 0.35:
+        gap = max(0.0, max(first.y0, second.y0) - min(first.y1, second.y1))
+        return gap <= 8.0
+    return False
+
+
+def _merge_fragmented_roughness(
+    items: list[_DetectedDimensionMarking],
+) -> list[_DetectedDimensionMarking]:
+    """Rzmax の途中切れなど、同一値の隣接断片を1本の帯にする。"""
+
+    result: list[_DetectedDimensionMarking] = []
+    used = [False] * len(items)
+    for index, item in enumerate(items):
+        if used[index]:
+            continue
+        if item.kind != "roughness":
+            result.append(item)
+            continue
+        group = [item]
+        used[index] = True
+        changed = True
+        while changed:
+            changed = False
+            for other_index, other in enumerate(items):
+                if used[other_index] or other.kind != "roughness":
+                    continue
+                if any(
+                    _roughness_fragments_join(member, other) for member in group
+                ):
+                    group.append(other)
+                    used[other_index] = True
+                    changed = True
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        base = max(
+            group,
+            key=lambda member: (member.rect[2] - member.rect[0])
+            * (member.rect[3] - member.rect[1]),
+        )
+        extra_points = [
+            fitz.Point(point)
+            for member in group
+            for point in member.quad
+        ]
+        tolerance_points = [
+            fitz.Point(point)
+            for member in group
+            if member.tolerance_quad is not None
+            for point in member.tolerance_quad
+        ]
+        quad = _extend_along_keep_across(
+            [fitz.Point(point) for point in base.quad],
+            extra_points,
+            base.direction,
+            along_expand=0.6,
+        )
+        result.append(
+            replace(
+                base,
+                rect=_marking_quad_bounds(quad),
+                quad=quad,
+            )
+        )
+    return result
+
+
+def _separate_overlapping_roughness(
+    items: list[_DetectedDimensionMarking],
+) -> list[_DetectedDimensionMarking]:
+    """粗さの重なりは読み方向だけ切り、塗り幅は変えない。"""
+
+    result = list(items)
+    indexes = [
+        index for index, item in enumerate(result) if item.kind == "roughness"
+    ]
+    for _ in range(4):
+        moved = False
+        for left_pos, left_index in enumerate(indexes):
+            for right_index in indexes[left_pos + 1 :]:
+                left = result[left_index]
+                right = result[right_index]
+                left_rect = fitz.Rect(left.rect)
+                right_rect = fitz.Rect(right.rect)
+                overlap = left_rect & right_rect
+                if overlap.is_empty or overlap.get_area() < 0.4:
+                    continue
+                direction = left.direction
+                left_points = [fitz.Point(point) for point in left.quad]
+                right_points = [fitz.Point(point) for point in right.quad]
+                (
+                    left_along0,
+                    left_along1,
+                    left_across0,
+                    left_across1,
+                    axis,
+                    normal,
+                ) = _axis_bounds(left_points, direction)
+                (
+                    right_along0,
+                    right_along1,
+                    right_across0,
+                    right_across1,
+                    _axis,
+                    _normal,
+                ) = _axis_bounds(right_points, direction)
+                along_overlap = min(left_along1, right_along1) - max(
+                    left_along0, right_along0
+                )
+                if along_overlap <= 0:
+                    continue
+                gap = 1.2
+                mid = (
+                    max(left_along0, right_along0)
+                    + min(left_along1, right_along1)
+                ) / 2
+                left_center = (left_along0 + left_along1) / 2
+                right_center = (right_along0 + right_along1) / 2
+                if left_center <= right_center:
+                    left_along1 = min(left_along1, mid - gap / 2)
+                    right_along0 = max(right_along0, mid + gap / 2)
+                else:
+                    right_along1 = min(right_along1, mid - gap / 2)
+                    left_along0 = max(left_along0, mid + gap / 2)
+                if left_along1 <= left_along0 + 1.2 or right_along1 <= right_along0 + 1.2:
+                    continue
+                left_quad = _quad_from_axis_bounds(
+                    left_along0,
+                    left_along1,
+                    left_across0,
+                    left_across1,
+                    axis,
+                    normal,
+                )
+                right_quad = _quad_from_axis_bounds(
+                    right_along0,
+                    right_along1,
+                    right_across0,
+                    right_across1,
+                    axis,
+                    normal,
+                )
+                result[left_index] = replace(
+                    left,
+                    rect=_marking_quad_bounds(left_quad),
+                    quad=left_quad,
+                )
+                result[right_index] = replace(
+                    right,
+                    rect=_marking_quad_bounds(right_quad),
+                    quad=right_quad,
+                )
+                moved = True
+        if not moved:
+            break
+    return result
+
+
+def _marking_paint_parts(
+    marking: _DetectedDimensionMarking,
+) -> list[tuple[tuple[float, float, float, float], tuple[tuple[float, float], ...]]]:
+    """本体と括弧は、同じ塗り幅の帯として出す。"""
+
+    if not marking.tolerance_rect or not marking.tolerance_quad:
+        return [(marking.rect, marking.quad)]
+    xs = [point[0] for point in marking.quad]
+    ys = [point[1] for point in marking.quad]
+    base_points = [fitz.Point(point) for point in marking.quad]
+    extra_points = [fitz.Point(point) for point in marking.tolerance_quad]
+    direction = _quad_reading_direction(base_points, marking.direction)
+    if abs(direction[1]) < 0.72 and (max(ys) - min(ys)) / max(max(xs) - min(xs), 0.1) >= 1.6:
+        direction = (0.0, 1.0)
+    _along0, _along1, across0, across1, _axis, _normal = _axis_bounds(
+        base_points, direction
+    )
+    thickness = max(across1 - across0, 2.8)
+    extra_quad = _quad_same_thickness(
+        extra_points, direction, thickness, along_expand=0.5
+    )
+    extra_along0, extra_along1, extra_across0, extra_across1, _eaxis, _enormal = (
+        _axis_bounds(extra_points, direction)
+    )
+    across_shift = abs(
+        ((extra_across0 + extra_across1) / 2) - ((across0 + across1) / 2)
+    )
+    # 縦の g6/H7 の括弧内偏差は、読み方向に連続していても別帯にする。
+    # 本体へ結合すると括弧部分が他色の寸法へ食い込みやすい。
+    fit_tolerance = bool(
+        _FIT_TOLERANCE_PATTERN.search(
+            unicodedata.normalize("NFKC", marking.source_text)
+        )
+    )
+    if across_shift <= 6.0 and not fit_tolerance:
+        joined = _extend_along_keep_across(
+            base_points, extra_points, direction, along_expand=0.5
+        )
+        return [(_marking_quad_bounds(joined), joined)]
+    body_quad = _quad_same_thickness(
+        base_points, direction, thickness, along_expand=0.4
+    )
+    return [
+        (_marking_quad_bounds(body_quad), body_quad),
+        (_marking_quad_bounds(extra_quad), extra_quad),
+    ]
+
+
+def _quad_or_rect_points(
+    rect: tuple[float, float, float, float],
+    quad: tuple[tuple[float, float], ...] | None,
+) -> list[fitz.Point]:
+    if quad:
+        return [fitz.Point(point) for point in quad]
+    box = fitz.Rect(rect)
+    return [box.top_left, box.top_right, box.bottom_right, box.bottom_left]
+
+
+def _quad_reading_direction(
+    points: list[fitz.Point],
+    fallback: tuple[float, float] = (1.0, 0.0),
+) -> tuple[float, float]:
+    """4点から読み方向を取る。斜め寸法は四角形の辺方向を維持する。"""
+
+    if len(points) < 2:
+        return fallback
+    edge_a = points[1] - points[0]
+    edge_b = points[-1] - points[0]
+    axis = edge_a if math.hypot(edge_a.x, edge_a.y) >= math.hypot(edge_b.x, edge_b.y) else edge_b
+    length = math.hypot(axis.x, axis.y) or 1.0
+    dx, dy = axis.x / length, axis.y / length
+    # ほぼ軸平行のOCR枠だけをスナップする。0.72では約46度まで
+    # 横／縦扱いになり、斜め寸法の帯が大きな矩形へ崩れてしまう。
+    if abs(dx) >= 0.965:
+        return (1.0 if dx >= 0 else -1.0, 0.0)
+    if abs(dy) >= 0.965:
+        return (0.0, 1.0 if dy >= 0 else -1.0)
+    return (dx, dy)
+
+
+def _paint_entries_join(
+    left: DimensionMarkingEntry,
+    right: DimensionMarkingEntry,
+) -> bool:
+    """同じ色で、同じ行の途切れ枠だけを1本にまとめる。"""
+
+    if left.color != right.color:
+        return False
+    left_points = _quad_or_rect_points(left.rect, left.quad)
+    right_points = _quad_or_rect_points(right.rect, right.quad)
+    direction = _quad_reading_direction(left_points)
+    left_along0, left_along1, left_across0, left_across1, _axis, _normal = (
+        _axis_bounds(left_points, direction)
+    )
+    right_along0, right_along1, right_across0, right_across1, _ra, _rn = (
+        _axis_bounds(right_points, direction)
+    )
+    thickness = max(
+        (left_across1 - left_across0 + right_across1 - right_across0) / 2,
+        2.4,
+    )
+    across_shift = abs(
+        ((left_across0 + left_across1) / 2)
+        - ((right_across0 + right_across1) / 2)
+    )
+    if across_shift > max(5.2, thickness * 0.8):
+        return False
+    span_left = max(left_along1 - left_along0, 1.0)
+    span_right = max(right_along1 - right_along0, 1.0)
+    short_span = min(span_left, span_right)
+    long_span = max(span_left, span_right)
+    # 二つの完成した粗さ（カンマ・中点で区切る）は、OCR枠が
+    # わずかに重なってもつなげない。各値を別候補・別帯に保つ。
+    if (
+        short_span > thickness * 3.5
+        and short_span / long_span > 0.62
+    ):
+        return False
+    along_overlap = min(left_along1, right_along1) - max(left_along0, right_along0)
+    along_gap = max(0.0, max(left_along0, right_along0) - min(left_along1, right_along1))
+    if along_overlap > 0.4:
+        return True
+    # Rzmax と数値、φ16 と H7 のような途切れだけつなぐ
+    return along_gap <= max(5.8, min(9.5, thickness * 0.9))
+
+
+def _fit_strip_to_ink(
+    image: Image.Image | None,
+    scale_x: float,
+    scale_y: float,
+    points: list[fitz.Point],
+    direction: tuple[float, float],
+    kind: str = "",
+) -> tuple[tuple[float, float], ...]:
+    """文字のインクに合わせて帯の厚みを締め、末尾は少し余裕を残す。"""
+
+    along0, along1, across0, across1, axis, normal = _axis_bounds(
+        points, direction
+    )
+    original = _quad_from_axis_bounds(
+        along0, along1, across0, across1, axis, normal
+    )
+    if image is None or scale_x <= 0 or scale_y <= 0:
+        return original
+    xs = [point.x for point in points]
+    ys = [point.y for point in points]
+    # 縦g6/H7はOCR枠が文字の上半分へ寄ることがあるため、位置合わせ時だけ
+    # 周囲の文字インクも参照する。帯の幅は後段で維持する。
+    pad = 8.0 if kind == "fit" else 2.2
+    ix0 = max(0, int((min(xs) - pad) * scale_x))
+    iy0 = max(0, int((min(ys) - pad) * scale_y))
+    ix1 = min(image.width, int(math.ceil((max(xs) + pad) * scale_x)))
+    iy1 = min(image.height, int(math.ceil((max(ys) + pad) * scale_y)))
+    if ix1 - ix0 < 4 or iy1 - iy0 < 4:
+        return original
+    crop = image.convert("L").crop((ix0, iy0, ix1, iy1))
+    pixels = crop.load()
+    ink_along: list[float] = []
+    ink_across: list[float] = []
+    for row in range(crop.height):
+        for column in range(crop.width):
+            if pixels[column, row] > 168:
+                continue
+            page_x = (ix0 + column) / scale_x
+            page_y = (iy0 + row) / scale_y
+            ink_along.append(page_x * axis.x + page_y * axis.y)
+            ink_across.append(page_x * normal.x + page_y * normal.y)
+    if len(ink_along) < 12:
+        return original
+    ink_along0, ink_along1 = min(ink_along), max(ink_along)
+    bin_size = 0.35
+    across_min = min(ink_across)
+    counts: list[int] = []
+    along_ranges: list[list[float | None]] = []
+    value = across_min
+    while value <= max(ink_across) + bin_size:
+        counts.append(0)
+        along_ranges.append([None, None])
+        value += bin_size
+    if not counts:
+        return original
+    for along_value, across_value in zip(ink_along, ink_across):
+        index = min(len(counts) - 1, int((across_value - across_min) / bin_size))
+        counts[index] += 1
+        if along_ranges[index][0] is None:
+            along_ranges[index] = [along_value, along_value]
+        else:
+            along_ranges[index][0] = min(along_ranges[index][0], along_value)
+            along_ranges[index][1] = max(along_ranges[index][1], along_value)
+    # OCR 枠へ寸法線や粗さ記号の横線が混ざると、その1本が最大密度に
+    # なって文字の帯幅を過大にしてしまう。読み方向の大半を占める線は除く。
+    long_ink_span = max(18.0, (along1 - along0) * 0.72)
+    for index, (range_start, range_end) in enumerate(along_ranges):
+        if (
+            range_start is not None
+            and range_end is not None
+            and range_end - range_start >= long_ink_span
+        ):
+            counts[index] = 0
+    if not any(counts):
+        if kind in {"roughness", "chamfer"}:
+            original_thickness = across1 - across0
+            if kind == "chamfer" and abs(axis.x) < 0.96 and abs(axis.y) < 0.96:
+                # 斜めC0.3は元のOCR枠が細く、横C0用の縮小を流用すると
+                # 文字列の下側が欠ける。
+                factor = 1.05
+            elif kind == "chamfer":
+                factor = 0.36
+            else:
+                factor = 0.38
+            thickness = max(2.8, original_thickness * factor)
+            center = (across0 + across1) / 2
+            return _quad_from_axis_bounds(
+                along0,
+                along1,
+                center - thickness / 2,
+                center + thickness / 2,
+                axis,
+                normal,
+            )
+        return original
+    peak = max(counts)
+    peak_index = counts.index(peak)
+    floor = max(3, int(peak * 0.14))
+    start = peak_index
+    end = peak_index
+    while start > 0 and counts[start - 1] >= floor:
+        start -= 1
+    while end + 1 < len(counts) and counts[end + 1] >= floor:
+        end += 1
+    ink_across0 = across_min + start * bin_size
+    ink_across1 = across_min + (end + 1) * bin_size
+    if kind == "fit":
+        original_thickness = across1 - across0
+        original_center = (across0 + across1) / 2
+        ink_center = (ink_across0 + ink_across1) / 2
+        shift = max(
+            -max(2.0, original_thickness * 0.28),
+            min(max(2.0, original_thickness * 0.28), ink_center - original_center),
+        )
+        return _quad_from_axis_bounds(
+            min(along0, max(along0 - 7.0, ink_along0 - 1.6)),
+            max(along1, min(along1 + 7.0, ink_along1 + 1.6)),
+            original_center + shift - original_thickness / 2,
+            original_center + shift + original_thickness / 2,
+            axis,
+            normal,
+        )
+    across_pad = 0.52 if kind in {"roughness", "chamfer"} else 0.72
+    new_across0 = max(across0, ink_across0 - across_pad)
+    new_across1 = min(across1, ink_across1 + across_pad)
+    # 寸法線を含む背の高いOCR枠でも、文字インクへ帯を戻せるようにする。
+    # 極端に細くなる場合だけ従来枠を残す。
+    minimum_ratio = 0.36 if kind in {"linear", "diameter"} else 0.28
+    if kind in {"roughness", "chamfer"}:
+        minimum_ratio = 0.20
+    original_thickness = across1 - across0
+    if new_across1 - new_across0 < max(2.8, original_thickness * minimum_ratio):
+        new_across0, new_across1 = across0, across1
+    # 粗さ記号と面取りは、OCR枠へ引出線・下線が混ざる図面がある。
+    # 種類ごとに文字列の長さから帯厚みを制限し、通常寸法の帯幅には
+    # 影響させない。斜めCは細くなり過ぎない下限も与える。
+    current_thickness = new_across1 - new_across0
+    along_span = max(along1 - along0, 1.0)
+    if kind == "roughness":
+        minimum_thickness = max(4.8, along_span * 0.12)
+        maximum_thickness = max(
+            minimum_thickness,
+            min(original_thickness * 0.64, along_span * 0.25),
+        )
+    elif kind == "chamfer" and abs(axis.x) < 0.96 and abs(axis.y) < 0.96:
+        minimum_thickness = max(4.8, along_span * 0.12)
+        maximum_thickness = max(
+            minimum_thickness,
+            max(original_thickness * 0.92, along_span * 0.20),
+        )
+    elif kind == "chamfer":
+        minimum_thickness = max(4.0, along_span * 0.10)
+        maximum_thickness = max(
+            minimum_thickness,
+            min(original_thickness * 0.62, along_span * 0.24),
+        )
+    else:
+        minimum_thickness = 0.0
+        maximum_thickness = float("inf")
+    if current_thickness < minimum_thickness or current_thickness > maximum_thickness:
+        thickness = min(max(current_thickness, minimum_thickness), maximum_thickness)
+        center = (new_across0 + new_across1) / 2
+        new_across0 = center - thickness / 2
+        new_across1 = center + thickness / 2
+    # 文字方向は縮めない（末尾の 5 や 7 が欠けないようにする）
+    new_along0 = min(along0, max(along0 - 3.0, ink_along0 - 1.6))
+    new_along1 = max(along1, min(along1 + 3.0, ink_along1 + 1.6))
+    return _quad_from_axis_bounds(
+        new_along0,
+        new_along1,
+        new_across0,
+        new_across1,
+        axis,
+        normal,
+    )
+
+
+def _strip_from_paint_group(
+    group: list[DimensionMarkingEntry],
+    image: Image.Image | None,
+    scale_x: float,
+    scale_y: float,
+) -> DimensionMarkingEntry:
+    """途切れ枠を、中央値の厚みの1本帯にする。"""
+
+    base = group[0]
+    all_points: list[fitz.Point] = []
+    thicknesses: list[float] = []
+    for entry in group:
+        points = _quad_or_rect_points(entry.rect, entry.quad)
+        all_points.extend(points)
+        direction = _quad_reading_direction(points)
+        _a0, _a1, across0, across1, _axis, _normal = _axis_bounds(
+            points, direction
+        )
+        thicknesses.append(max(across1 - across0, 2.4))
+    direction = _quad_reading_direction(
+        _quad_or_rect_points(base.rect, base.quad)
+    )
+    thickness = max(thicknesses)
+    strip = _quad_same_thickness(
+        all_points, direction, thickness, along_expand=0.5
+    )
+    fitted = _fit_strip_to_ink(
+        image,
+        scale_x,
+        scale_y,
+        [fitz.Point(point) for point in strip],
+        direction,
+        base.kind,
+    )
+    return DimensionMarkingEntry(
+        _marking_quad_bounds(fitted),
+        base.color,
+        base.opacity,
+        fitted,
+        base.kind,
+    )
+
+
+def _equalize_beside_paint(
+    entries: list[DimensionMarkingEntry],
+) -> list[DimensionMarkingEntry]:
+    """横並びの本体と括弧は、同じ厚みに揃える（1つの大きな矩形にはしない）。"""
+
+    result = list(entries)
+    for left_index, left in enumerate(result):
+        left_points = _quad_or_rect_points(left.rect, left.quad)
+        direction = _quad_reading_direction(left_points)
+        left_along0, left_along1, left_across0, left_across1, _axis, _normal = (
+            _axis_bounds(left_points, direction)
+        )
+        left_thickness = left_across1 - left_across0
+        for right_index in range(left_index + 1, len(result)):
+            right = result[right_index]
+            if right.color != left.color:
+                continue
+            right_points = _quad_or_rect_points(right.rect, right.quad)
+            right_along0, right_along1, right_across0, right_across1, _ra, _rn = (
+                _axis_bounds(right_points, direction)
+            )
+            along_overlap = min(left_along1, right_along1) - max(
+                left_along0, right_along0
+            )
+            across_shift = abs(
+                ((left_across0 + left_across1) / 2)
+                - ((right_across0 + right_across1) / 2)
+            )
+            if along_overlap < 2.0 or not (3.5 <= across_shift <= 28.0):
+                continue
+            thickness = max((left_thickness + (right_across1 - right_across0)) / 2, 2.8)
+            result[left_index] = DimensionMarkingEntry(
+                _marking_quad_bounds(
+                    _quad_same_thickness(
+                        left_points, direction, thickness, along_expand=0.2
+                    )
+                ),
+                left.color,
+                left.opacity,
+                _quad_same_thickness(
+                    left_points, direction, thickness, along_expand=0.2
+                ),
+                left.kind,
+            )
+            result[right_index] = DimensionMarkingEntry(
+                _marking_quad_bounds(
+                    _quad_same_thickness(
+                        right_points, direction, thickness, along_expand=0.2
+                    )
+                ),
+                right.color,
+                right.opacity,
+                _quad_same_thickness(
+                    right_points, direction, thickness, along_expand=0.2
+                ),
+                right.kind,
+            )
+    return result
+
+
+def _align_collinear_complete_strips(
+    entries: list[DimensionMarkingEntry],
+) -> list[DimensionMarkingEntry]:
+    """区切り記号で分かれた同じ行の完成帯は、重ねずに厚みと中心を揃える。"""
+
+    result = list(entries)
+    for left_index, left in enumerate(result):
+        left_points = _quad_or_rect_points(left.rect, left.quad)
+        direction = _quad_reading_direction(left_points)
+        left_along0, left_along1, left_across0, left_across1, axis, normal = (
+            _axis_bounds(left_points, direction)
+        )
+        for right_index in range(left_index + 1, len(result)):
+            right = result[right_index]
+            if right.color != left.color:
+                continue
+            right_points = _quad_or_rect_points(right.rect, right.quad)
+            right_along0, right_along1, right_across0, right_across1, _ra, _rn = (
+                _axis_bounds(right_points, direction)
+            )
+            along_overlap = min(left_along1, right_along1) - max(
+                left_along0, right_along0
+            )
+            along_gap = max(
+                0.0,
+                max(left_along0, right_along0) - min(left_along1, right_along1),
+            )
+            across_shift = abs(
+                ((left_across0 + left_across1) / 2)
+                - ((right_across0 + right_across1) / 2)
+            )
+            span_left = left_along1 - left_along0
+            span_right = right_along1 - right_along0
+            thickness = max(
+                left_across1 - left_across0,
+                right_across1 - right_across0,
+                2.8,
+            )
+            if across_shift > max(6.0, thickness * 0.9):
+                continue
+            span_ratio = min(span_left, span_right) / max(
+                span_left, span_right, 1.0
+            )
+            if span_ratio < 0.55:
+                continue
+            # Rzmax 5.7・Rzmax 2.9 のように、OCR 枠だけが中点へ
+            # 食い込んだ完成帯は、区切り位置に小さな余白を作る。
+            # 短い文字断片には適用せず、従来どおり1本へ統合する。
+            separate_overlap = (
+                along_overlap > 0.4
+                and min(span_left, span_right) > thickness * 3.5
+                and span_ratio >= 0.62
+            )
+            # OCR枠が接しているだけの連続粗さも、完成した2本の帯なら
+            # 中点記号の位置で分離する。Rzmax と数値の短い断片は対象外。
+            separate_contact = (
+                along_gap <= 16.0
+                and min(span_left, span_right) > thickness * 3.5
+                and span_ratio >= 0.62
+            )
+            if not separate_overlap and not separate_contact:
+                continue
+            center = (
+                (left_across0 + left_across1) / 2
+                + (right_across0 + right_across1) / 2
+            ) / 2
+            half = thickness / 2
+            if separate_overlap or separate_contact:
+                split = (max(left_along0, right_along0) + min(
+                    left_along1, right_along1
+                )) / 2
+                gap = min(8.0, max(4.5, thickness * 0.45))
+                if left_along0 <= right_along0:
+                    left_along1 = min(left_along1, split - gap / 2)
+                    right_along0 = max(right_along0, split + gap / 2)
+                else:
+                    right_along1 = min(right_along1, split - gap / 2)
+                    left_along0 = max(left_along0, split + gap / 2)
+            left_quad = _quad_from_axis_bounds(
+                left_along0,
+                left_along1,
+                center - half,
+                center + half,
+                axis,
+                normal,
+            )
+            right_quad = _quad_from_axis_bounds(
+                right_along0,
+                right_along1,
+                center - half,
+                center + half,
+                axis,
+                normal,
+            )
+            result[left_index] = DimensionMarkingEntry(
+                _marking_quad_bounds(left_quad),
+                left.color,
+                left.opacity,
+                left_quad,
+                left.kind,
+            )
+            result[right_index] = DimensionMarkingEntry(
+                _marking_quad_bounds(right_quad),
+                right.color,
+                right.opacity,
+                right_quad,
+                right.kind,
+            )
+            left = result[left_index]
+            left_points = _quad_or_rect_points(left.rect, left.quad)
+            left_along0, left_along1, left_across0, left_across1, axis, normal = (
+                _axis_bounds(left_points, direction)
+            )
+    return result
+
+
+def _separate_other_color_paint(
+    entries: list[DimensionMarkingEntry],
+) -> list[DimensionMarkingEntry]:
+    """別色の帯へ食い込んだ枠は、直交方向だけ内側へ戻す。"""
+
+    result = list(entries)
+    for index, entry in enumerate(result):
+        entry_rect = fitz.Rect(entry.rect)
+        points = _quad_or_rect_points(entry.rect, entry.quad)
+        direction = _quad_reading_direction(points)
+        along0, along1, across0, across1, axis, normal = _axis_bounds(
+            points, direction
+        )
+        changed = False
+        for other in result:
+            if other.color == entry.color:
+                continue
+            other_rect = fitz.Rect(other.rect)
+            overlap = entry_rect & other_rect
+            if overlap.is_empty:
+                continue
+            if overlap.get_area() < 0.08 * min(
+                entry_rect.get_area(), other_rect.get_area()
+            ):
+                continue
+            if entry_rect.get_area() + 1.0 < other_rect.get_area():
+                continue
+            entry_cx = (entry_rect.x0 + entry_rect.x1) / 2
+            other_cx = (other_rect.x0 + other_rect.x1) / 2
+            entry_cy = (entry_rect.y0 + entry_rect.y1) / 2
+            other_cy = (other_rect.y0 + other_rect.y1) / 2
+            if abs(entry_cx - other_cx) >= abs(entry_cy - other_cy):
+                if entry_cx > other_cx:
+                    new_x0 = other_rect.x1 + 0.7
+                    if new_x0 < entry_rect.x1 - 2.8:
+                        entry_rect.x0 = new_x0
+                        changed = True
+                else:
+                    new_x1 = other_rect.x0 - 0.7
+                    if new_x1 > entry_rect.x0 + 2.8:
+                        entry_rect.x1 = new_x1
+                        changed = True
+            else:
+                if entry_cy > other_cy:
+                    new_y0 = other_rect.y1 + 0.7
+                    if new_y0 < entry_rect.y1 - 2.8:
+                        entry_rect.y0 = new_y0
+                        changed = True
+                else:
+                    new_y1 = other_rect.y0 - 0.7
+                    if new_y1 > entry_rect.y0 + 2.8:
+                        entry_rect.y1 = new_y1
+                        changed = True
+        if not changed:
+            continue
+        clipped = _quad_same_thickness(
+            [
+                entry_rect.top_left,
+                entry_rect.top_right,
+                entry_rect.bottom_right,
+                entry_rect.bottom_left,
+            ],
+            direction,
+            max(across1 - across0, 2.8),
+            along_expand=0.0,
+        )
+        result[index] = DimensionMarkingEntry(
+            _marking_quad_bounds(clipped),
+            entry.color,
+            entry.opacity,
+            clipped,
+            entry.kind,
+        )
+    return result
+
+
+def _unify_dimension_marking_entries(
+    entries: list[DimensionMarkingEntry],
+    image: Image.Image | None = None,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> list[DimensionMarkingEntry]:
+    """検出件数用の断片枠を、見た目の1本帯へまとめる。"""
+
+    if not entries:
+        return entries
+    # 明示片側公差を含む縦寸法で、OCRが公差だけを別候補にした場合は
+    # 本体と同じ黄色へ寄せる。短く隣接する帯に限定し、独立した
+    # ピンク寸法や粗さを色変更しない。
+    absorbed_entries = list(entries)
+    for short_index, short in enumerate(absorbed_entries):
+        if short.color != "#ff33cc":
+            continue
+        short_points = _quad_or_rect_points(short.rect, short.quad)
+        direction = _quad_reading_direction(short_points)
+        short_a0, short_a1, short_c0, short_c1, _axis, _normal = _axis_bounds(
+            short_points, direction
+        )
+        short_span = short_a1 - short_a0
+        for long in absorbed_entries:
+            if long.color != "#ffff00":
+                continue
+            long_points = _quad_or_rect_points(long.rect, long.quad)
+            long_a0, long_a1, long_c0, long_c1, _la, _ln = _axis_bounds(
+                long_points, direction
+            )
+            long_span = long_a1 - long_a0
+            along_gap = max(0.0, max(short_a0, long_a0) - min(short_a1, long_a1))
+            across_overlap = min(short_c1, long_c1) - max(short_c0, long_c0)
+            if (
+                long_span >= max(18.0, short_span * 1.2)
+                and short_span <= 36.0
+                and along_gap <= 6.0
+                and across_overlap >= min(short_c1 - short_c0, long_c1 - long_c0) * 0.65
+            ):
+                absorbed_entries[short_index] = replace(short, color=long.color)
+                break
+    entries = absorbed_entries
+    used = [False] * len(entries)
+    unified: list[DimensionMarkingEntry] = []
+    for index, entry in enumerate(entries):
+        if used[index]:
+            continue
+        group = [entry]
+        used[index] = True
+        changed = True
+        while changed:
+            changed = False
+            for other_index, other in enumerate(entries):
+                if used[other_index]:
+                    continue
+                if any(_paint_entries_join(member, other) for member in group):
+                    group.append(other)
+                    used[other_index] = True
+                    changed = True
+        if len(group) == 1:
+            points = _quad_or_rect_points(group[0].rect, group[0].quad)
+            direction = _quad_reading_direction(points)
+            fitted = _fit_strip_to_ink(
+                image, scale_x, scale_y, points, direction, group[0].kind
+            )
+            unified.append(
+                DimensionMarkingEntry(
+                    _marking_quad_bounds(fitted),
+                    group[0].color,
+                    group[0].opacity,
+                    fitted,
+                    group[0].kind,
+                )
+            )
+        else:
+            unified.append(
+                _strip_from_paint_group(group, image, scale_x, scale_y)
+            )
+    return _separate_other_color_paint(
+        _align_collinear_complete_strips(_equalize_beside_paint(unified))
+    )
+
+
+def _same_callout_fragments(
+    left: _DetectedDimensionMarking,
+    right: _DetectedDimensionMarking,
+) -> bool:
+    """同じ寸法のOCR断片かどうか。隣の別寸法はまとめない。"""
+
+    kinds = {left.kind, right.kind}
+    if left.kind != right.kind and not kinds <= {"linear", "diameter"}:
+        return False
+    if abs(left.nominal_value - right.nominal_value) > 1e-6:
+        return False
+    if left.kind == "roughness" and right.kind == "roughness":
+        return _roughness_fragments_join(left, right)
+    left_text = unicodedata.normalize("NFKC", left.source_text).replace(" ", "")
+    right_text = unicodedata.normalize("NFKC", right.source_text).replace(" ", "")
+    left_rect = fitz.Rect(left.rect)
+    right_rect = fitz.Rect(right.rect)
+    distance = math.dist(
+        (
+            (left_rect.x0 + left_rect.x1) / 2,
+            (left_rect.y0 + left_rect.y1) / 2,
+        ),
+        (
+            (right_rect.x0 + right_rect.x1) / 2,
+            (right_rect.y0 + right_rect.y1) / 2,
+        ),
+    )
+    if distance > 30.0:
+        return False
+    overlap = (left_rect & right_rect).get_area()
+    if overlap > 0.15 * min(left_rect.get_area(), right_rect.get_area()):
+        return True
+    if left_text in right_text or right_text in left_text:
+        return True
+    if _FIT_TOLERANCE_PATTERN.search(left_text) or _FIT_TOLERANCE_PATTERN.search(
+        right_text
+    ):
+        return distance <= 22.0
+    return False
+
+
+def _merge_nearby_same_callout(
+    items: list[_DetectedDimensionMarking],
+) -> list[_DetectedDimensionMarking]:
+    """同じ呼びの隣接断片を、長い読みの帯として1件にする。"""
+
+    used = [False] * len(items)
+    merged: list[_DetectedDimensionMarking] = []
+    for index, item in enumerate(items):
+        if used[index]:
+            continue
+        group = [item]
+        used[index] = True
+        changed = True
+        while changed:
+            changed = False
+            for other_index, other in enumerate(items):
+                if used[other_index]:
+                    continue
+                if any(_same_callout_fragments(member, other) for member in group):
+                    group.append(other)
+                    used[other_index] = True
+                    changed = True
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        keeper = max(
+            group,
+            key=lambda member: _marking_ocr_quality(member.source_text, 0.0)[:2],
+        )
+        extra_points = [
+            fitz.Point(point)
+            for member in group
+            for point in member.quad
+        ]
+        _a0, _a1, across0, across1, _axis, _normal = _axis_bounds(
+            [fitz.Point(point) for point in keeper.quad],
+            keeper.direction,
+        )
+        thickness = max(across1 - across0, 2.8)
+        quad = _quad_same_thickness(
+            extra_points, keeper.direction, thickness, along_expand=0.5
+        )
+        tolerance_quad = (
+            _quad_same_thickness(
+                tolerance_points,
+                keeper.direction,
+                thickness,
+                along_expand=0.5,
+            )
+            if tolerance_points
+            else None
+        )
+        merged.append(
+            replace(
+                keeper,
+                rect=_marking_quad_bounds(quad),
+                quad=quad,
+                tolerance_rect=(
+                    _marking_quad_bounds(tolerance_quad)
+                    if tolerance_quad is not None
+                    else None
+                ),
+                tolerance_quad=tolerance_quad,
+            )
+        )
+    return merged
 
 
 def _explicit_tolerance_range(
@@ -225,6 +1644,13 @@ def _explicit_tolerance_range(
     if nominal_match is None:
         return None
     remainder = normalized[nominal_match.end() :]
+    fit_match = re.match(r"\s*([A-Za-z])\s*(\d{1,2})", remainder)
+    fit_width = None
+    if fit_match is not None:
+        fit_width = _iso_fit_tolerance_width(
+            nominal_value,
+            int(fit_match.group(2)),
+        )
     # ISO fit notation is part of the nominal (for example ``φ26g6``), not
     # a tolerance magnitude.  Ignore the grade digit before reading deviations.
     remainder = re.sub(r"^\s*[A-Za-z]\s*\d{1,2}", "", remainder)
@@ -234,7 +1660,7 @@ def _explicit_tolerance_range(
     if _PART_NUMBER_PATTERN.search(normalized):
         return None
     if not any(symbol in remainder for symbol in ("±", "+", "-")):
-        return None
+        return fit_width
     values = [
         float(value.replace(",", "."))
         for value in re.findall(r"\d+(?:[.,]\d+)?", remainder)
@@ -248,6 +1674,20 @@ def _explicit_tolerance_range(
     if "+" in remainder and "-" in remainder:
         return abs(values[0]) + abs(values[1])
     return abs(max(values) - min(values))
+
+
+def _marking_highlight_color(kind: str, total_range: float | None) -> str:
+    """色分けの塗色。きつい公差・はめあい・粗い指示値はピンク。"""
+
+    if kind == "geometric":
+        return "#ffff00"
+    if total_range is None:
+        return "#ffff00"
+    if kind == "roughness":
+        limit = 5.7
+    else:
+        limit = 1.0 if kind == "angle" else 0.03
+    return "#ff33cc" if total_range <= limit + 1e-9 else "#ffff00"
 
 
 def _marking_ocr_quality(text: str, score: float) -> tuple[int, int, float]:
@@ -287,6 +1727,9 @@ def _merge_detected_markings(
 
     merged = list(base)
     for item in extra:
+        item_compact = unicodedata.normalize(
+            "NFKC", item.source_text
+        ).replace(" ", "")
         item_rect = fitz.Rect(item.rect)
         item_center = fitz.Point(
             (item_rect.x0 + item_rect.x1) / 2,
@@ -295,22 +1738,24 @@ def _merge_detected_markings(
         item_quality = _marking_ocr_quality(item.source_text, extra_score)
         overlapped = False
         for index, existing in enumerate(merged):
+            existing_compact = unicodedata.normalize(
+                "NFKC", existing.source_text
+            ).replace(" ", "")
             existing_rect = fitz.Rect(existing.rect)
             existing_center = fitz.Point(
                 (existing_rect.x0 + existing_rect.x1) / 2,
                 (existing_rect.y0 + existing_rect.y1) / 2,
             )
             overlap_area = (item_rect & existing_rect).get_area()
-            overlap_hit = overlap_area >= 0.45 * min(
-                item_rect.get_area(),
-                existing_rect.get_area(),
-            )
-            same_dimension = (
+            same_nominal_kind = (
                 abs(existing.nominal_value - item.nominal_value) < 1e-6
                 and (
                     existing.kind == item.kind
                     or {existing.kind, item.kind} <= {"linear", "diameter"}
                 )
+            )
+            same_dimension = (
+                same_nominal_kind
                 and (
                     (existing.tolerance_range is None)
                     == (item.tolerance_range is None)
@@ -324,15 +1769,58 @@ def _merge_detected_markings(
                     < 1e-6
                 )
             )
-            near_hit = same_dimension and math.dist(
-                (item_center.x, item_center.y),
-                (existing_center.x, existing_center.y),
-            ) <= 36.0
+            same_text = item_compact == existing_compact
+            # Dense vertical dimension columns can legitimately overlap after
+            # their stacked deviations are included. Do not discard a
+            # neighbouring dimension merely because the review rectangles
+            # intersect; overlap is duplicate evidence only when the nominal
+            # reading or normalized OCR text also agrees.
+            overlap_threshold = (
+                0.18
+                if item.kind == "roughness" and existing.kind == "roughness"
+                else 0.45
+            )
+            overlap_hit = (
+                overlap_area
+                >= overlap_threshold
+                * min(item_rect.get_area(), existing_rect.get_area())
+                and (same_nominal_kind or same_text)
+            )
+            near_distance = (
+                22.0
+                if item.kind == "roughness" or existing.kind == "roughness"
+                else 36.0
+            )
+            near_hit = (
+                same_dimension
+                and math.dist(
+                    (item_center.x, item_center.y),
+                    (existing_center.x, existing_center.y),
+                )
+                <= near_distance
+            )
             if not overlap_hit and not near_hit:
                 continue
             overlapped = True
-            if item_quality > _marking_ocr_quality(existing.source_text, 0.0):
-                merged[index] = item
+            existing_quality = _marking_ocr_quality(existing.source_text, 0.0)
+            # Preserve the page-OCR geometry when both engines read the same
+            # expression equally well.  Windows OCR boxes are often displaced
+            # perpendicular to vertical or tightly stacked dimensions.
+            keeper = item if item_quality[:2] > existing_quality[:2] else existing
+            other = existing if keeper is item else item
+            union_quad = _extend_along_keep_across(
+                [fitz.Point(point) for point in keeper.quad],
+                [fitz.Point(point) for point in other.quad],
+                keeper.direction,
+                along_expand=0.4,
+            )
+            merged[index] = replace(
+                keeper,
+                rect=_marking_quad_bounds(union_quad),
+                quad=union_quad,
+                tolerance_rect=keeper.tolerance_rect or other.tolerance_rect,
+                tolerance_quad=keeper.tolerance_quad or other.tolerance_quad,
+            )
             break
         if not overlapped:
             merged.append(item)
@@ -383,14 +1871,12 @@ def _is_plausible_tolerance_marking(
         return False
     stem = re.sub(r"^[φΦØ⌀CRcr]", "", compact)
     if re.search(r"[A-Za-z]", stem):
-        # はめあい（例: 26g6±0.01）だけ許容し、130E± などは落とす
+        # はめあい（例: 26g6±0.01 / 18G6(+0.012/+0.001)）だけ許容する
         if not re.match(
-            r"^\d+(?:[.,]\d+)?[A-Za-z]\d{1,2}(?:[±+\-－−].*)?$",
+            r"^\d+(?:[.,]\d+)?[A-Za-z]\d{1,2}(?:[()（）±+\-－−].*)?$",
             stem,
         ):
             return False
-    if _FIT_TOLERANCE_PATTERN.search(text):
-        return False
     if _ROUGHNESS_OCR_PATTERN.fullmatch(compact):
         return False
     if re.search(r"M\d", text, re.IGNORECASE):
@@ -564,9 +2050,14 @@ def _detect_dimension_markings(
                 across_inset=max(0.12, font_size * 0.035),
             )
             core_rect = fitz.Rect(_marking_quad_bounds(core_quad))
+            explicit_tolerance_in_line = any(
+                symbol in working_text for symbol in ("±", "亇", "+", "-", "−", "－")
+            )
             if (
                 core_rect.y1 < page.rect.height * 0.11
-                or core_rect.y0 > page.rect.height * 0.82
+                or core_rect.y0 > page.rect.height * (
+                    0.93 if explicit_tolerance_in_line else 0.82
+                )
             ):
                 continue
 
@@ -616,6 +2107,10 @@ def _detect_dimension_markings(
                 group_text,
                 nominal_value,
             )
+            if kind == "limit":
+                # R/Cの「以下」は個別指示として色分けするが、公差値ではない。
+                # 黄色扱いにして一般公差の候補とは混同しない。
+                tolerance_range = 1.0
             # Vector-only parentheses occur in several CAD exports.  Do not
             # confuse tolerance glyphs or a descriptor such as ``(二面幅)``
             # with reference-dimension parentheses.
@@ -746,12 +2241,14 @@ def _detect_scanned_dimension_markings(
     ocr_script: Path,
     *,
     include_plain_dimensions: bool = False,
+    rotations: tuple[int, ...] = (0, 90, 270),
+    tiled: bool = False,
 ) -> list[_DetectedDimensionMarking]:
     """Detect explicit dimension+tolerance groups in a raster drawing."""
 
     maximum_dimension = max(page.rect.width, page.rect.height)
     # 小寸法・公差付きの読み取り精度を優先して解像度を上げる
-    zoom = max(3.2, min(4.5, 3600 / maximum_dimension))
+    zoom = max(2.7, min(3.4, 3200 / maximum_dimension))
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(zoom, zoom),
         colorspace=fitz.csRGB,
@@ -897,63 +2394,74 @@ def _detect_scanned_dimension_markings(
     ) as temp_name:
         temp_dir = Path(temp_name)
         jobs: list[dict[str, Any]] = []
-        for rotation in (0, 90, 270):
-            rotated = image if rotation == 0 else image.rotate(rotation, expand=True)
-            image_path = temp_dir / f"marking-{rotation}.png"
-            rotated.save(image_path)
-            jobs.append(
-                {
-                    "rotation": rotation,
-                    "path": image_path,
-                    "tile": None,
-                }
+        if tiled:
+            tile_width = min(image_width, 1800)
+            tile_height = min(image_height, 1400)
+            step_x = max(1, int(tile_width * 0.82))
+            step_y = max(1, int(tile_height * 0.80))
+            x_positions = list(
+                range(0, max(1, image_width - tile_width + 1), step_x)
             )
-
-        # Full-page OCR loses many small dimension strings on image PDFs.  Add
-        # overlapping, enlarged horizontal tiles; the overlap keeps dimensions
-        # near a tile boundary intact.  Vertical dimensions remain covered by
-        # the rotated full-page passes above.
-        tile_width = min(image_width, 1050)
-        tile_height = min(image_height, 760)
-        step_x = max(1, int(tile_width * 0.72))
-        step_y = max(1, int(tile_height * 0.70))
-        x_positions = list(range(0, max(1, image_width - tile_width + 1), step_x))
-        y_positions = list(range(0, max(1, image_height - tile_height + 1), step_y))
-        final_x = max(0, image_width - tile_width)
-        final_y = max(0, image_height - tile_height)
-        if not x_positions or x_positions[-1] != final_x:
-            x_positions.append(final_x)
-        if not y_positions or y_positions[-1] != final_y:
-            y_positions.append(final_y)
-        tile_index = 0
-        for tile_y in y_positions:
-            for tile_x in x_positions:
-                crop = image.crop(
-                    (
-                        tile_x,
-                        tile_y,
-                        min(image_width, tile_x + tile_width),
-                        min(image_height, tile_y + tile_height),
-                    )
-                )
-                resize_factor = min(1.65, max(1.25, 1450 / max(crop.width, 1)))
-                enlarged = crop.resize(
-                    (
-                        max(1, round(crop.width * resize_factor)),
-                        max(1, round(crop.height * resize_factor)),
-                    ),
-                    Image.Resampling.LANCZOS,
-                )
-                image_path = temp_dir / f"tile-{tile_index}.png"
-                enlarged.save(image_path)
+            y_positions = list(
+                range(0, max(1, image_height - tile_height + 1), step_y)
+            )
+            final_x = max(0, image_width - tile_width)
+            final_y = max(0, image_height - tile_height)
+            if not x_positions or x_positions[-1] != final_x:
+                x_positions.append(final_x)
+            if not y_positions or y_positions[-1] != final_y:
+                y_positions.append(final_y)
+            tile_index = 0
+            for rotation in rotations:
+                for tile_y in y_positions:
+                    for tile_x in x_positions:
+                        crop = image.crop(
+                            (
+                                tile_x,
+                                tile_y,
+                                min(image_width, tile_x + tile_width),
+                                min(image_height, tile_y + tile_height),
+                            )
+                        )
+                        prepared = (
+                            crop
+                            if rotation == 0
+                            else crop.rotate(rotation, expand=True)
+                        )
+                        image_path = temp_dir / f"tile-{rotation}-{tile_index}.png"
+                        prepared.save(image_path)
+                        jobs.append(
+                            {
+                                "rotation": rotation,
+                                "path": image_path,
+                                "tile": (
+                                    tile_x,
+                                    tile_y,
+                                    1.0,
+                                    crop.width,
+                                    crop.height,
+                                ),
+                            }
+                        )
+                        tile_index += 1
+        else:
+            for rotation in rotations:
+                rotated = image if rotation == 0 else image.rotate(rotation, expand=True)
+                image_path = temp_dir / f"marking-{rotation}.png"
+                rotated.save(image_path)
                 jobs.append(
                     {
-                        "rotation": 0,
+                        "rotation": rotation,
                         "path": image_path,
-                        "tile": (tile_x, tile_y, resize_factor),
+                        "tile": None,
                     }
                 )
-                tile_index += 1
+
+        # RapidOCR already supplies overlapping high-resolution tiles for
+        # small horizontal text.  Windows OCR is retained as a complementary
+        # orientation pass, chiefly for vertical fit callouts.  Repeating
+        # the same page as dozens of Windows tiles added minutes without enough
+        # independent evidence to justify the cost.
 
         results = _run_windows_ocr_jobs(
             jobs,
@@ -1024,6 +2532,8 @@ def _detect_scanned_dimension_markings(
                     match.group("degree"),
                 )
             tolerance_range = _explicit_tolerance_range(working, nominal)
+            if kind == "limit":
+                tolerance_range = 1.0
             if _PART_NUMBER_PATTERN.search(text) or _PART_NUMBER_PATTERN.search(working):
                 continue
             if (
@@ -1052,20 +2562,10 @@ def _detect_scanned_dimension_markings(
                 )
             ):
                 continue
-            # Plain OCR numbers are too ambiguous for global color coding.
-            # They are still covered by the selected general-tolerance batch.
-            if (
-                tolerance_range is None
-                and not thread_callout
-                and limit_callout is None
-                and not reference
-                and not include_plain_dimensions
-            ):
-                continue
             if tile is None:
                 rect = mapped_rect(words, rotation)
             else:
-                tile_x, tile_y, resize_factor = tile
+                tile_x, tile_y, resize_factor, tile_source_width, tile_source_height = tile
                 pixel_rect = fitz.Rect(
                     min(float(word.get("x") or 0) for word in words),
                     min(float(word.get("y") or 0) for word in words),
@@ -1080,15 +2580,22 @@ def _detect_scanned_dimension_markings(
                         for word in words
                     ),
                 )
+                mapped_tile_rect = _map_rotated_rect(
+                    tuple(pixel_rect),
+                    rotation,
+                    int(tile_source_width * resize_factor),
+                    int(tile_source_height * resize_factor),
+                )
                 rect = fitz.Rect(
-                    (tile_x + pixel_rect.x0 / resize_factor) / scale_x,
-                    (tile_y + pixel_rect.y0 / resize_factor) / scale_y,
-                    (tile_x + pixel_rect.x1 / resize_factor) / scale_x,
-                    (tile_y + pixel_rect.y1 / resize_factor) / scale_y,
+                    (tile_x + mapped_tile_rect[0] / resize_factor) / scale_x,
+                    (tile_y + mapped_tile_rect[1] / resize_factor) / scale_y,
+                    (tile_x + mapped_tile_rect[2] / resize_factor) / scale_x,
+                    (tile_y + mapped_tile_rect[3] / resize_factor) / scale_y,
                 ) & page.rect
+            top_limit = 0.05 if tolerance_range is not None else 0.08
             if (
                 rect.is_empty
-                or rect.y1 < page.rect.height * 0.08
+                or rect.y1 < page.rect.height * top_limit
                 or rect.y0 > page.rect.height * (
                     0.93 if tolerance_range is not None else 0.86
                 )
@@ -1101,17 +2608,50 @@ def _detect_scanned_dimension_markings(
                 )
             ):
                 continue
-            if _is_feature_control_frame(
+            if tolerance_range is not None and _is_dense_table_region(
+                image,
+                rect,
+                scale_x=scale_x,
+                scale_y=scale_y,
+            ):
+                continue
+            if (
+                _FIT_TOLERANCE_PATTERN.search(working)
+                and rect.x0 > page.rect.width * 0.62
+                and rect.y0 > page.rect.height * 0.68
+            ):
+                # 表題欄付近のはめあいは表の読み取りが多く、符号付きでも誤検出になる。
+                continue
+            is_feature_frame = _is_feature_control_frame(
                 image,
                 rect,
                 direction,
                 scale_x=scale_x,
                 scale_y=scale_y,
+            )
+            if is_feature_frame:
+                if re.search(r"[±+\-]", working):
+                    continue
+                if nominal <= 1.0 and re.search(r"[.,]", working):
+                    kind = "geometric"
+                    tolerance_range = nominal
+                else:
+                    continue
+            # Plain OCR numbers are too ambiguous for global color coding.
+            # They are still covered by the selected general-tolerance batch.
+            if (
+                tolerance_range is None
+                and not thread_callout
+                and limit_callout is None
+                and not reference
+                and not include_plain_dimensions
             ):
                 continue
             # 明示公差がある寸法は、OCR枠のずれで括弧・寸法線判定が外れやすい。
             # 素の数値だけ厳密に幾何確認し、公差付きは誤除外を避ける。
-            if not reference and tolerance_range is None:
+            if not reference and (
+                tolerance_range is None or kind == "angle"
+            ):
                 reference = _is_visual_parenthetical(
                     image,
                     rect,
@@ -1129,7 +2669,7 @@ def _detect_scanned_dimension_markings(
                 strict=False,
             ):
                 continue
-            quad = _marking_quad_from_points(
+            quad = _stable_marking_quad(
                 [
                     rect.top_left,
                     rect.top_right,
@@ -1137,14 +2677,7 @@ def _detect_scanned_dimension_markings(
                     rect.bottom_left,
                 ],
                 direction,
-                # Windows OCR often omits the leading diameter glyph from its
-                # word box even though it recognizes the following value.
-                # Extend by roughly one small glyph so φ is painted too.
-                along_expand=max(
-                    1.5,
-                    min(5.0, max(rect.width, rect.height) * 0.07),
-                ),
-                across_inset=max(0.08, min(rect.width, rect.height) * 0.025),
+                rect,
             )
             candidate = _DetectedDimensionMarking(
                 rect=_marking_quad_bounds(quad),
@@ -1195,12 +2728,79 @@ def _detect_local_dimension_markings(
     reference_rects = _ocr_reference_rects(ocr_page)
     for line in ocr_page.lines:
         text = unicodedata.normalize("NFKC", line.text)
+        if re.fullmatch(r"[()（）\[\]【】,，、./:\s]+", text):
+            continue
         if _SURFACE_ROUGHNESS_PATTERN.search(text):
+            roughness_matches = list(_ROUGHNESS_VALUE_PATTERN.finditer(text))
+            rect = fitz.Rect(line.rect) & page.rect
+            width = max(rect.width, 0.1)
+            height = max(rect.height, 0.1)
+            thin = min(width, height)
+            thick = max(width, height)
+            # 引出線のような細い長枠は粗さとして塗らない（長い1行の粗さ列は残す）
+            if thick / thin > 6.0 and thin < 12.0:
+                continue
+            if roughness_matches and not rect.is_empty:
+                text_length = max(len(text), 1)
+                for match in roughness_matches:
+                    try:
+                        roughness_value = float(
+                            match.group(1).replace(",", ".")
+                        )
+                    except ValueError:
+                        continue
+                    if roughness_value <= 0:
+                        continue
+                    if len(roughness_matches) == 1:
+                        quad = _stable_marking_quad(
+                            [fitz.Point(point) for point in line.quad],
+                            line.direction,
+                            rect,
+                        )
+                    else:
+                        start_index, end_index = _roughness_match_span(text, match)
+                        start_ratio = start_index / text_length
+                        end_ratio = end_index / text_length
+                        parent_points = [fitz.Point(point) for point in line.quad]
+                        _a0, _a1, across0, across1, _axis, _normal = _axis_bounds(
+                            parent_points, line.direction
+                        )
+                        thickness = max(across1 - across0, 2.4)
+                        sliced = _slice_ocr_line_quad(
+                            line,
+                            start_ratio,
+                            end_ratio,
+                            # 中点「・」の前後を確実に空ける。隣の粗さ帯が
+                            # 重ならず、記号自体もマーキングしない。
+                            along_inset=min(
+                                46.0,
+                                max(32.0, max(rect.width, rect.height) * 0.18),
+                            ),
+                        )
+                        quad = _quad_same_thickness(
+                            [fitz.Point(point) for point in sliced],
+                            line.direction,
+                            thickness,
+                            along_expand=0.0,
+                        )
+                    detected.append(
+                        _DetectedDimensionMarking(
+                            rect=_marking_quad_bounds(quad),
+                            quad=quad,
+                            direction=line.direction,
+                            source_text=match.group(0),
+                            nominal_value=roughness_value,
+                            kind="roughness",
+                            tolerance_range=roughness_value,
+                            reference=False,
+                        )
+                    )
             continue
         if re.search(r"[（(]", text) or re.search(r"[）)]", text):
-            continue
-        if re.search(r"[ぁ-んァ-ヶ一-龯]", text):
-            continue
+            compact_probe = unicodedata.normalize("NFKC", text).replace(" ", "")
+            # はめあい本体と括弧内公差が1行になった場合は落とさない
+            if not _FIT_TOLERANCE_PATTERN.search(compact_probe):
+                continue
         if re.search(r"M\d", text, re.IGNORECASE):
             continue
         compact = _normalize_raster_dimension_text(text).lstrip("△▲◆◇")
@@ -1208,15 +2808,90 @@ def _detect_local_dimension_markings(
         compact = re.sub(r"^A(?=\d)", "", compact)
         if _PART_NUMBER_PATTERN.search(text) or _PART_NUMBER_PATTERN.search(compact):
             continue
-        if is_tolerance_fragment(text) or is_tolerance_fragment(compact):
-            continue
         limit_callout = _MARKING_LIMIT_PATTERN.fullmatch(compact)
-        if limit_callout is not None:
+        # R0.2以下のような完全一致の上限指示は日本語を含むが、一般注記ではない。
+        # この3種だけは後段の専用候補化へ通し、他の日本語行は従来どおり除外する。
+        if re.search(r"[ぁ-んァ-ヶ一-龯]", text) and limit_callout is None:
+            continue
+        if is_tolerance_fragment(compact) and limit_callout is None:
             continue
         if not compact or (
-            _MARKING_CONTEXT_PATTERN.search(text)
-            or _MARKING_NOTE_CONTEXT_PATTERN.search(text)
+            limit_callout is None
+            and (
+                _MARKING_CONTEXT_PATTERN.search(text)
+                or _MARKING_NOTE_CONTEXT_PATTERN.search(text)
+            )
         ):
+            continue
+        # 「R0.2以下」などは引出線に接していて通常の寸法線判定に
+        # 通らない。文字列が完全一致する個別指示だけは、OCR枠から直接
+        # 黄色候補にする。注記本文・一般の数値には適用しない。
+        if limit_callout is not None:
+            try:
+                nominal = float(limit_callout.group("number").replace(",", "."))
+            except (AttributeError, ValueError):
+                continue
+            rect = fitz.Rect(line.rect) & page.rect
+            if (
+                rect.is_empty
+                or rect.y1 < page.rect.height * 0.05
+                or rect.y0 > page.rect.height * 0.88
+            ):
+                continue
+            direction = line.direction
+            quad = _stable_marking_quad(
+                [fitz.Point(point) for point in line.quad],
+                direction,
+                rect,
+            )
+            detected.append(
+                _DetectedDimensionMarking(
+                    rect=_marking_quad_bounds(quad),
+                    quad=quad,
+                    direction=direction,
+                    source_text=compact,
+                    nominal_value=nominal,
+                    kind=_dimension_marking_kind(
+                        limit_callout.group("prefix"),
+                        "",
+                    ),
+                    tolerance_range=1.0,
+                    reference=False,
+                )
+            )
+            continue
+        small_feature_callout = re.fullmatch(
+            r"(?P<prefix>[RCＲＣ])\s*(?P<number>0[.,]\d+)",
+            compact,
+        )
+        if small_feature_callout is not None and line.score >= 0.82:
+            # 詳細図のC0.3のように、公差だけが注記行へ混ざる小面取り・
+            # 小Rを、独立した文字行として扱う。値と接頭辞が完全な場合のみ。
+            nominal = float(small_feature_callout.group("number").replace(",", "."))
+            rect = fitz.Rect(line.rect) & page.rect
+            if rect.is_empty:
+                continue
+            direction = line.direction
+            quad = _stable_marking_quad(
+                [fitz.Point(point) for point in line.quad],
+                direction,
+                rect,
+            )
+            detected.append(
+                _DetectedDimensionMarking(
+                    rect=_marking_quad_bounds(quad),
+                    quad=quad,
+                    direction=direction,
+                    source_text=compact,
+                    nominal_value=nominal,
+                    kind=_dimension_marking_kind(
+                        small_feature_callout.group("prefix"),
+                        "",
+                    ),
+                    tolerance_range=1.0,
+                    reference=False,
+                )
+            )
             continue
         reference = bool(re.fullmatch(r"[（(].+[）)]", compact))
         working = compact[1:-1] if reference else compact
@@ -1239,17 +2914,103 @@ def _detect_local_dimension_markings(
             continue
         kind = _dimension_marking_kind(match.group("prefix"), match.group("degree"))
         tolerance_range = _explicit_tolerance_range(working, nominal)
-        if tolerance_range is not None and not _is_plausible_tolerance_marking(
-            text,
-            nominal,
-            tolerance_range,
+        if limit_callout is not None:
+            # R0.2以下 / C0.2以下のような個別上限は、一般公差ではないが
+            # 色分け対象として黄色にする。OCRの読取り回数は増やさない。
+            tolerance_range = 1.0
+        elif kind in {"chamfer", "radius"} and nominal <= 1.0:
+            # C0.3 のような小面取り／小Rは、上付き公差が注記へ混ざって
+            # OCRで読めない場合でも、引出線付きの独立寸法として残す。
+            # 後段の寸法線・領域判定を通過したものだけを黄色候補にする。
+            tolerance_range = 1.0
+        joined_tolerance_line: LocalOcrLine | None = None
+        if tolerance_range is None and re.fullmatch(
+            r"[φΦØ⌀RCＲＣ]?\d+(?:[.,]\d+)?",
+            working,
+        ):
+            # 18.7 と +0.05 のように公称値・上付き公差が別OCR行になっても、
+            # 近接する明示公差だけを同じ寸法として戻す。
+            for nearby_line in ocr_page.lines:
+                if nearby_line is line or not _ocr_lines_near(line, nearby_line):
+                    continue
+                fragment = unicodedata.normalize(
+                    "NFKC", nearby_line.text
+                ).replace(" ", "")
+                if not re.fullmatch(r"[±+\-−－]?0(?:[.,]\d+)", fragment):
+                    continue
+                combined = f"{working}{fragment}"
+                combined_range = _explicit_tolerance_range(combined, nominal)
+                if combined_range is None or not _is_plausible_tolerance_marking(
+                    combined,
+                    nominal,
+                    combined_range,
+                ):
+                    continue
+                working = combined
+                tolerance_range = combined_range
+                joined_tolerance_line = nearby_line
+                break
+        rect = fitz.Rect(line.rect) & page.rect
+        direction = line.direction
+        if tolerance_range is not None and _is_dense_table_region(
+            ocr_page.image,
+            rect,
+            scale_x=ocr_page.scale_x,
+            scale_y=ocr_page.scale_y,
+        ):
+            continue
+        if (
+            _FIT_TOLERANCE_PATTERN.search(working)
+            and rect.x0 > page.rect.width * 0.62
+            and rect.y0 > page.rect.height * 0.68
+        ):
+            # 表題欄付近のはめあいは表の読み取りが多く、符号付きでも誤検出になる。
+            continue
+        if (
+            tolerance_range is None
+            and nominal <= 1.0
+            and re.search(r"[.,]", working)
+            and not re.search(r"[/:]", working)
+            and _is_feature_control_frame(
+            ocr_page.image,
+            rect,
+            direction,
+            scale_x=ocr_page.scale_x,
+            scale_y=ocr_page.scale_y,
+            )
+        ):
+            quad = _marking_quad_from_points(
+                [fitz.Point(point) for point in line.quad],
+                direction,
+                along_expand=max(3.0, max(rect.width, rect.height) * 0.35),
+                across_inset=0.0,
+            )
+            detected.append(
+                _DetectedDimensionMarking(
+                    rect=_marking_quad_bounds(quad),
+                    quad=quad,
+                    direction=direction,
+                    source_text=working,
+                    nominal_value=nominal,
+                    kind="geometric",
+                    tolerance_range=nominal,
+                    reference=False,
+                )
+            )
+            continue
+        if (
+            limit_callout is None
+            and tolerance_range is not None
+            and not _is_plausible_tolerance_marking(
+                working,
+                nominal,
+                tolerance_range,
+            )
         ):
             continue
         if tolerance_range is None and not include_plain_dimensions:
             continue
 
-        rect = fitz.Rect(line.rect) & page.rect
-        direction = line.direction
         # 参照寸法 (n) の近傍抑制は、素の数値の重複読み向け。
         # 明示公差付き寸法まで落とすと隣接寸法が欠けるため対象外にする。
         if tolerance_range is None and _overlaps_reference_evidence(
@@ -1257,6 +3018,10 @@ def _detect_local_dimension_markings(
         ):
             continue
         quad_points = [fitz.Point(point) for point in line.quad]
+        if joined_tolerance_line is not None:
+            quad_points.extend(
+                fitz.Point(point) for point in joined_tolerance_line.quad
+            )
         edge_lengths = (
             math.dist(line.quad[0], line.quad[1]),
             math.dist(line.quad[0], line.quad[3]),
@@ -1270,11 +3035,13 @@ def _detect_local_dimension_markings(
             9.0,
             min(page.rect.width, page.rect.height) * thickness_ratio,
         )
-        # 公差付きは表題欄付近にも実寸法があるため、下端除外を緩める
+        # 公差付きは表題欄付近にも実寸法があるため、上下端の除外を緩める。
+        # 詳細図の小さな片側公差がページ上端 8% 付近に置かれることがある。
+        top_limit = 0.05 if tolerance_range is not None else 0.08
         bottom_limit = 0.93 if tolerance_range is not None else 0.86
         if (
             rect.is_empty
-            or rect.y1 < page.rect.height * 0.08
+            or rect.y1 < page.rect.height * top_limit
             or rect.y0 > page.rect.height * bottom_limit
             or rect.width > page.rect.width * 0.34
             or rect.height > page.rect.height * 0.25
@@ -1297,7 +3064,9 @@ def _detect_local_dimension_markings(
         ):
             continue
         # 明示公差がある寸法は、OCR枠ずれで括弧誤判定しやすいため幾何括弧判定をスキップ
-        if not reference and tolerance_range is None:
+        if not reference and (
+            tolerance_range is None or kind == "angle"
+        ):
             if _is_visual_parenthetical(
                 ocr_page.image,
                 rect,
@@ -1320,8 +3089,11 @@ def _detect_local_dimension_markings(
         if scanned_page and not has_line_support:
             # 公差付きで信頼度が高い場合は寸法線欠落での誤除外を避ける
             if not (
-                tolerance_range is not None
-                and line.score >= 0.85
+                limit_callout is not None
+                or (
+                    tolerance_range is not None
+                    and line.score >= 0.85
+                )
             ):
                 continue
         if scanned_page and tolerance_range is None and line.score < 0.72:
@@ -1338,12 +3110,20 @@ def _detect_local_dimension_markings(
             # Isolated 1/2/3 are usually view labels, note numbers, or table
             # cells in scanned drawings rather than actual dimensions.
             continue
-        quad = _marking_quad_from_points(
+        quad = _stable_marking_quad(
             quad_points,
             direction,
-            along_expand=max(1.5, min(5.0, max(rect.width, rect.height) * 0.07)),
-            across_inset=max(0.08, min(rect.width, rect.height) * 0.025),
+            rect,
         )
+        if kind == "chamfer":
+            # C0.1 等だけは文字のすぐ下の寸法線をOCR枠へ含みやすい。
+            # 通常寸法へ影響させず、直交方向だけを締める。
+            quad = _marking_quad_from_points(
+                quad_points,
+                direction,
+                along_expand=max(2.0, min(4.0, min(rect.width, rect.height) * 0.35)),
+                across_inset=max(0.18, min(rect.width, rect.height) * 0.15),
+            )
         candidate = _DetectedDimensionMarking(
             rect=_marking_quad_bounds(quad),
             quad=quad,
@@ -1354,16 +3134,183 @@ def _detect_local_dimension_markings(
             tolerance_range=tolerance_range,
             reference=reference,
         )
+        if _FIT_TOLERANCE_PATTERN.search(working):
+            if _fit_line_is_columnar(line):
+                base_points = [fitz.Point(point) for point in candidate.quad]
+                along0, along1, across0, across1, axis, normal = _axis_bounds(
+                    base_points, _fit_line_axis(line)
+                )
+                # g6/H7本体は縦寸法線を含んだOCR枠になりやすい。文字長との
+                # 比率で幅を上限化し、隣の黄色寸法へ食い込ませない。
+                thickness = min(
+                    across1 - across0,
+                    max(8.0, (along1 - along0) * 0.26),
+                )
+                center = (across0 + across1) / 2
+                body_quad = _quad_from_axis_bounds(
+                    along0,
+                    along1,
+                    center - thickness / 2,
+                    center + thickness / 2,
+                    axis,
+                    normal,
+                )
+                candidate = replace(
+                    candidate,
+                    rect=_marking_quad_bounds(body_quad),
+                    quad=body_quad,
+                )
+            owner_lines = tuple(
+                other
+                for other in ocr_page.lines
+                if _is_dimension_owner_line(other.text)
+            )
+            original_rect = fitz.Rect(candidate.rect)
+            cluster: list[LocalOcrLine] = []
+            for nearby_line in ocr_page.lines:
+                if nearby_line is line:
+                    continue
+                if not _is_fit_cluster_line(nearby_line.text):
+                    continue
+                if _fit_owns_parenthetical(line, nearby_line, owner_lines):
+                    cluster.append(nearby_line)
+            changed = True
+            while changed:
+                changed = False
+                for nearby_line in ocr_page.lines:
+                    if nearby_line is line or nearby_line in cluster:
+                        continue
+                    if not _is_fit_cluster_line(nearby_line.text):
+                        continue
+                    if not any(
+                        _ocr_lines_near(nearby_line, owned) for owned in cluster
+                    ):
+                        continue
+                    stolen = False
+                    for other in owner_lines:
+                        if other is line:
+                            continue
+                        if _fit_owns_parenthetical(
+                            other, nearby_line, owner_lines
+                        ):
+                            stolen = True
+                            break
+                    if stolen:
+                        continue
+                    cluster.append(nearby_line)
+                    changed = True
+            after_points: list[fitz.Point] = []
+            beside_points: list[fitz.Point] = []
+            default_side = (
+                "beside" if _fit_line_is_columnar(line) else "after"
+            )
+            for owned in cluster:
+                ownership = (
+                    _fit_owns_parenthetical(line, owned, owner_lines)
+                    or default_side
+                )
+                nearby_points = [
+                    fitz.Point(point) for point in owned.quad
+                ]
+                if ownership == "after":
+                    after_points.extend(nearby_points)
+                else:
+                    beside_points.extend(nearby_points)
+            neighbor_rects = [
+                fitz.Rect(other.rect)
+                for other in owner_lines
+                if other is not line
+            ]
+            if after_points:
+                fit_axis = _fit_line_axis(line)
+                fit_quad = _extend_along_keep_across(
+                    [fitz.Point(point) for point in candidate.quad],
+                    after_points,
+                    fit_axis,
+                    along_expand=0.8,
+                )
+                expanded_rect = fitz.Rect(_marking_quad_bounds(fit_quad))
+                extra_across = (
+                    expanded_rect.width - original_rect.width
+                    if abs(fit_axis[1]) >= 0.72
+                    else expanded_rect.height - original_rect.height
+                )
+                covers_neighbor = any(
+                    (expanded_rect & neighbor).get_area()
+                    >= 0.35 * neighbor.get_area()
+                    for neighbor in neighbor_rects
+                    if neighbor.get_area() > 0
+                )
+                if extra_across <= 6.0 and not covers_neighbor:
+                    candidate = replace(
+                        candidate,
+                        rect=_marking_quad_bounds(fit_quad),
+                        quad=fit_quad,
+                    )
+                else:
+                    beside_points.extend(after_points)
+            if beside_points:
+                _b0, _b1, across0, across1, _ax, _nm = _axis_bounds(
+                    [fitz.Point(point) for point in candidate.quad],
+                    _fit_line_axis(line),
+                )
+                thickness = max(across1 - across0, 2.8)
+                beside_quad = _quad_same_thickness(
+                    beside_points,
+                    _fit_line_axis(line),
+                    thickness,
+                    along_expand=0.5,
+                )
+                candidate = replace(
+                    candidate,
+                    tolerance_rect=_marking_quad_bounds(beside_quad),
+                    tolerance_quad=beside_quad,
+                )
+            # 縦の g6/H7 は括弧内偏差が本体の直前へ並ぶ。小さい括弧や
+            # 符号をOCRが落としても、文字高と同じ幅の短い別帯を確保する。
+            # 横方向へは広げないため、隣の黄色寸法を覆わない。
+            if (
+                candidate.tolerance_quad is None
+                and _fit_line_is_columnar(line)
+                and re.search(r"[gG]\s*\d{1,2}", working)
+            ):
+                fit_axis = _fit_line_axis(line)
+                base_points = [fitz.Point(point) for point in candidate.quad]
+                along0, along1, across0, across1, axis, normal = _axis_bounds(
+                    base_points, fit_axis
+                )
+                span = along1 - along0
+                tolerance_quad = _quad_from_axis_bounds(
+                    along0 - min(32.0, max(16.0, span * 0.78)),
+                    along0 - 0.8,
+                    across0,
+                    across1,
+                    axis,
+                    normal,
+                )
+                candidate = replace(
+                    candidate,
+                    tolerance_rect=_marking_quad_bounds(tolerance_quad),
+                    tolerance_quad=tolerance_quad,
+                )
         candidate_rect = fitz.Rect(candidate.rect)
         candidate_quality = _marking_ocr_quality(working, line.score)
         overlapped = False
         for index, existing in enumerate(detected):
             existing_rect = fitz.Rect(existing.rect)
             overlap_area = (candidate_rect & existing_rect).get_area()
+            same_nominal = (
+                abs(existing.nominal_value - candidate.nominal_value) < 1e-6
+                and existing.kind == candidate.kind
+            )
+            same_text = (
+                unicodedata.normalize("NFKC", existing.source_text).replace(" ", "")
+                == unicodedata.normalize("NFKC", working).replace(" ", "")
+            )
             if overlap_area < 0.45 * min(
                 candidate_rect.get_area(),
                 existing_rect.get_area(),
-            ):
+            ) or not (same_nominal or same_text):
                 continue
             overlapped = True
             existing_quality = _marking_ocr_quality(existing.source_text, 0.0)
@@ -1374,6 +3321,13 @@ def _detect_local_dimension_markings(
         if overlapped:
             continue
         detected.append(candidate)
+    detected = _separate_overlapping_roughness(
+        _merge_nearby_same_callout(
+            _merge_fragmented_roughness(
+                _merge_detected_markings([], detected, extra_score=0.8)
+            )
+        )
+    )
     return sorted(detected, key=lambda item: (item.rect[1], item.rect[0]))
 
 
@@ -1564,6 +3518,9 @@ class DrawingApi:
         ] = {}
         self.local_ocr_cache: dict[int, LocalOcrPage] = {}
         self.scanned_tile_cache: dict[int, tuple[LocalOcrLine, ...]] = {}
+        self.enriched_ocr_cache: dict[int, LocalOcrPage] = {}
+        self.vertical_ocr_cache: dict[int, tuple[LocalOcrLine, ...]] = {}
+        self.incomplete_dimension_ocr_cache: dict[int, tuple[LocalOcrLine, ...]] = {}
         self.lock = RLock()
         self.upload_directory = tempfile.TemporaryDirectory(
             prefix="DrawingAssist-"
@@ -1603,14 +3560,19 @@ class DrawingApi:
             return None
         if not _needs_local_ocr(page):
             return base
+        cached = self.enriched_ocr_cache.get(self.page_index)
+        if cached is not None:
+            return cached
         tiles = self.scanned_tile_cache.get(self.page_index)
         if tiles is None:
             try:
-                tiles = analyze_scanned_page_tiles(page)
+                tiles = analyze_scanned_page_tiles(page, fast=True)
                 self.scanned_tile_cache[self.page_index] = tiles
             except Exception:
                 tiles = ()
-        return enrich_scanned_ocr_page(base, tiles)
+        cached = enrich_scanned_ocr_page(base, tiles)
+        self.enriched_ocr_cache[self.page_index] = cached
+        return cached
 
     def _collect_scanned_dimension_markings(
         self,
@@ -1620,9 +3582,36 @@ class DrawingApi:
     ) -> list[_DetectedDimensionMarking]:
         """画像PDFの色分け候補をページ/タイル/Windows OCRから収集する。"""
 
+        cached = self.scanned_marking_cache.get(self.page_index)
+        if cached is not None:
+            if recorder is not None:
+                recorder.set_count("cached_markings", len(cached))
+            return list(cached)
         scanned_detected: list[_DetectedDimensionMarking] = []
         page_ocr = self._shared_local_ocr(page)
         if page_ocr is not None:
+            incomplete_lines = self.incomplete_dimension_ocr_cache.get(self.page_index)
+            if incomplete_lines is None:
+                try:
+                    incomplete_lines = analyze_incomplete_dimension_regions(page, page_ocr)
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "不完全な横寸法の追加OCRに失敗しました: %s", exc
+                    )
+                    incomplete_lines = ()
+                self.incomplete_dimension_ocr_cache[self.page_index] = incomplete_lines
+            if incomplete_lines:
+                page_ocr = LocalOcrPage(
+                    width=page_ocr.width,
+                    height=page_ocr.height,
+                    scale_x=page_ocr.scale_x,
+                    scale_y=page_ocr.scale_y,
+                    image=page_ocr.image,
+                    # 局所再OCRで完成した行だけを追記する。ページ全体の
+                    # OCR行を再結合すると、既存の縦寸法断片まで統合されて
+                    # 候補数が減るため、元の観測行は変更しない。
+                    lines=(*page_ocr.lines, *incomplete_lines),
+                )
             page_detected = _detect_local_dimension_markings(
                 page,
                 page_ocr,
@@ -1636,13 +3625,53 @@ class DrawingApi:
         tiles = self.scanned_tile_cache.get(self.page_index)
         if tiles is None:
             try:
-                tiles = analyze_scanned_page_tiles(page)
+                tiles = analyze_scanned_page_tiles(page, fast=True)
                 self.scanned_tile_cache[self.page_index] = tiles
             except Exception:
                 tiles = ()
         if tiles:
             if page_ocr is not None:
-                ocr_for_tiles = enrich_scanned_ocr_page(page_ocr, tiles)
+                horizontal_ocr = self._enriched_local_ocr(page)
+                if horizontal_ocr is None:
+                    horizontal_ocr = page_ocr
+                vertical_seed_ocr = LocalOcrPage(
+                    width=page_ocr.width,
+                    height=page_ocr.height,
+                    scale_x=page_ocr.scale_x,
+                    scale_y=page_ocr.scale_y,
+                    image=page_ocr.image,
+                    # Keep raw page/tile directions. The tolerance-line
+                    # merger intentionally normalizes nearby fragments and
+                    # can otherwise erase the vertical-cluster evidence.
+                    lines=(*page_ocr.lines, *tiles),
+                )
+                vertical_lines = self.vertical_ocr_cache.get(self.page_index)
+                if vertical_lines is None:
+                    try:
+                        vertical_lines = analyze_vertical_dimension_regions(
+                            page,
+                            vertical_seed_ocr,
+                        )
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "縦寸法の追加OCRに失敗しました: %s",
+                            exc,
+                        )
+                        vertical_lines = ()
+                    self.vertical_ocr_cache[self.page_index] = vertical_lines
+                # Keep adjacent vertical fit callouts as independent lines.
+                # Generic OCR-line merging can otherwise collapse, for example,
+                # two neighbouring g6 dimensions into one wider candidate.
+                # 縦列内の公差・小数点断片だけは結合する（OCRは増やさない）。
+                vertical_joined = join_split_dimension_ocr_lines(vertical_lines)
+                ocr_for_tiles = LocalOcrPage(
+                    width=horizontal_ocr.width,
+                    height=horizontal_ocr.height,
+                    scale_x=horizontal_ocr.scale_x,
+                    scale_y=horizontal_ocr.scale_y,
+                    image=horizontal_ocr.image,
+                    lines=(*horizontal_ocr.lines, *vertical_joined),
+                )
             else:
                 ocr_for_tiles = build_tile_ocr_page(page, tiles)
             tile_detected = _detect_local_dimension_markings(
@@ -1659,14 +3688,24 @@ class DrawingApi:
             if recorder is not None:
                 recorder.set_count("tile_markings", len(tile_detected))
 
-        try:
-            windows_detected = _detect_scanned_dimension_markings(
-                page,
-                _resource_path("windows_ocr.ps1"),
-                include_plain_dimensions=False,
-            )
-        except (OSError, subprocess.SubprocessError, ValueError):
+        vertical_evidence = [
+            marking
+            for marking in scanned_detected
+            if abs(marking.direction[1]) >= 0.72
+            and marking.tolerance_range is not None
+        ]
+        if page_ocr is not None and len(vertical_evidence) >= 2:
             windows_detected = []
+        else:
+            try:
+                windows_detected = _detect_scanned_dimension_markings(
+                    page,
+                    _resource_path("windows_ocr.ps1"),
+                    include_plain_dimensions=False,
+                    rotations=(270,) if page_ocr is not None else (0, 90, 270),
+                )
+            except (OSError, subprocess.SubprocessError, ValueError):
+                windows_detected = []
         scanned_detected = _merge_detected_markings(
             scanned_detected,
             windows_detected,
@@ -1675,7 +3714,44 @@ class DrawingApi:
         if recorder is not None:
             recorder.set_count("windows_markings", len(windows_detected))
             recorder.set_count("merged_markings", len(scanned_detected))
-        return scanned_detected
+        unique: list[_DetectedDimensionMarking] = []
+        seen: set[tuple[str, str, tuple[float, float, float, float]]] = set()
+        for marking in scanned_detected:
+            key = (
+                marking.kind,
+                unicodedata.normalize("NFKC", marking.source_text).replace(" ", ""),
+                tuple(round(value, 1) for value in marking.rect),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(marking)
+        filtered: list[_DetectedDimensionMarking] = []
+        for marking in unique:
+            compact = unicodedata.normalize("NFKC", marking.source_text).replace(" ", "")
+            marking_rect = fitz.Rect(marking.rect)
+            marking_center = marking_rect.tl + (marking_rect.br - marking_rect.tl) / 2
+            truncated_duplicate = False
+            for other in unique:
+                if other is marking:
+                    continue
+                other_compact = unicodedata.normalize("NFKC", other.source_text).replace(" ", "")
+                if len(other_compact) < len(compact) + 2 or not other_compact.endswith(compact):
+                    continue
+                other_rect = fitz.Rect(other.rect)
+                other_center = other_rect.tl + (other_rect.br - other_rect.tl) / 2
+                if math.dist(marking_center, other_center) <= 58.0:
+                    truncated_duplicate = True
+                    break
+            if not truncated_duplicate:
+                filtered.append(marking)
+        result = _merge_nearby_same_callout(
+            _merge_fragmented_roughness(filtered)
+        )
+        # 同一ページで候補の再描画・反映を行ってもOCRとタイル解析を
+        # 再実行しない。PDF読込時にキャッシュを消すため、検出結果は変わらない。
+        self.scanned_marking_cache[self.page_index] = tuple(result)
+        return result
 
     def drawing_assist_command(
         self,
@@ -2308,6 +4384,9 @@ class DrawingApi:
             self.scanned_marking_cache.clear()
             self.local_ocr_cache.clear()
             self.scanned_tile_cache.clear()
+            self.enriched_ocr_cache.clear()
+            self.vertical_ocr_cache.clear()
+            self.incomplete_dimension_ocr_cache.clear()
             return self._state(
                 "PDFを読み込みました。使いたいツールを選んで図面をクリックしてください。"
             )
@@ -3938,16 +6017,6 @@ class DrawingApi:
                     for candidate in self.last_general_tolerance_batch
                 ]
 
-            def color_for(kind: str, total_range: float | None) -> str:
-                if total_range is None:
-                    return "#ffff00"
-                limit = 1.0 if kind == "angle" else 0.03
-                return (
-                    "#ff33cc"
-                    if total_range <= limit + 1e-9
-                    else "#ffff00"
-                )
-
             def matching_general_candidate(
                 marking: _DetectedDimensionMarking,
             ) -> GeneralToleranceCandidate | None:
@@ -3983,6 +6052,7 @@ class DrawingApi:
                 rect: tuple[float, float, float, float],
                 color: str,
                 quad: tuple[tuple[float, float], ...] | None,
+                kind: str,
             ) -> None:
                 new_rect = fitz.Rect(rect)
                 if new_rect.is_empty:
@@ -3997,11 +6067,12 @@ class DrawingApi:
                     ):
                         return
                 entries.append(
-                    DimensionMarkingEntry(rect, color, 0.42, quad)
+                    DimensionMarkingEntry(rect, color, 0.42, quad, kind)
                 )
 
             marked_dimension_count = 0
             matched_markings: dict[int, _DetectedDimensionMarking] = {}
+            explicit_general_candidates: set[int] = set()
             for marking in detected:
                 # Reference dimensions in parentheses are informational and
                 # must never be part of the automatic marking batch.
@@ -4030,6 +6101,29 @@ class DrawingApi:
                     and marking.tolerance_range is None
                 ):
                     continue
+                explicit_range = marking.tolerance_range
+                if explicit_range is None:
+                    explicit_range = _explicit_tolerance_range(
+                        marking.source_text,
+                        marking.nominal_value,
+                    )
+                # 明示公差は一般公差の追加対象にしない。二重処理により
+                # 黄色の実公差へ別色の小帯が混ざることを防ぐ。
+                if matched is not None and explicit_range is not None:
+                    color = _marking_highlight_color(
+                        marking.kind,
+                        explicit_range,
+                    )
+                    for paint_rect, paint_quad in _marking_paint_parts(marking):
+                        append_entry(
+                            paint_rect,
+                            color,
+                            paint_quad,
+                            "fit" if _FIT_TOLERANCE_PATTERN.search(marking.source_text) else marking.kind,
+                        )
+                    explicit_general_candidates.add(id(matched))
+                    marked_dimension_count += 1
+                    continue
                 # Batch candidates are appended below as one continuous quad
                 # spanning the nominal and newly added tolerance. This also
                 # guarantees the nominal is marked if the broader detector
@@ -4041,24 +6135,14 @@ class DrawingApi:
                     matched_markings.setdefault(id(matched), marking)
                     continue
                 total_range = marking.tolerance_range
-                color = color_for(marking.kind, total_range)
-                if marking.tolerance_rect and marking.tolerance_quad:
-                    joined_quad = _marking_quad_from_points(
-                        [
-                            fitz.Point(point)
-                            for point in (*marking.quad, *marking.tolerance_quad)
-                        ],
-                        marking.direction,
-                        along_expand=0.04,
-                        across_inset=0.08,
-                    )
+                color = _marking_highlight_color(marking.kind, total_range)
+                for paint_rect, paint_quad in _marking_paint_parts(marking):
                     append_entry(
-                        _marking_quad_bounds(joined_quad),
+                        paint_rect,
                         color,
-                        joined_quad,
+                        paint_quad,
+                        "fit" if _FIT_TOLERANCE_PATTERN.search(marking.source_text) else marking.kind,
                     )
-                else:
-                    append_entry(marking.rect, color, marking.quad)
                 marked_dimension_count += 1
 
             def text_kind_and_range(
@@ -4161,8 +6245,9 @@ class DrawingApi:
                 label_rect = dimension_label_rect(dimension)
                 append_entry(
                     tuple(label_rect),
-                    color_for(kind, total_range),
+                    _marking_highlight_color(kind, total_range),
                     None,
+                    kind,
                 )
                 marked_dimension_count += 1
 
@@ -4180,8 +6265,9 @@ class DrawingApi:
                 quad = replacement_marker_quad(replacement)
                 append_entry(
                     _marking_quad_bounds(quad),
-                    color_for(kind, total_range),
+                    _marking_highlight_color(kind, total_range),
                     quad,
+                    kind,
                 )
                 marked_dimension_count += 1
 
@@ -4191,7 +6277,9 @@ class DrawingApi:
                 self.last_general_tolerance_batch,
                 additions,
             ):
-                color = color_for(
+                if id(candidate) in explicit_general_candidates:
+                    continue
+                color = _marking_highlight_color(
                     candidate.kind,
                     candidate.tolerance * 2,
                 )
@@ -4211,21 +6299,71 @@ class DrawingApi:
                         candidate_rect.bottom_left,
                     )
                 )
-                joined_quad = _marking_quad_from_points(
-                    [
-                        fitz.Point(point)
-                        for point in (*nominal_quad, *tolerance_quad)
-                    ],
-                    candidate.direction,
-                    along_expand=0.04,
-                    across_inset=0.08,
+                nominal_points = [fitz.Point(point) for point in nominal_quad]
+                extra_points = [fitz.Point(point) for point in tolerance_quad]
+                _n0, _n1, across0, across1, _axis, _normal = _axis_bounds(
+                    nominal_points, candidate.direction
                 )
-                append_entry(
-                    _marking_quad_bounds(joined_quad),
-                    color,
-                    joined_quad,
+                thickness = max(across1 - across0, 2.8)
+                extra_along0, extra_along1, extra_across0, extra_across1, _ea, _en = (
+                    _axis_bounds(extra_points, candidate.direction)
                 )
+                across_shift = abs(
+                    ((extra_across0 + extra_across1) / 2)
+                    - ((across0 + across1) / 2)
+                )
+                if across_shift <= 6.0:
+                    joined_quad = _extend_along_keep_across(
+                        nominal_points,
+                        extra_points,
+                        candidate.direction,
+                        along_expand=0.6,
+                    )
+                    append_entry(
+                        _marking_quad_bounds(joined_quad),
+                        color,
+                        joined_quad,
+                        candidate.kind,
+                    )
+                else:
+                    append_entry(
+                        _marking_quad_bounds(
+                            _quad_same_thickness(
+                                nominal_points,
+                                candidate.direction,
+                                thickness,
+                                along_expand=0.4,
+                            )
+                        ),
+                        color,
+                        _quad_same_thickness(
+                            nominal_points,
+                            candidate.direction,
+                            thickness,
+                            along_expand=0.4,
+                        ),
+                        candidate.kind,
+                    )
+                    extra_quad = _quad_same_thickness(
+                        extra_points,
+                        candidate.direction,
+                        thickness,
+                        along_expand=0.4,
+                    )
+                    append_entry(
+                        _marking_quad_bounds(extra_quad),
+                        color,
+                        extra_quad,
+                        candidate.kind,
+                    )
                 marked_dimension_count += 1
+            ocr_page = self.local_ocr_cache.get(self.page_index)
+            entries = _unify_dimension_marking_entries(
+                entries,
+                image=ocr_page.image if ocr_page is not None else None,
+                scale_x=ocr_page.scale_x if ocr_page is not None else 1.0,
+                scale_y=ocr_page.scale_y if ocr_page is not None else 1.0,
+            )
             marking_recorder.set_count("matched_batch", len(matched_markings))
             marking_recorder.set_count("colored_entries", len(entries))
             marking_recorder.log_summary()
@@ -4251,6 +6389,7 @@ class DrawingApi:
                     entry.color,
                     entry.opacity,
                     entry.quad,
+                    entry.kind,
                     selected=True,
                 )
                 for entry in entries
@@ -4334,6 +6473,7 @@ class DrawingApi:
                     candidate.color,
                     candidate.opacity,
                     candidate.quad,
+                    candidate.kind,
                 )
                 for candidate in selected
             )
@@ -6040,9 +8180,50 @@ def main() -> None:
     webview.start(gui="edgechromium", private_mode=False)
 
 
+def _diagnose_detail_ocr(pdf_path: Path, result_path: Path) -> None:
+    """Record packaged detail-crop OCR results without opening the UI."""
+
+    document = fitz.open(pdf_path)
+    try:
+        page = document[0]
+        base = analyze_page(page, scanned=True)
+        detail_lines = analyze_detail_angles(page, base)
+        payload = {
+            "ok": True,
+            "build_id": APP_BUILD_ID,
+            "page_rect": list(page.rect),
+            "detail_lines": [
+                {
+                    "text": line.text,
+                    "score": line.score,
+                    "agreement_count": line.agreement_count,
+                    "rect": list(line.rect),
+                }
+                for line in detail_lines
+            ],
+        }
+    except Exception as exc:
+        payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        raise
+    finally:
+        document.close()
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
 if __name__ == "__main__":
     freeze_support()
-    if "--self-test" in sys.argv:
+    if "--diagnose-detail-ocr" in sys.argv:
+        diagnose_index = sys.argv.index("--diagnose-detail-ocr")
+        result_index = sys.argv.index("--result")
+        _diagnose_detail_ocr(
+            Path(sys.argv[diagnose_index + 1]).resolve(),
+            Path(sys.argv[result_index + 1]).resolve(),
+        )
+    elif "--self-test" in sys.argv:
         test_index = sys.argv.index("--self-test")
         result_index = sys.argv.index("--result")
         preview_index = sys.argv.index("--preview")
