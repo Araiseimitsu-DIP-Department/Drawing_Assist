@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 from typing import Iterable, TypeAlias
+import unicodedata
 
 import fitz
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
@@ -1555,6 +1556,7 @@ def find_text_group(
     along_gap: float = 10.0,
     normal_gap: float = 1.75,
     text_lines: list[dict[str, object]] | None = None,
+    include_stacked_tolerance: bool = False,
 ) -> TextHit | None:
     """Select one dimension group, including prefixes and tolerance symbols.
 
@@ -1693,6 +1695,82 @@ def find_text_group(
             <= normal_gap
         ):
             group_indexes.add(index)
+
+    if include_stacked_tolerance:
+        # CAD の片側・上下公差は、公称値と同じ行ではなく、末尾の上下へ
+        # 小さい文字で分かれて配置されることがある。編集時の通常選択には
+        # 影響させず、寸法検出だけが明示指定した場合に限って結合する。
+        signed_indexes: list[int] = []
+        tolerance_pattern = re.compile(
+            r"^[+\-−－±](?:0(?:[.,]\d+)?|[.,]\d+)$"
+        )
+        zero_pattern = re.compile(r"^0(?:[.,]0+)?$")
+        for index, candidate in enumerate(lines):
+            if index in group_indexes:
+                continue
+            candidate_direction = candidate["direction"]
+            assert isinstance(candidate_direction, tuple)
+            if abs(
+                candidate_direction[0] * direction[0]
+                + candidate_direction[1] * direction[1]
+            ) < 0.985:
+                continue
+            candidate_text = unicodedata.normalize(
+                "NFKC", str(candidate["text"])
+            ).replace(" ", "")
+            if not tolerance_pattern.fullmatch(candidate_text):
+                continue
+            candidate_size = float(candidate["size"])
+            if candidate_size > selected_size * 0.82:
+                continue
+            candidate_rect = candidate["rect"]
+            assert isinstance(candidate_rect, fitz.Rect)
+            candidate_along = _projection_interval(candidate_rect, direction)
+            candidate_normal = _projection_interval(candidate_rect, normal)
+            if (
+                candidate_along[1] < selected_midpoint - selected_size * 0.25
+                or candidate_along[0] > selected_along[1] + selected_size * 1.9
+                or _interval_gap(candidate_normal, selected_normal)
+                > selected_size * 2.8 + 3.0
+            ):
+                continue
+            group_indexes.add(index)
+            signed_indexes.append(index)
+
+        # 下側の 0 は、それ単体では通常の別寸法と区別できない。上側または
+        # 下側の符号付き公差を同じ位置に確認できたときだけ追加する。
+        for index, candidate in enumerate(lines):
+            if not signed_indexes or index in group_indexes:
+                continue
+            candidate_text = unicodedata.normalize(
+                "NFKC", str(candidate["text"])
+            ).replace(" ", "")
+            if not zero_pattern.fullmatch(candidate_text):
+                continue
+            candidate_direction = candidate["direction"]
+            assert isinstance(candidate_direction, tuple)
+            if abs(
+                candidate_direction[0] * direction[0]
+                + candidate_direction[1] * direction[1]
+            ) < 0.985 or float(candidate["size"]) > selected_size * 0.82:
+                continue
+            candidate_rect = candidate["rect"]
+            assert isinstance(candidate_rect, fitz.Rect)
+            candidate_along = _projection_interval(candidate_rect, direction)
+            candidate_normal = _projection_interval(candidate_rect, normal)
+            for signed_index in signed_indexes:
+                signed_rect = lines[signed_index]["rect"]
+                assert isinstance(signed_rect, fitz.Rect)
+                signed_along = _projection_interval(signed_rect, direction)
+                signed_normal = _projection_interval(signed_rect, normal)
+                if (
+                    _interval_gap(candidate_along, signed_along)
+                    <= selected_size * 1.35 + 2.0
+                    and _interval_gap(candidate_normal, signed_normal)
+                    <= selected_size * 2.6 + 3.0
+                ):
+                    group_indexes.add(index)
+                    break
 
     group_rect = fitz.Rect(lines[selected_index]["rect"])
     visible_group_rect = fitz.Rect(lines[selected_index]["rect"])

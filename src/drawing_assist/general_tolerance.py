@@ -1744,6 +1744,60 @@ def _native_text_candidates(
         )
     )
     candidates: list[GeneralToleranceCandidate] = []
+
+    def has_feature_control_index(
+        rect: fitz.Rect,
+        direction: tuple[float, float],
+        font_size: float,
+    ) -> bool:
+        """幾何公差枠の直前にある小さい管理番号を確認する。"""
+
+        axis = fitz.Point(direction)
+        axis /= math.hypot(axis.x, axis.y) or 1.0
+        normal = fitz.Point(-axis.y, axis.x)
+
+        def interval(box: fitz.Rect, vector: fitz.Point) -> tuple[float, float]:
+            values = [
+                point.x * vector.x + point.y * vector.y
+                for point in (
+                    box.top_left,
+                    box.top_right,
+                    box.bottom_right,
+                    box.bottom_left,
+                )
+            ]
+            return (min(values), max(values))
+
+        def gap(left: tuple[float, float], right: tuple[float, float]) -> float:
+            return max(0.0, max(left[0], right[0]) - min(left[1], right[1]))
+
+        target_along = interval(rect, axis)
+        target_normal = interval(rect, normal)
+        for line in text_lines:
+            marker_text = unicodedata.normalize(
+                "NFKC", str(line["text"])
+            ).strip()
+            if not re.fullmatch(r"[1-9]", marker_text):
+                continue
+            if float(line["size"]) > font_size * 0.78:
+                continue
+            marker_direction = line["direction"]
+            assert isinstance(marker_direction, tuple)
+            if abs(
+                marker_direction[0] * axis.x + marker_direction[1] * axis.y
+            ) < 0.985:
+                continue
+            marker_rect = line["rect"]
+            assert isinstance(marker_rect, fitz.Rect)
+            marker_along = interval(marker_rect, axis)
+            marker_normal = interval(marker_rect, normal)
+            if (
+                0 <= target_along[0] - marker_along[1] <= font_size * 0.62
+                and gap(marker_normal, target_normal) <= font_size * 0.45
+            ):
+                return True
+        return False
+
     for block in page.get_text("rawdict").get("blocks", []):
         for line in block.get("lines", []):
             spans = line.get("spans") or []
@@ -1798,12 +1852,6 @@ def _native_text_candidates(
                 or core_rect.y0 > page.rect.height * 0.82
             ):
                 continue
-            font_size = max(
-                (float(span.get("size") or 0) for span in spans),
-                default=expected_size,
-            )
-            if not expected_size * 0.74 <= font_size <= expected_size * 1.13:
-                continue
             direction_value = line.get("dir") or (1.0, 0.0)
             direction = (float(direction_value[0]), float(direction_value[1]))
             core_quad_points: list[fitz.Point] = []
@@ -1827,6 +1875,33 @@ def _native_text_candidates(
                         )
                     )
             core_quad = _oriented_quad(core_quad_points, direction)
+            font_size = max(
+                (float(span.get("size") or 0) for span in spans),
+                default=expected_size,
+            )
+            small_decimal = (
+                not prefix
+                and not degree
+                and 0 < nominal < 1
+                and "." in match.group("number").replace(",", ".")
+            )
+            normal_size = expected_size * 0.74 <= font_size <= expected_size * 1.13
+            # 幾何公差などの小数値は通常寸法より小さい書体で描かれる。
+            # 寸法線の支持が確認できる小数だけを許可し、注記の数値は拾わない。
+            if not normal_size and not (
+                small_decimal
+                and expected_size * 0.56 <= font_size <= expected_size * 1.13
+                and _has_dimension_line_support(
+                    image,
+                    core_rect,
+                    direction,
+                    _candidate_kind(prefix, degree) or "linear",
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                    strict=True,
+                )
+            ):
+                continue
             if not suffix and _is_visual_parenthetical(
                 image,
                 core_rect,
@@ -1834,12 +1909,37 @@ def _native_text_candidates(
                 scale_x=scale_x,
                 scale_y=scale_y,
             ):
-                continue
+                # 幾何公差記号の近くにある 0.12 等は、括弧に似た記号を
+                # 参照寸法の括弧と誤認しやすい。小さい管理番号が直前にあり、
+                # 寸法線で支持される場合だけ一般公差候補として残す。
+                if not (
+                    small_decimal
+                    and has_feature_control_index(
+                        core_rect,
+                        direction,
+                        font_size,
+                    )
+                    and _has_dimension_line_support(
+                        image,
+                        core_rect,
+                        direction,
+                        _candidate_kind(prefix, degree) or "linear",
+                        scale_x=scale_x,
+                        scale_y=scale_y,
+                        strict=True,
+                    )
+                ):
+                    continue
             center = fitz.Point(
                 (core_rect.x0 + core_rect.x1) / 2,
                 (core_rect.y0 + core_rect.y1) / 2,
             )
-            hit = find_text_group(page, center, text_lines=text_lines)
+            hit = find_text_group(
+                page,
+                center,
+                text_lines=text_lines,
+                include_stacked_tolerance=True,
+            )
             if hit is not None:
                 hit_text = unicodedata.normalize("NFKC", hit.text)
                 hit_nominal = unicodedata.normalize(
@@ -2209,6 +2309,15 @@ def _local_ocr_general_candidates(
     for line in (*ocr_page.lines, *detail_callouts):
         is_detail_supplement = line in detail_callouts
         line_text = unicodedata.normalize("NFKC", line.text)
+        # 粗さ記号の値（Rz6.3 / Ra3.2 等）は寸法線の近くにあるため、
+        # 数字だけのOCR補助経路で一般公差候補へ戻りやすい。表面粗さは
+        # 公差未記載寸法ではないので、どのOCR経路でも早期に除外する。
+        if re.search(
+            r"(?:Rz\s*max|Rzmax|Ra\s*max|Ramax|Rmax|Rz|Ra)\s*\d",
+            line_text,
+            re.IGNORECASE,
+        ):
+            continue
         if is_tolerance_fragment(line_text):
             continue
         parsed = parse_dimension_token(line_text)

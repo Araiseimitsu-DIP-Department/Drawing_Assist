@@ -66,6 +66,7 @@ from drawing_assist.pdf_editor import (
     dimension_label_rect,
     expand_work_region,
     export_pdf,
+    find_japanese_font,
     find_text_group,
     infer_dimension_style,
     predict_work_outline,
@@ -422,6 +423,11 @@ def _fit_owns_parenthetical(
             beside_ok = along_overlap > 0 and -4.0 <= gap_x <= 30.0
             if beside_ok:
                 across_dist = max(gap_x, 0.0)
+                # 縦寸法列では、同じ高さで右横に置かれた偏差を「後続」と
+                # 扱うと、本体の帯を上下へ拡大して隣の g6 寸法まで覆う。
+                # この配置は必ず横付きの公差帯として保持する。
+                after_ok = False
+                before_ok = False
         if not after_ok and not before_ok and not beside_ok:
             return None
         rank = 0 if after_ok or before_ok else 1
@@ -832,6 +838,48 @@ def _separate_overlapping_roughness(
     return result
 
 
+def _has_stacked_tolerance_layout(marking: _DetectedDimensionMarking) -> bool:
+    """上下公差が本体帯の外へ張り出す配置かを判定する。"""
+
+    if not marking.tolerance_rect or not marking.tolerance_quad:
+        return False
+    xs = [point[0] for point in marking.quad]
+    ys = [point[1] for point in marking.quad]
+    base_points = [fitz.Point(point) for point in marking.quad]
+    extra_points = [fitz.Point(point) for point in marking.tolerance_quad]
+    direction = _quad_reading_direction(base_points, marking.direction)
+    # ``1`` のように細い横書き公称値は、文字枠だけを見ると縦長になる。
+    # 明示公差を持ち、元の読取方向が横なら、その方向を維持して上下公差を
+    # 同じ帯に結合する。
+    if (
+        abs(marking.direction[0]) >= 0.92
+        and abs(direction[0]) < 0.72
+        and (max(ys) - min(ys)) / max(max(xs) - min(xs), 0.1) >= 1.6
+    ):
+        # ``1`` のような短い横書き公称値は、文字枠の長辺だけから
+        # 縦書きと誤判定される。検出時の読取方向が横ならそれを優先する。
+        direction = (1.0 if marking.direction[0] >= 0 else -1.0, 0.0)
+    # 上下公差を別帯にするのは横書き寸法だけである。縦寸法では同じ配置が
+    # 読み方向に連続する公称値・公差なので、ここで分けると公差だけが上へ
+    # 外れて別色になる。
+    if abs(direction[0]) < 0.92:
+        return False
+    along0, along1, across0, across1, _axis, _normal = _axis_bounds(
+        base_points, direction
+    )
+    thickness = max(across1 - across0, 2.8)
+    extra_along0, extra_along1, extra_across0, extra_across1, _eaxis, _enormal = (
+        _axis_bounds(extra_points, direction)
+    )
+    # 横書きの上下公差（例: 2.9 の右上「+0.1」と右下「0」）は、
+    # 公称値の帯と同じ高さに押し込むと上側を切り落としてしまう。
+    # 公差が本体帯の外へ明確にはみ出す場合だけ、同じ厚みの別帯にする。
+    return (
+        min(extra_across0, across0) < across0 - thickness * 0.25
+        or max(extra_across1, across1) > across1 + thickness * 0.25
+    )
+
+
 def _marking_paint_parts(
     marking: _DetectedDimensionMarking,
 ) -> list[tuple[tuple[float, float, float, float], tuple[tuple[float, float], ...]]]:
@@ -844,9 +892,16 @@ def _marking_paint_parts(
     base_points = [fitz.Point(point) for point in marking.quad]
     extra_points = [fitz.Point(point) for point in marking.tolerance_quad]
     direction = _quad_reading_direction(base_points, marking.direction)
-    if abs(direction[1]) < 0.72 and (max(ys) - min(ys)) / max(max(xs) - min(xs), 0.1) >= 1.6:
-        direction = (0.0, 1.0)
-    _along0, _along1, across0, across1, _axis, _normal = _axis_bounds(
+    # 細い横書き公称値の上下公差は、縦書きへ誤判定しない。
+    if (
+        abs(marking.direction[0]) >= 0.92
+        and abs(direction[0]) < 0.72
+        and (max(ys) - min(ys)) / max(max(xs) - min(xs), 0.1) >= 1.6
+    ):
+        # ``1`` のような短い横書き公称値は、文字枠の長辺だけから
+        # 縦書きと誤判定される。検出時の読取方向が横ならそれを優先する。
+        direction = (1.0 if marking.direction[0] >= 0 else -1.0, 0.0)
+    along0, along1, across0, across1, _axis, _normal = _axis_bounds(
         base_points, direction
     )
     thickness = max(across1 - across0, 2.8)
@@ -859,6 +914,24 @@ def _marking_paint_parts(
     across_shift = abs(
         ((extra_across0 + extra_across1) / 2) - ((across0 + across1) / 2)
     )
+    stacked_across = _has_stacked_tolerance_layout(marking)
+    # 小さい公称値（例: ``1``）では、公差のOCR枠が本体へ少し重なり、
+    # ``_has_stacked_tolerance_layout`` の張り出し判定に届かないことがある。
+    # それでも公差枠そのものが本文より十分に高ければ上下公差なので、
+    # 一つの帯として外接させる。
+    compact_stacked_across = (
+        abs(direction[0]) >= 0.92
+        and extra_across1 - extra_across0 > thickness * 1.28
+    )
+    # 斜めの角度・面取りは、公称値と公差のOCR枠が少し横へずれていても
+    # 同じ読取軸上に続く。離れた別寸法を結ばないよう、軸方向の隙間と
+    # 直交方向のずれの両方が文字高さに収まる場合だけ一本化する。
+    along_gap = max(extra_along0 - along1, along0 - extra_along1, 0.0)
+    diagonal_contiguous = (
+        abs(direction[0]) < 0.92
+        and across_shift <= max(10.0, thickness * 3.0)
+        and along_gap <= max(6.0, thickness * 1.5)
+    )
     # 縦の g6/H7 の括弧内偏差は、読み方向に連続していても別帯にする。
     # 本体へ結合すると括弧部分が他色の寸法へ食い込みやすい。
     fit_tolerance = bool(
@@ -866,7 +939,35 @@ def _marking_paint_parts(
             unicodedata.normalize("NFKC", marking.source_text)
         )
     )
-    if across_shift <= 6.0 and not fit_tolerance:
+    if (
+        across_shift <= 6.0
+        or stacked_across
+        or compact_stacked_across
+        or diagonal_contiguous
+    ) and not fit_tolerance:
+        # 縦書き寸法の上下公差は、本体より横幅が広い。公称値側の幅だけを
+        # 維持すると「-0.01/-0.04」や「+0.03/0」の片側が塗り切れない。
+        # 2つのOCR枠の外接幅で一本の帯を作り、手修正時と同じく公称値と
+        # 公差を確実に連結する。
+        # 横書きの上下公差も、別帯の段差ではなく公称値を含む同じ高さの
+        # 一本帯にする。これにより 0.12、14.7、3.9、1、2.9 の公差が
+        # 途中で途切れず、帯の高さも揃う。
+        if (
+            abs(direction[0]) < 0.92
+            or stacked_across
+            or compact_stacked_across
+        ):
+            joined_points = base_points + extra_points
+            _j0, _j1, joined_across0, joined_across1, _ja, _jn = _axis_bounds(
+                joined_points, direction
+            )
+            joined = _quad_same_thickness(
+                joined_points,
+                direction,
+                joined_across1 - joined_across0,
+                along_expand=0.5,
+            )
+            return [(_marking_quad_bounds(joined), joined)]
         joined = _extend_along_keep_across(
             base_points, extra_points, direction, along_expand=0.5
         )
@@ -920,9 +1021,23 @@ def _paint_entries_join(
 
     if left.color != right.color:
         return False
+    # R0.2以下とC0.2以下のような個別上限指示は、同じ色・近接でも
+    # 別の指示である。完成した2つの呼びを一体化しない。
+    if left.kind == "limit" or right.kind == "limit":
+        return False
+    # 上下公差を含む本体・公差帯は意図的に分けている。ここで通常の
+    # OCR断片として再結合すると、上側公差を含む巨大な矩形に戻る。
+    if left.kind == "stacked_tolerance" or right.kind == "stacked_tolerance":
+        return False
     left_points = _quad_or_rect_points(left.rect, left.quad)
     right_points = _quad_or_rect_points(right.rect, right.quad)
     direction = _quad_reading_direction(left_points)
+    right_direction = _quad_reading_direction(right_points)
+    # 近接していても、横寸法と斜め角度のように読み方向が異なるものは
+    # 同じ寸法の断片ではない。方向を無視してつなぐと、交点を含む大きな
+    # 四角形になってしまうため、帯の向きが十分一致するときだけ統合する。
+    if abs(direction[0] * right_direction[0] + direction[1] * right_direction[1]) < 0.94:
+        return False
     left_along0, left_along1, left_across0, left_across1, _axis, _normal = (
         _axis_bounds(left_points, direction)
     )
@@ -952,6 +1067,14 @@ def _paint_entries_join(
         return False
     along_overlap = min(left_along1, right_along1) - max(left_along0, right_along0)
     along_gap = max(0.0, max(left_along0, right_along0) - min(left_along1, right_along1))
+    # 公称値と上下公差の別帯は、右端だけが少し重なることがある。この
+    # 接点を通常の文字断片とみなして統合すると、公差全体を覆う大きな
+    # 矩形へ戻ってしまうため、帯の中心がずれる場合は独立したまま保つ。
+    if (
+        0.0 < along_overlap <= thickness * 0.16
+        and across_shift > thickness * 0.28
+    ):
+        return False
     if along_overlap > 0.4:
         return True
     # Rzmax と数値、φ16 と H7 のような途切れだけつなぐ
@@ -1032,7 +1155,7 @@ def _fit_strip_to_ink(
         ):
             counts[index] = 0
     if not any(counts):
-        if kind in {"roughness", "chamfer"}:
+        if kind in {"roughness", "chamfer", "angle"}:
             original_thickness = across1 - across0
             if kind == "chamfer" and abs(axis.x) < 0.96 and abs(axis.y) < 0.96:
                 # 斜めC0.3は元のOCR枠が細く、横C0用の縮小を流用すると
@@ -1040,6 +1163,10 @@ def _fit_strip_to_ink(
                 factor = 1.05
             elif kind == "chamfer":
                 factor = 0.36
+            elif kind == "angle":
+                # 角度記号では引出線がOCR枠へ混ざりやすい。文字列の向きは
+                # 維持したまま、読み方向に直交する幅だけを抑える。
+                factor = 0.48
             else:
                 factor = 0.38
             thickness = max(2.8, original_thickness * factor)
@@ -1080,13 +1207,13 @@ def _fit_strip_to_ink(
             axis,
             normal,
         )
-    across_pad = 0.52 if kind in {"roughness", "chamfer"} else 0.72
+    across_pad = 0.52 if kind in {"roughness", "chamfer", "angle"} else 0.72
     new_across0 = max(across0, ink_across0 - across_pad)
     new_across1 = min(across1, ink_across1 + across_pad)
     # 寸法線を含む背の高いOCR枠でも、文字インクへ帯を戻せるようにする。
     # 極端に細くなる場合だけ従来枠を残す。
     minimum_ratio = 0.36 if kind in {"linear", "diameter"} else 0.28
-    if kind in {"roughness", "chamfer"}:
+    if kind in {"roughness", "chamfer", "angle"}:
         minimum_ratio = 0.20
     original_thickness = across1 - across0
     if new_across1 - new_across0 < max(2.8, original_thickness * minimum_ratio):
@@ -1113,6 +1240,12 @@ def _fit_strip_to_ink(
         maximum_thickness = max(
             minimum_thickness,
             min(original_thickness * 0.62, along_span * 0.24),
+        )
+    elif kind == "angle":
+        minimum_thickness = max(4.4, along_span * 0.11)
+        maximum_thickness = max(
+            minimum_thickness,
+            min(original_thickness * 0.58, along_span * 0.23),
         )
     else:
         minimum_thickness = 0.0
@@ -1158,23 +1291,36 @@ def _strip_from_paint_group(
         _quad_or_rect_points(base.rect, base.quad)
     )
     thickness = max(thicknesses)
-    strip = _quad_same_thickness(
-        all_points, direction, thickness, along_expand=0.5
+    has_general_descriptor = any(
+        entry.kind == "general_descriptor" for entry in group
     )
-    fitted = _fit_strip_to_ink(
-        image,
-        scale_x,
-        scale_y,
-        [fitz.Point(point) for point in strip],
+    strip = _quad_same_thickness(
+        all_points,
         direction,
-        base.kind,
+        thickness,
+        # 幅／二面幅は、元の文字領域に末尾余白を含めている。
+        along_expand=0.04 if has_general_descriptor else 0.5,
+    )
+    # 幅／二面幅まで含む統合帯は、OCRインクへの再フィットで
+    # 末尾補足文字だけが欠けるため、文字領域を維持する。
+    fitted = (
+        tuple((float(point[0]), float(point[1])) for point in strip)
+        if has_general_descriptor
+        else _fit_strip_to_ink(
+            image,
+            scale_x,
+            scale_y,
+            [fitz.Point(point) for point in strip],
+            direction,
+            base.kind,
+        )
     )
     return DimensionMarkingEntry(
         _marking_quad_bounds(fitted),
         base.color,
         base.opacity,
         fitted,
-        base.kind,
+        "general_descriptor" if has_general_descriptor else base.kind,
     )
 
 
@@ -1185,6 +1331,10 @@ def _equalize_beside_paint(
 
     result = list(entries)
     for left_index, left in enumerate(result):
+        # 幅／二面幅まで含めて確定した一般公差の帯は、近傍帯との
+        # 厚み合わせで末尾注記を削らない。
+        if left.kind in {"stacked_tolerance", "general_descriptor", "limit"}:
+            continue
         left_points = _quad_or_rect_points(left.rect, left.quad)
         direction = _quad_reading_direction(left_points)
         left_along0, left_along1, left_across0, left_across1, _axis, _normal = (
@@ -1193,9 +1343,16 @@ def _equalize_beside_paint(
         left_thickness = left_across1 - left_across0
         for right_index in range(left_index + 1, len(result)):
             right = result[right_index]
-            if right.color != left.color:
+            if right.color != left.color or right.kind in {
+                "stacked_tolerance",
+                "general_descriptor",
+                "limit",
+            }:
                 continue
             right_points = _quad_or_rect_points(right.rect, right.quad)
+            right_direction = _quad_reading_direction(right_points)
+            if abs(direction[0] * right_direction[0] + direction[1] * right_direction[1]) < 0.94:
+                continue
             right_along0, right_along1, right_across0, right_across1, _ra, _rn = (
                 _axis_bounds(right_points, direction)
             )
@@ -1245,6 +1402,9 @@ def _align_collinear_complete_strips(
 
     result = list(entries)
     for left_index, left in enumerate(result):
+        # 補足文字まで一体化済みの帯は、粗さ用の同線整列対象から除く。
+        if left.kind in {"stacked_tolerance", "general_descriptor", "limit"}:
+            continue
         left_points = _quad_or_rect_points(left.rect, left.quad)
         direction = _quad_reading_direction(left_points)
         left_along0, left_along1, left_across0, left_across1, axis, normal = (
@@ -1252,9 +1412,16 @@ def _align_collinear_complete_strips(
         )
         for right_index in range(left_index + 1, len(result)):
             right = result[right_index]
-            if right.color != left.color:
+            if right.color != left.color or right.kind in {
+                "stacked_tolerance",
+                "general_descriptor",
+                "limit",
+            }:
                 continue
             right_points = _quad_or_rect_points(right.rect, right.quad)
+            right_direction = _quad_reading_direction(right_points)
+            if abs(direction[0] * right_direction[0] + direction[1] * right_direction[1]) < 0.94:
+                continue
             right_along0, right_along1, right_across0, right_across1, _ra, _rn = (
                 _axis_bounds(right_points, direction)
             )
@@ -1361,6 +1528,10 @@ def _separate_other_color_paint(
 
     result = list(entries)
     for index, entry in enumerate(result):
+        # 幅／二面幅まで含めた一般公差は、別色の近接寸法より優先する。
+        # ここで矩形を切ると、末尾の注記だけが帯から欠けてしまう。
+        if entry.kind == "general_descriptor":
+            continue
         entry_rect = fitz.Rect(entry.rect)
         points = _quad_or_rect_points(entry.rect, entry.quad)
         direction = _quad_reading_direction(points)
@@ -1492,8 +1663,15 @@ def _unify_dimension_marking_entries(
         if len(group) == 1:
             points = _quad_or_rect_points(group[0].rect, group[0].quad)
             direction = _quad_reading_direction(points)
-            fitted = _fit_strip_to_ink(
-                image, scale_x, scale_y, points, direction, group[0].kind
+            # 一般公差に後置した実図面の補足文字（幅／二面幅）は、
+            # 文字列全体の枠を使っている。ここでインクへ再縮小すると、
+            # 末尾の補足文字だけが帯から欠けるため元の帯を維持する。
+            fitted = (
+                tuple((float(point.x), float(point.y)) for point in points)
+                if group[0].kind in {"general_descriptor", "limit"}
+                else _fit_strip_to_ink(
+                    image, scale_x, scale_y, points, direction, group[0].kind
+                )
             )
             unified.append(
                 DimensionMarkingEntry(
@@ -1770,6 +1948,32 @@ def _merge_detected_markings(
                 )
             )
             same_text = item_compact == existing_compact
+            # 画像OCRは縦のはめあい寸法を ``φ24.95g6`` と ``95g6`` の
+            # ように全体・末尾だけで二重に読むことがある。公称値は異なるが
+            # 後者は前者の部分文字列であり、別寸法ではない。短い断片を
+            # 残すと本体へ別の帯が重なり、g6のマーキング範囲が崩れる。
+            item_fit = bool(_FIT_TOLERANCE_PATTERN.search(item_compact))
+            existing_fit = bool(_FIT_TOLERANCE_PATTERN.search(existing_compact))
+            nested_fit_fragment = (
+                item_fit
+                and existing_fit
+                and math.dist(
+                    (item_center.x, item_center.y),
+                    (existing_center.x, existing_center.y),
+                )
+                <= 32.0
+                and (
+                    item_compact in existing_compact
+                    or existing_compact in item_compact
+                )
+            )
+            if nested_fit_fragment:
+                # 長い方が完全な公称値を持つ。ここでは枠を外接させず、
+                # 完全読取りの文字帯だけをそのまま残す。
+                if len(item_compact) > len(existing_compact):
+                    merged[index] = item
+                overlapped = True
+                break
             # Dense vertical dimension columns can legitimately overlap after
             # their stacked deviations are included. Do not discard a
             # neighbouring dimension merely because the review rectangles
@@ -1957,9 +2161,6 @@ def _detect_dimension_markings(
                 (float(span.get("size") or 0.0) for span in spans),
                 default=0.0,
             )
-            if not expected_size * 0.82 <= font_size <= expected_size * 1.23:
-                continue
-
             textual_reference = False
             working_text = text
             text_offset = leading_space_count
@@ -2050,6 +2251,31 @@ def _detect_dimension_markings(
                 across_inset=max(0.12, font_size * 0.035),
             )
             core_rect = fitz.Rect(_marking_quad_bounds(core_quad))
+            small_decimal = bool(
+                match is not None
+                and not match.group("prefix")
+                and not match.group("degree")
+                and 0 < nominal_value < 1
+                and "." in match.group("number").replace(",", ".")
+            )
+            normal_size = expected_size * 0.82 <= font_size <= expected_size * 1.23
+            # テキストPDFの幾何公差・細部寸法には、通常寸法より小さい
+            # 0.12 等の小数値がある。寸法線支持を確認できる場合だけ下限を
+            # 緩め、表題欄や注記の小さい数値は従来どおり除外する。
+            if not normal_size and not (
+                small_decimal
+                and expected_size * 0.56 <= font_size <= expected_size * 1.23
+                and _has_dimension_line_support(
+                    image,
+                    core_rect,
+                    direction,
+                    kind,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                    strict=True,
+                )
+            ):
+                continue
             explicit_tolerance_in_line = any(
                 symbol in working_text for symbol in ("±", "亇", "+", "-", "−", "－")
             )
@@ -2065,29 +2291,37 @@ def _detect_dimension_markings(
                 (core_rect.x0 + core_rect.x1) / 2,
                 (core_rect.y0 + core_rect.y1) / 2,
             )
-            hit = find_text_group(page, center, text_lines=text_lines)
-            if hit is None:
-                continue
-            hit_number = re.search(
-                r"\d+(?:[.,]\d+)?",
-                unicodedata.normalize("NFKC", hit.nominal_text or hit.text),
+            hit = find_text_group(
+                page,
+                center,
+                text_lines=text_lines,
+                include_stacked_tolerance=True,
             )
-            if hit_number is not None and not thread_callout:
-                try:
-                    hit_value = float(hit_number.group(0).replace(",", "."))
-                except ValueError:
-                    continue
-                # This raw line is one of the smaller upper/lower tolerance
-                # values, not the nominal anchor selected by find_text_group.
-                if abs(hit_value - nominal_value) > 1e-7:
-                    continue
+            if hit is not None:
+                hit_number = re.search(
+                    r"\d+(?:[.,]\d+)?",
+                    unicodedata.normalize("NFKC", hit.nominal_text or hit.text),
+                )
+                if hit_number is not None and not thread_callout:
+                    try:
+                        hit_value = float(hit_number.group(0).replace(",", "."))
+                    except ValueError:
+                        continue
+                    # This raw line is one of the smaller upper/lower tolerance
+                    # values, not the nominal anchor selected by find_text_group.
+                    if abs(hit_value - nominal_value) > 1e-7:
+                        continue
 
             # Some CAD writers draw the diameter sign with an unmapped glyph.
             # It is visible in the PDF but extracted as an empty text line.
             # ``find_text_group`` preserves that fact; extend only toward the
             # leading side so the marker covers φ without swallowing the
             # tolerance or the adjacent dimension line.
-            if hit.preserved_prefix == "φ" and kind == "linear":
+            if (
+                hit is not None
+                and hit.preserved_prefix == "φ"
+                and kind == "linear"
+            ):
                 kind = "diameter"
                 axis = fitz.Point(direction)
                 prefix_extent = max(2.2, font_size * 1.42)
@@ -2102,11 +2336,51 @@ def _detect_dimension_markings(
                 )
                 core_rect = fitz.Rect(_marking_quad_bounds(core_quad))
 
-            group_text = hit.text or text
+            # C0.1±0.05 / R0.2+0.15/-0.1 のような小さい斜め寸法は、
+            # 図面線との交差でテキストグループ化が失敗することがある。
+            # 元の完全な文字行をフォールバックにし、色判定だけでも欠かさない。
+            group_text = (hit.text or text) if hit is not None else working_text
             tolerance_range = _explicit_tolerance_range(
                 group_text,
                 nominal_value,
             )
+            # 一部のCAD PDFでは ±0.2 がテキスト層から脱落しても、後ろの
+            # （二面幅）／（幅）は正しく残る。候補が一般公差工程から黄色に
+            # なる場合でも、この補足語まで同じ寸法の範囲として保持する。
+            # 公称値だけの通常寸法には適用しないため、隣接寸法を広げない。
+            descriptor_match = re.search(r"[（(][^）)]*[）)]", working_text)
+            if descriptor_match is not None:
+                descriptor_start = text_offset + descriptor_match.start()
+                descriptor_points: list[fitz.Point] = []
+                for index, char in enumerate(chars):
+                    if index < descriptor_start or not str(char.get("c") or "").strip():
+                        continue
+                    try:
+                        char_quad = fitz.recover_char_quad(direction_value, char)
+                        descriptor_points.extend(
+                            (char_quad.ul, char_quad.ur, char_quad.lr, char_quad.ll)
+                        )
+                    except (TypeError, ValueError):
+                        char_rect = fitz.Rect(char.get("bbox"))
+                        descriptor_points.extend(
+                            (
+                                char_rect.top_left,
+                                char_rect.top_right,
+                                char_rect.bottom_right,
+                                char_rect.bottom_left,
+                            )
+                        )
+                if descriptor_points:
+                    core_quad = _marking_quad_from_points(
+                        [fitz.Point(point) for point in core_quad] + descriptor_points,
+                        direction,
+                        # 縦書き補足語は最終の帯整形でさらにわずかに縮む。
+                        # 元字形の外側を保持し、（二面幅）／（幅）の先頭・
+                        # 末尾を確実に含める。補足語を持つこのケース限定。
+                        along_expand=max(3.6, font_size * 0.42),
+                        across_inset=0.0,
+                    )
+                    core_rect = fitz.Rect(_marking_quad_bounds(core_quad))
             if kind == "limit":
                 # R/Cの「以下」は個別指示として色分けするが、公差値ではない。
                 # 黄色扱いにして一般公差の候補とは混同しない。
@@ -2142,10 +2416,23 @@ def _detect_dimension_markings(
 
             tolerance_quad = None
             tolerance_rect = None
-            if tolerance_range is not None and hit.quad:
+            if tolerance_range is not None and (hit is None or hit.quad):
                 axis = fitz.Point(direction)
                 normal = fitz.Point(-axis.y, axis.x)
-                group_points = [fitz.Point(point) for point in hit.quad]
+                if hit is not None and hit.quad:
+                    group_points = [fitz.Point(point) for point in hit.quad]
+                else:
+                    group_points = [
+                        point
+                        for char in chars
+                        if str(char.get("c") or "").strip()
+                        for point in (
+                            fitz.Rect(char.get("bbox")).top_left,
+                            fitz.Rect(char.get("bbox")).top_right,
+                            fitz.Rect(char.get("bbox")).bottom_right,
+                            fitz.Rect(char.get("bbox")).bottom_left,
+                        )
+                    ]
                 # A trailing parenthetical is a descriptor, not a reference
                 # dimension. Include it in the same continuous marker, e.g.
                 # 16+/-0.2(two-face width) and dia15.5+/-0.2(groove).
@@ -2243,12 +2530,17 @@ def _detect_scanned_dimension_markings(
     include_plain_dimensions: bool = False,
     rotations: tuple[int, ...] = (0, 90, 270),
     tiled: bool = False,
+    zoom_override: float | None = None,
 ) -> list[_DetectedDimensionMarking]:
     """Detect explicit dimension+tolerance groups in a raster drawing."""
 
     maximum_dimension = max(page.rect.width, page.rect.height)
     # 小寸法・公差付きの読み取り精度を優先して解像度を上げる
-    zoom = max(2.7, min(3.4, 3200 / maximum_dimension))
+    zoom = (
+        max(2.7, min(3.4, 3200 / maximum_dimension))
+        if zoom_override is None
+        else max(2.7, min(6.0, zoom_override))
+    )
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(zoom, zoom),
         colorspace=fitz.csRGB,
@@ -2301,6 +2593,39 @@ def _detect_scanned_dimension_markings(
             r"^(?:[±+\-−－]?\s*0(?:[.,]\d+)?|[+\-−－]\d+(?:[.,]\d+)?)$"
         )
         for index, base_text in enumerate(normalized):
+            # 高解像度の画像OCRでは ``C0.1±0.05`` が ``C0.`` と
+            # ``1±0.05`` の別行になることがある。小R/Cの明示公差だけは
+            # 近接する後半行を再結合して、寸法全体として扱う。
+            split_small_feature = re.fullmatch(
+                r"[RC]\s*[O0]\s*[.,]", base_text, re.IGNORECASE
+            )
+            if split_small_feature:
+                base_rect = bounds[index]
+                for other_index, other_text in enumerate(normalized):
+                    if other_index == index or not re.fullmatch(
+                        # Windows OCRでは ± が置換文字になることがある。
+                        # C0. の直後にある短い小数列だけを後半行として許可する。
+                        r"\d(?:.*(?:[±士土+\-−－�]|[.,]\d+).*)",
+                        other_text,
+                    ):
+                        continue
+                    other_rect = bounds[other_index]
+                    horizontal_gap = max(other_rect.x0 - base_rect.x1, 0.0)
+                    vertical_gap = max(
+                        base_rect.y0 - other_rect.y1,
+                        other_rect.y0 - base_rect.y1,
+                        0.0,
+                    )
+                    height = max(base_rect.height, other_rect.height, 1.0)
+                    if horizontal_gap > height * 3.8 or vertical_gap > height * 0.8:
+                        continue
+                    combined.append(
+                        {
+                            "text": base_text + other_text,
+                            "words": list(original[index].get("words") or [])
+                            + list(original[other_index].get("words") or []),
+                        }
+                    )
             if (
                 re.fullmatch(r"[（(].+[）)]", base_text)
                 or
@@ -2495,6 +2820,59 @@ def _detect_scanned_dimension_markings(
                 continue
             compact = _normalize_raster_dimension_text(text)
             compact = compact.lstrip("△▲◆◇")
+            # `R0.2` / `C0.1` の上付き公差は画像OCRで記号化けしやすい。
+            # 値までが確実に読めた小R/Cだけを、既存の小面取りと同じ黄色
+            # 候補として残す。Rzや一般注記はこの形式に一致しない。
+            small_feature = re.match(
+                r"^(?P<prefix>[RC])\s*[O0]\s*[.,]\s*(?P<number>\d+)",
+                compact,
+                re.IGNORECASE,
+            )
+            if small_feature is not None:
+                try:
+                    small_nominal = float(
+                        "0." + small_feature.group("number")
+                    )
+                except ValueError:
+                    small_nominal = 0.0
+                if 0 < small_nominal <= 1.0 and len(compact) <= 18:
+                    rect = mapped_rect(words, rotation) if tile is None else fitz.Rect()
+                    if tile is not None:
+                        tile_x, tile_y, resize_factor, tile_source_width, tile_source_height = tile
+                        pixel_rect = fitz.Rect(
+                            min(float(word.get("x") or 0) for word in words),
+                            min(float(word.get("y") or 0) for word in words),
+                            max(float(word.get("x") or 0) + float(word.get("width") or 0) for word in words),
+                            max(float(word.get("y") or 0) + float(word.get("height") or 0) for word in words),
+                        )
+                        mapped_tile_rect = _map_rotated_rect(
+                            tuple(pixel_rect), rotation,
+                            int(tile_source_width * resize_factor),
+                            int(tile_source_height * resize_factor),
+                        )
+                        rect = fitz.Rect(
+                            (tile_x + mapped_tile_rect[0] / resize_factor) / scale_x,
+                            (tile_y + mapped_tile_rect[1] / resize_factor) / scale_y,
+                            (tile_x + mapped_tile_rect[2] / resize_factor) / scale_x,
+                            (tile_y + mapped_tile_rect[3] / resize_factor) / scale_y,
+                        ) & page.rect
+                    if not rect.is_empty:
+                        quad = _stable_marking_quad(
+                            [rect.top_left, rect.top_right, rect.bottom_right, rect.bottom_left],
+                            direction,
+                            rect,
+                        )
+                        detected.append(
+                            _DetectedDimensionMarking(
+                                rect=_marking_quad_bounds(quad), quad=quad,
+                                direction=direction, source_text=compact,
+                                nominal_value=small_nominal,
+                                kind=_dimension_marking_kind(
+                                    small_feature.group("prefix"), ""
+                                ), tolerance_range=1.0, reference=False,
+                            )
+                        )
+                        continue
             reference = bool(re.fullmatch(r"[（(].+[）)]", compact))
             working = compact[1:-1] if reference else compact
             thread_callout = bool(_MARKING_THREAD_PATTERN.fullmatch(working))
@@ -2851,10 +3229,9 @@ def _detect_local_dimension_markings(
                     direction=direction,
                     source_text=compact,
                     nominal_value=nominal,
-                    kind=_dimension_marking_kind(
-                        limit_callout.group("prefix"),
-                        "",
-                    ),
+                    # 上限指示はR/Cの通常寸法ではない。個別の注記として
+                    # 保持し、隣接するR/C上限指示との結合対象から外す。
+                    kind="limit",
                     tolerance_range=1.0,
                     reference=False,
                 )
@@ -3266,33 +3643,6 @@ def _detect_local_dimension_markings(
                     tolerance_rect=_marking_quad_bounds(beside_quad),
                     tolerance_quad=beside_quad,
                 )
-            # 縦の g6/H7 は括弧内偏差が本体の直前へ並ぶ。小さい括弧や
-            # 符号をOCRが落としても、文字高と同じ幅の短い別帯を確保する。
-            # 横方向へは広げないため、隣の黄色寸法を覆わない。
-            if (
-                candidate.tolerance_quad is None
-                and _fit_line_is_columnar(line)
-                and re.search(r"[gG]\s*\d{1,2}", working)
-            ):
-                fit_axis = _fit_line_axis(line)
-                base_points = [fitz.Point(point) for point in candidate.quad]
-                along0, along1, across0, across1, axis, normal = _axis_bounds(
-                    base_points, fit_axis
-                )
-                span = along1 - along0
-                tolerance_quad = _quad_from_axis_bounds(
-                    along0 - min(32.0, max(16.0, span * 0.78)),
-                    along0 - 0.8,
-                    across0,
-                    across1,
-                    axis,
-                    normal,
-                )
-                candidate = replace(
-                    candidate,
-                    tolerance_rect=_marking_quad_bounds(tolerance_quad),
-                    tolerance_quad=tolerance_quad,
-                )
         candidate_rect = fitz.Rect(candidate.rect)
         candidate_quality = _marking_ocr_quality(working, line.score)
         overlapped = False
@@ -3500,6 +3850,9 @@ class DrawingApi:
         self.general_tolerance_standard = "jis_b_0405"
         self.general_tolerance_grade = "m"
         self.general_tolerance_angle_length = 10.0
+        # 現在ページで未記載公差の検出を完了したか。候補0件なら、
+        # 次の色分け工程へ安全に進めるために保持する。
+        self.general_tolerance_checked = False
         self.last_general_tolerance_marked = False
         self.work_region_candidates: list[
             tuple[tuple[float, float], ...]
@@ -3695,14 +4048,37 @@ class DrawingApi:
             and marking.tolerance_range is not None
         ]
         if page_ocr is not None and len(vertical_evidence) >= 2:
-            windows_detected = []
+            # 全頁の補助OCRを重ねると候補数だけ増え、画像PDF①の精度を
+            # 悪化させる。ここでは通常OCRが落としやすい小R/Cの明示公差
+            # だけを高解像度タイルで補足する。
+            try:
+                windows_detected = [
+                    marking
+                    for marking in _detect_scanned_dimension_markings(
+                        page,
+                        _resource_path("windows_ocr.ps1"),
+                        include_plain_dimensions=False,
+                        rotations=(0,),
+                        tiled=True,
+                        # C0.1±0.05 のような細字は通常倍率の全頁タイルで
+                        # 小さくなりすぎるため、この限定補助経路だけを高精細化。
+                        zoom_override=6.0,
+                    )
+                    if marking.kind in {"radius", "chamfer"}
+                    and marking.nominal_value <= 1.0
+                    and marking.tolerance_range is not None
+                ]
+            except (OSError, subprocess.SubprocessError, ValueError):
+                windows_detected = []
         else:
             try:
                 windows_detected = _detect_scanned_dimension_markings(
                     page,
                     _resource_path("windows_ocr.ps1"),
                     include_plain_dimensions=False,
-                    rotations=(270,) if page_ocr is not None else (0, 90, 270),
+                    rotations=(0, 270)
+                    if page_ocr is not None
+                    else (0, 90, 270),
                 )
             except (OSError, subprocess.SubprocessError, ValueError):
                 windows_detected = []
@@ -4289,6 +4665,7 @@ class DrawingApi:
             "general_tolerance_applied_count": len(
                 self.last_general_tolerance_batch
             ),
+            "general_tolerance_checked": self.general_tolerance_checked,
             "general_tolerance_standard": self.general_tolerance_standard,
             "general_tolerance_grade": self.general_tolerance_grade,
             "general_tolerance_angle_length": (
@@ -4377,6 +4754,7 @@ class DrawingApi:
             self.last_general_tolerance_batch.clear()
             self.last_general_tolerance_additions.clear()
             self.last_general_tolerance_marked = False
+            self.general_tolerance_checked = False
             self.work_region_candidates.clear()
             self.word_candidate = None
             self.dimension_style_cache.clear()
@@ -4424,6 +4802,7 @@ class DrawingApi:
                 self.last_general_tolerance_batch.clear()
                 self.last_general_tolerance_additions.clear()
                 self.last_general_tolerance_marked = False
+                self.general_tolerance_checked = False
                 self.work_region_candidates.clear()
                 self.word_candidate = None
             return self._state()
@@ -4440,6 +4819,7 @@ class DrawingApi:
                 self.last_general_tolerance_batch.clear()
                 self.last_general_tolerance_additions.clear()
                 self.last_general_tolerance_marked = False
+                self.general_tolerance_checked = False
                 self.work_region_candidates.clear()
                 self.word_candidate = None
             return self._state()
@@ -4937,6 +5317,7 @@ class DrawingApi:
                     f" Windowsの日本語OCR設定を確認してください: {exc}"
                 )
             count = len(self.general_tolerance_candidates)
+            self.general_tolerance_checked = True
             OcrPipelineRecorder("scan_general_tolerances").set_count(
                 "final_candidates", count
             ).log_summary()
@@ -5796,21 +6177,28 @@ class DrawingApi:
             )
 
     @staticmethod
-    def _added_tolerance_mark_quad(
-        addition: ToleranceAddition,
+    def _rotated_text_mark_quad(
+        origin_value: tuple[float, float],
+        direction_value: tuple[float, float],
+        text: str,
+        font_size_value: float,
     ) -> tuple[tuple[float, float], ...]:
-        """Return an oriented page-space box for added tolerance text."""
+        """Return visible bounds for text drawn with the rotated renderer."""
 
-        direction = fitz.Point(addition.direction)
+        direction = fitz.Point(direction_value)
         length = math.hypot(direction.x, direction.y) or 1.0
         direction /= length
         normal = fitz.Point(-direction.y, direction.x)
-        origin = fitz.Point(addition.origin)
-        font_size = max(4.0, min(24.0, addition.font_size))
-        text_width = fitz.Font("helv").text_length(
-            addition.text,
-            fontsize=font_size,
-        )
+        origin = fitz.Point(origin_value)
+        font_size = max(4.0, min(24.0, font_size_value))
+        # 一般公差の文字は PDF 出力時に日本語フォントで描く。Helvetica の
+        # 文字幅で計算すると「（二面幅）」などの末尾括弧が短く見積もられ、
+        # 最後の「）」だけがマーキングから外れる。
+        try:
+            font = fitz.Font(fontfile=str(find_japanese_font()))
+        except (OSError, RuntimeError):
+            font = fitz.Font("helv")
+        text_width = font.text_length(text, fontsize=font_size)
         top = font_size * 0.88
         bottom = font_size * 0.18
         margin = max(0.35, font_size * 0.045)
@@ -5822,6 +6210,20 @@ class DrawingApi:
                 origin + direction * (text_width + margin) + normal * (bottom + margin),
                 origin - direction * margin + normal * (bottom + margin),
             )
+        )
+
+    @classmethod
+    def _added_tolerance_mark_quad(
+        cls,
+        addition: ToleranceAddition,
+    ) -> tuple[tuple[float, float], ...]:
+        """Return an oriented page-space box for added tolerance text."""
+
+        return cls._rotated_text_mark_quad(
+            addition.origin,
+            addition.direction,
+            addition.text,
+            addition.font_size,
         )
 
     @classmethod
@@ -5857,8 +6259,10 @@ class DrawingApi:
             direction = fitz.Point(addition.direction)
             length = math.hypot(direction.x, direction.y) or 1.0
             direction /= length
-            normal = fitz.Point(-direction.y, direction.x)
-            font = fitz.Font("helv")
+            try:
+                font = fitz.Font(fontfile=str(find_japanese_font()))
+            except (OSError, RuntimeError):
+                font = fitz.Font("helv")
             tolerance_size = max(4.0, min(24.0, addition.font_size))
             suffix_size = max(
                 tolerance_size,
@@ -5873,25 +6277,20 @@ class DrawingApi:
                 addition.text,
                 fontsize=tolerance_size,
             )
-            suffix_width = font.text_length(
-                addition.suffix_text,
-                fontsize=suffix_size,
-            )
             suffix_origin = (
                 fitz.Point(addition.origin)
-                + direction
-                * (tolerance_width + max(0.25, tolerance_size * 0.045))
+                + direction * (tolerance_width + max(0.45, tolerance_size * 0.07))
             )
+            # suffix_rect は元の補足語を白抜きする領域であり、描画される
+            # 補足語の位置ではない。実際には新しい公差の後ろへ再描画される
+            # ため、その最終位置をマーキングへ含める。
             points.extend(
-                (
-                    suffix_origin - normal * (suffix_size * 0.90),
-                    suffix_origin
-                    + direction * suffix_width
-                    - normal * (suffix_size * 0.90),
-                    suffix_origin
-                    + direction * suffix_width
-                    + normal * (suffix_size * 0.20),
-                    suffix_origin + normal * (suffix_size * 0.20),
+                fitz.Point(point)
+                for point in cls._rotated_text_mark_quad(
+                    (suffix_origin.x, suffix_origin.y),
+                    addition.direction,
+                    addition.suffix_text,
+                    suffix_size,
                 )
             )
         return _marking_quad_from_points(
@@ -5914,9 +6313,11 @@ class DrawingApi:
         direction = fitz.Point(addition.direction)
         length = math.hypot(direction.x, direction.y) or 1.0
         direction /= length
-        normal = fitz.Point(-direction.y, direction.x)
         font_size = max(4.0, min(24.0, addition.font_size))
-        font = fitz.Font("helv")
+        try:
+            font = fitz.Font(fontfile=str(find_japanese_font()))
+        except (OSError, RuntimeError):
+            font = fitz.Font("helv")
         tolerance_width = font.text_length(
             addition.text,
             fontsize=font_size,
@@ -5930,27 +6331,21 @@ class DrawingApi:
                 else font_size,
             ),
         )
-        suffix_width = font.text_length(
-            addition.suffix_text,
-            fontsize=suffix_font_size,
-        )
         suffix_origin = (
             fitz.Point(addition.origin)
             + direction * (tolerance_width + max(0.45, font_size * 0.07))
         )
-        top = suffix_font_size * 0.92
-        bottom = suffix_font_size * 0.24
-        points = (
-            suffix_origin - normal * top,
-            suffix_origin + direction * suffix_width - normal * top,
-            suffix_origin + direction * suffix_width + normal * bottom,
-            suffix_origin + normal * bottom,
+        points = cls._rotated_text_mark_quad(
+            (suffix_origin.x, suffix_origin.y),
+            addition.direction,
+            addition.suffix_text,
+            suffix_font_size,
         )
         suffix_bounds = fitz.Rect(
-            min(point.x for point in points),
-            min(point.y for point in points),
-            max(point.x for point in points),
-            max(point.y for point in points),
+            min(point[0] for point in points),
+            min(point[1] for point in points),
+            max(point[0] for point in points),
+            max(point[1] for point in points),
         )
         return rect | suffix_bounds
 
@@ -5989,8 +6384,7 @@ class DrawingApi:
                         (scanned_rect & fitz.Rect(existing.rect)).get_area()
                         >= 0.45
                         * min(
-                            scanned_rect.get_area(),
-                            fitz.Rect(existing.rect).get_area(),
+                            scanned_rect.get_area(), fitz.Rect(existing.rect).get_area()
                         )
                         for existing in detected
                     ):
@@ -6114,12 +6508,19 @@ class DrawingApi:
                         marking.kind,
                         explicit_range,
                     )
+                    paint_kind = (
+                        "stacked_tolerance"
+                        if _has_stacked_tolerance_layout(marking)
+                        else "fit"
+                        if _FIT_TOLERANCE_PATTERN.search(marking.source_text)
+                        else marking.kind
+                    )
                     for paint_rect, paint_quad in _marking_paint_parts(marking):
                         append_entry(
                             paint_rect,
                             color,
                             paint_quad,
-                            "fit" if _FIT_TOLERANCE_PATTERN.search(marking.source_text) else marking.kind,
+                            paint_kind,
                         )
                     explicit_general_candidates.add(id(matched))
                     marked_dimension_count += 1
@@ -6136,12 +6537,19 @@ class DrawingApi:
                     continue
                 total_range = marking.tolerance_range
                 color = _marking_highlight_color(marking.kind, total_range)
+                paint_kind = (
+                    "stacked_tolerance"
+                    if _has_stacked_tolerance_layout(marking)
+                    else "fit"
+                    if _FIT_TOLERANCE_PATTERN.search(marking.source_text)
+                    else marking.kind
+                )
                 for paint_rect, paint_quad in _marking_paint_parts(marking):
                     append_entry(
                         paint_rect,
                         color,
                         paint_quad,
-                        "fit" if _FIT_TOLERANCE_PATTERN.search(marking.source_text) else marking.kind,
+                        paint_kind,
                     )
                 marked_dimension_count += 1
 
@@ -6301,22 +6709,61 @@ class DrawingApi:
                 )
                 nominal_points = [fitz.Point(point) for point in nominal_quad]
                 extra_points = [fitz.Point(point) for point in tolerance_quad]
-                _n0, _n1, across0, across1, _axis, _normal = _axis_bounds(
-                    nominal_points, candidate.direction
+                paint_direction = _quad_reading_direction(
+                    nominal_points,
+                    candidate.direction,
+                )
+                along0, along1, across0, across1, _axis, _normal = _axis_bounds(
+                    nominal_points, paint_direction
                 )
                 thickness = max(across1 - across0, 2.8)
                 extra_along0, extra_along1, extra_across0, extra_across1, _ea, _en = (
-                    _axis_bounds(extra_points, candidate.direction)
+                    _axis_bounds(extra_points, paint_direction)
                 )
                 across_shift = abs(
                     ((extra_across0 + extra_across1) / 2)
                     - ((across0 + across1) / 2)
                 )
-                if across_shift <= 6.0:
+                along_gap = max(extra_along0 - along1, along0 - extra_along1, 0.0)
+                # 追加した上下公差と補足文字（幅／二面幅）は、元の寸法と
+                # 一つの注記である。軸平行は直交方向の張り出しも含めて
+                # 一本化し、斜め寸法は近接する場合だけ同じ向きの帯にする。
+                # これにより 0.12、14.7、3.9、1、2.9 と縦の補足文字を
+                # 分離せずに塗り、離れた斜め注記までは結合しない。
+                diagonal_contiguous = (
+                    abs(paint_direction[0]) < 0.92
+                    and across_shift <= max(10.0, thickness * 3.0)
+                    and along_gap <= max(6.0, thickness * 1.5)
+                )
+                join_across = (
+                    abs(paint_direction[0]) >= 0.92
+                    or abs(paint_direction[1]) >= 0.92
+                    or diagonal_contiguous
+                )
+                if join_across:
+                    joined_points = nominal_points + extra_points
+                    _j0, _j1, joined_across0, joined_across1, _ja, _jn = (
+                        _axis_bounds(joined_points, paint_direction)
+                    )
+                    joined_quad = _quad_same_thickness(
+                        joined_points,
+                        paint_direction,
+                        joined_across1 - joined_across0,
+                        along_expand=0.55,
+                    )
+                    append_entry(
+                        _marking_quad_bounds(joined_quad),
+                        color,
+                        joined_quad,
+                        "general_descriptor"
+                        if addition.suffix_rect is not None
+                        else candidate.kind,
+                    )
+                elif across_shift <= 6.0:
                     joined_quad = _extend_along_keep_across(
                         nominal_points,
                         extra_points,
-                        candidate.direction,
+                        paint_direction,
                         along_expand=0.6,
                     )
                     append_entry(
@@ -6330,7 +6777,7 @@ class DrawingApi:
                         _marking_quad_bounds(
                             _quad_same_thickness(
                                 nominal_points,
-                                candidate.direction,
+                                paint_direction,
                                 thickness,
                                 along_expand=0.4,
                             )
@@ -6338,7 +6785,7 @@ class DrawingApi:
                         color,
                         _quad_same_thickness(
                             nominal_points,
-                            candidate.direction,
+                            paint_direction,
                             thickness,
                             along_expand=0.4,
                         ),
@@ -6346,7 +6793,7 @@ class DrawingApi:
                     )
                     extra_quad = _quad_same_thickness(
                         extra_points,
-                        candidate.direction,
+                        paint_direction,
                         thickness,
                         along_expand=0.4,
                     )

@@ -54,6 +54,8 @@ from drawing_assist.web_app import (
     _marking_highlight_color,
     _marking_paint_parts,
     _merge_detected_markings,
+    _paint_entries_join,
+    _strip_from_paint_group,
     _unify_dimension_marking_entries,
 )
 
@@ -751,9 +753,84 @@ def _verify_native_drawing_detection() -> None:
         assert isinstance(descriptor_batch, DimensionMarkingBatch)
         descriptor_rect = fitz.Rect(face_addition.suffix_rect)
         assert any(
-            not (fitz.Rect(entry.rect) & descriptor_rect).is_empty
+            (fitz.Rect(entry.rect) & descriptor_rect).get_area()
+            >= descriptor_rect.get_area() * 0.80
             for entry in descriptor_batch.entries
         )
+
+        def reaches_descriptor_tail(
+            batch: DimensionMarkingBatch,
+            addition: ToleranceAddition,
+        ) -> bool:
+            """縦書き補足文字の最終字形まで帯が届くことを確認する。"""
+
+            assert addition.suffix_rect is not None
+            axis = fitz.Point(addition.direction)
+            axis /= math.hypot(axis.x, axis.y) or 1.0
+            suffix = fitz.Rect(addition.suffix_rect)
+            suffix_tail = max(
+                point.x * axis.x + point.y * axis.y
+                for point in (
+                    suffix.top_left,
+                    suffix.top_right,
+                    suffix.bottom_right,
+                    suffix.bottom_left,
+                )
+            )
+            return any(
+                entry.kind == "general_descriptor"
+                and entry.quad
+                and max(
+                    fitz.Point(point).x * axis.x + fitz.Point(point).y * axis.y
+                    for point in entry.quad
+                )
+                >= suffix_tail + 0.8
+                for entry in batch.entries
+            )
+
+        assert reaches_descriptor_tail(descriptor_batch, face_addition)
+
+        def reaches_redrawn_descriptor_tail(
+            batch: DimensionMarkingBatch,
+            addition: ToleranceAddition,
+        ) -> bool:
+            """公差の後ろへ再描画した補足語の末尾「）」まで帯が届く。"""
+
+            axis = fitz.Point(addition.direction)
+            axis /= math.hypot(axis.x, axis.y) or 1.0
+            redrawn_tail = max(
+                fitz.Point(point).x * axis.x + fitz.Point(point).y * axis.y
+                for point in api._full_tolerance_addition_quad(addition)
+            )
+            return any(
+                entry.kind == "general_descriptor"
+                and entry.quad
+                and max(
+                    fitz.Point(point).x * axis.x + fitz.Point(point).y * axis.y
+                    for point in entry.quad
+                )
+                >= redrawn_tail
+                for entry in batch.entries
+            )
+
+        assert reaches_redrawn_descriptor_tail(descriptor_batch, face_addition)
+
+        # 実図に残る「(幅)」も、追加した ±0.2 と同じ一本帯の末尾まで
+        # 含むこと。推定した追加文字位置だけを使うと縦書きで欠ける。
+        api.last_general_tolerance_batch = [groove_candidate]
+        api.last_general_tolerance_additions = [addition]
+        api.last_general_tolerance_marked = False
+        _scan_and_apply_markings(api)
+        groove_batch = api.items[-1]
+        assert isinstance(groove_batch, DimensionMarkingBatch)
+        groove_suffix_rect = fitz.Rect(addition.suffix_rect)
+        assert any(
+            (fitz.Rect(entry.rect) & groove_suffix_rect).get_area()
+            >= groove_suffix_rect.get_area() * 0.80
+            for entry in groove_batch.entries
+        )
+        assert reaches_descriptor_tail(groove_batch, addition)
+        assert reaches_redrawn_descriptor_tail(groove_batch, addition)
 
         diagonal_angle = next(
             candidate
@@ -1508,6 +1585,30 @@ def _verify_scanned_ocr_tolerance_recovery() -> None:
         assert unified[0].rect[2] - unified[0].rect[0] >= 85
         height = unified[0].rect[3] - unified[0].rect[1]
         assert 7.5 <= height <= 17.0
+        descriptor_fragments = [
+            PaintEntry(
+                (220, 40, 264, 54),
+                "#ffff00",
+                0.42,
+                ((220, 42), (264, 42), (264, 52), (220, 52)),
+                "general_descriptor",
+            ),
+            PaintEntry(
+                (265, 40, 318, 54),
+                "#ffff00",
+                0.42,
+                ((265, 42), (318, 42), (318, 52), (265, 52)),
+                "general_descriptor",
+            ),
+        ]
+        descriptor_unified = _strip_from_paint_group(
+            descriptor_fragments,
+            None,
+            1.0,
+            1.0,
+        )
+        assert descriptor_unified.kind == "general_descriptor"
+        assert descriptor_unified.rect[2] >= 317
         diagonal = PaintEntry(
             (90, 100, 160, 159),
             "#ffff00",
@@ -1828,6 +1929,154 @@ def _verify_scanned_ocr_tolerance_recovery() -> None:
     assert len(merged) == 3
 
 
+def _verify_stacked_vector_tolerance_detection() -> None:
+    """テキストPDFの上下公差と小さい小数寸法を回帰確認する。"""
+
+    document = fitz.open()
+    page = document.new_page(width=420, height=260)
+    # 基準となる通常寸法を置き、小さい 0.12 が寸法文字として扱われる
+    # 最低書体比になるようにする。
+    page.insert_text((80, 56), "14.7", fontsize=10)
+    page.insert_text((130, 56), "3.5", fontsize=10)
+    page.insert_text((208, 56), "0.12", fontsize=6)
+    page.draw_line((190, 60), (250, 60), width=0.25)
+    page.draw_line((190, 54), (190, 66), width=0.25)
+    page.draw_line((250, 54), (250, 66), width=0.25)
+    # 公称値と上下公差を別テキスト行へ置く。
+    page.insert_text((80, 130), "2.9", fontsize=10)
+    page.insert_text((112, 123), "+0.1", fontsize=6)
+    page.insert_text((112, 135), "0", fontsize=6)
+    page.draw_line((70, 140), (150, 140), width=0.25)
+    page.draw_line((70, 134), (70, 146), width=0.25)
+    page.draw_line((150, 134), (150, 146), width=0.25)
+    try:
+        markings = _detect_dimension_markings(page)
+        stacked = next(
+            marking
+            for marking in markings
+            if abs(marking.nominal_value - 2.9) < 1e-9
+        )
+        assert stacked.tolerance_range is not None
+        assert abs(stacked.tolerance_range - 0.1) < 1e-9
+        assert stacked.tolerance_quad is not None
+        tolerance_rect = fitz.Rect(stacked.tolerance_rect)
+        assert tolerance_rect.y0 <= 118 and tolerance_rect.y1 >= 135
+        paint_parts = _marking_paint_parts(stacked)
+        # 上下公差を公称値と同じ高さの一本帯にして、どちらも欠けずに覆う。
+        assert len(paint_parts) == 1
+        paint_rect, _paint_quad = paint_parts[0]
+        assert paint_rect[0] <= 80 and paint_rect[2] >= 118
+        assert paint_rect[1] <= 118 and paint_rect[3] >= 135
+
+        # 実図では上下公差のOCR枠が公称値よりさらに離れる場合がある。
+        # その場合も横書きの一注記として一本の帯に統合する。
+        wide_stacked = _DetectedDimensionMarking(
+            rect=(80, 130, 110, 141),
+            quad=((80, 130), (110, 130), (110, 141), (80, 141)),
+            direction=(1.0, 0.0),
+            source_text="2.9+0.1/0",
+            nominal_value=2.9,
+            kind="linear",
+            tolerance_range=0.1,
+            tolerance_rect=(112, 106, 130, 130),
+            tolerance_quad=((112, 106), (130, 106), (130, 130), (112, 130)),
+        )
+        wide_parts = _marking_paint_parts(wide_stacked)
+        assert len(wide_parts) == 1
+        wide_rect, _wide_quad = wide_parts[0]
+        assert wide_rect[0] <= 80 and wide_rect[2] >= 130
+        assert wide_rect[1] <= 106 and wide_rect[3] >= 141
+
+        # 細い「1」でも、横書きの読取方向を失わず上下公差まで一本で覆う。
+        compact_stacked = _DetectedDimensionMarking(
+            rect=(80, 168, 87, 181),
+            quad=((80, 168), (87, 168), (87, 181), (80, 181)),
+            direction=(1.0, 0.0),
+            source_text="1 0/-0.05",
+            nominal_value=1.0,
+            kind="linear",
+            tolerance_range=0.05,
+            tolerance_rect=(88, 153, 103, 181),
+            tolerance_quad=((88, 153), (103, 153), (103, 181), (88, 181)),
+        )
+        compact_parts = _marking_paint_parts(compact_stacked)
+        assert len(compact_parts) == 1
+        compact_rect, _compact_quad = compact_parts[0]
+        assert compact_rect[0] <= 80 and compact_rect[2] >= 103
+        assert compact_rect[1] <= 153 and compact_rect[3] >= 181
+
+        candidates = detect_general_tolerance_candidates(
+            page,
+            0,
+            standard="jis_b_0405",
+            grade="m",
+            ocr_script=ROOT / "src" / "drawing_assist" / "windows_ocr.ps1",
+        )
+        assert any(
+            abs(candidate.nominal_value - 0.12) < 1e-9
+            for candidate in candidates
+        )
+        assert not any(
+            abs(candidate.nominal_value - 2.9) < 1e-9
+            for candidate in candidates
+        )
+    finally:
+        document.close()
+
+
+def _verify_vertical_tolerance_paint_is_connected() -> None:
+    """縦書き寸法の上下公差は一本の帯として連結する。"""
+
+    marking = _DetectedDimensionMarking(
+        rect=(80, 100, 90, 140),
+        quad=((80, 100), (90, 100), (90, 140), (80, 140)),
+        direction=(0.0, 1.0),
+        source_text="φ19.4-0.01/-0.04",
+        nominal_value=19.4,
+        kind="diameter",
+        tolerance_range=0.04,
+        tolerance_rect=(74, 72, 92, 100),
+        tolerance_quad=((74, 72), (92, 72), (92, 100), (74, 100)),
+    )
+    parts = _marking_paint_parts(marking)
+    assert len(parts) == 1
+    rect, _quad = parts[0]
+    assert rect[0] <= 74 and rect[2] >= 92
+    assert rect[1] <= 72 and rect[3] >= 140
+
+
+def _verify_different_direction_paint_is_not_joined() -> None:
+    """横寸法と隣接する斜め角度の帯を統合しない。"""
+
+    horizontal = DimensionMarkingEntry(
+        (10, 10, 30, 14),
+        "#ffff00",
+        quad=((10, 10), (30, 10), (30, 14), (10, 14)),
+        kind="linear",
+    )
+    diagonal = DimensionMarkingEntry(
+        (28, 8, 43, 23),
+        "#ffff00",
+        quad=((31, 8), (43, 20), (40, 23), (28, 11)),
+        kind="angle",
+    )
+    assert not _paint_entries_join(horizontal, diagonal)
+
+    # 同じ値・同じ黄色でも、R/C の「以下」は別々の個別指示である。
+    radius_limit = DimensionMarkingEntry(
+        (50, 10, 84, 16),
+        "#ffff00",
+        quad=((50, 10), (84, 10), (84, 16), (50, 16)),
+        kind="limit",
+    )
+    chamfer_limit = DimensionMarkingEntry(
+        (85, 10, 119, 16),
+        "#ffff00",
+        quad=((85, 10), (119, 10), (119, 16), (85, 16)),
+        kind="limit",
+    )
+    assert not _paint_entries_join(radius_limit, chamfer_limit)
+
 
 def main() -> None:
     _verify_tables()
@@ -1847,6 +2096,9 @@ def main() -> None:
     _verify_hidden_ocr_window()
     _verify_native_drawing_detection()
     _verify_scanned_drawing_detection()
+    _verify_stacked_vector_tolerance_detection()
+    _verify_vertical_tolerance_paint_is_connected()
+    _verify_different_direction_paint_is_not_joined()
     print(
         "general tolerance tables, hidden OCR, native/image filtering, "
         "selection, and rendering: OK"

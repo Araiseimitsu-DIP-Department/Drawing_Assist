@@ -74,7 +74,8 @@ def main() -> None:
             markings = _detect_local_dimension_markings(page, ocr_page)
             marking_text = {item.source_text for item in markings}
             assert "50.6±0.05" in marking_text
-            assert "C0.2以下" not in marking_text
+            # 個別のR/C上限指示は一般注記ではなく、色分け対象の独立寸法。
+            assert "C0.2以下" in marking_text
             assert not any("指示なき" in text for text in marking_text)
             assert "φ0.02" not in marking_text
 

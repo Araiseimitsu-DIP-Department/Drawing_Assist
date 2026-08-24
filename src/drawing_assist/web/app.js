@@ -431,6 +431,9 @@
         step = "3";
         title = "手動で追加・修正";
         detail = "文字をクリック。選べないときはドラッグ。";
+      } else if (currentState.general_tolerance_checked) {
+        title = "対象寸法を検出";
+        detail = "未記載公差の寸法がなかったため、右の「対象寸法を検出」を押します。";
       } else {
         title = "先に①公差を反映";
         detail = "左の「公差未記載の寸法」を完了してください。";
@@ -542,6 +545,7 @@
   function updateWorkflowNavigation() {
     const toleranceDone =
       Number(currentState.general_tolerance_applied_count || 0) > 0;
+    const toleranceChecked = Boolean(currentState.general_tolerance_checked);
     const correctionCount =
       Number(currentState.added_dimension_count || 0) +
       Number(currentState.replacement_dimension_count || 0) +
@@ -556,7 +560,10 @@
       "ready",
       toleranceDone && !marked
     );
-    markingTool?.classList.toggle("next-step", toleranceDone && !marked);
+    markingTool?.classList.toggle(
+      "next-step",
+      (toleranceDone || toleranceChecked) && !marked
+    );
     markingTool?.classList.toggle("complete", marked);
     workTool?.classList.toggle("next-step", marked);
 
@@ -670,7 +677,8 @@
     );
     elements.removeAppliedTolerance.disabled = busy || !loaded;
     elements.scanDimensionMarkings.disabled =
-      busy || !loaded || appliedToleranceCount < 1 || marked;
+      busy || !loaded ||
+      (!appliedToleranceCount && !currentState.general_tolerance_checked) || marked;
     elements.applyDimensionMarkings.disabled =
       busy || !loaded || markingSelectedCount < 1 || marked;
     elements.removeDimensionMarking?.classList.toggle(
@@ -922,7 +930,13 @@
         }
       );
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      receiveState(await response.json());
+      const state = await response.json();
+      receiveState(state);
+      if (state.loaded) {
+        // 新しいPDFでは未記載公差のメニューだけを選択する。検出は利用者が
+        // 「公差未記載寸法を検出」を押したときに開始し、読込直後には実行しない。
+        selectTool("general_tolerance");
+      }
     } catch (error) {
       setBusy(false);
       setStatus(`PDFを開けませんでした: ${error}`, true);
