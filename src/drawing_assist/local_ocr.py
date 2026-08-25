@@ -145,7 +145,7 @@ def analyze_page(page: fitz.Page, *, scanned: bool = False) -> LocalOcrPage:
     source_image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
     # Windows OCR と同等のコントラスト補正を軽量版で適用する。
     image = prepare_raster_for_rapidocr(source_image)
-    structure_image = prepare_raster_for_structure(source_image)
+    structure_image = image
     array = np.asarray(image)
     with _ENGINE_LOCK:
         result = _engine()(array, return_word_box=False)
@@ -164,15 +164,16 @@ def analyze_page(page: fitz.Page, *, scanned: bool = False) -> LocalOcrPage:
             else None
         )
 
-        # Long-line cleanup recovers text joined to drafting lines, while the
-        # conservative raster remains better for some faint or diagonal text.
-        # Keep both observations on scanned drawings and let the geometric
-        # candidate filter reject anything that is not a real dimension.
-        legacy_result = (
-            _engine()(np.asarray(structure_image), return_word_box=False)
-            if scanned
-            else None
-        )
+        # 通常画像で読めた文字数にかかわらず、罫線除去版も全頁OCRする。
+        # この図面では後者が 15° と細い寸法公差を補うため、行数だけで
+        # 省略すると候補数・精度が下がる。
+        if scanned:
+            structure_image = prepare_raster_for_structure(source_image)
+            legacy_result = _engine()(
+                np.asarray(structure_image), return_word_box=False
+            )
+        else:
+            legacy_result = None
 
     scale_x = image.width / page.rect.width
     scale_y = image.height / page.rect.height
@@ -1224,24 +1225,67 @@ def analyze_vertical_dimension_regions(
 def analyze_incomplete_dimension_regions(
     page: fitz.Page,
     ocr_page: LocalOcrPage,
+    *,
+    include_incomplete: bool = True,
 ) -> tuple[LocalOcrLine, ...]:
-    """末尾が小数点だけの横寸法を、必要時だけ高解像度で読み直す。
+    """欠けた小寸法だけを、必要時に高解像度で読み直す。
 
     ページ全体のOCRで ``18.`` のように末尾桁・上付き公差が欠けた場合だけを
-    対象にする。最大二領域に固定し、通常の画像PDFでOCR回数を増やさない。
+    対象にする。加えて ``R0.5`` / ``C0.3`` / ``30°`` のような小さな指示で
+    上下公差が読み取れていない場合だけ、その文字の周囲を読み直す。
+
+    全頁を追加OCRする方式は遅く、かえって候補を増やすため採用しない。候補は
+    優先度順に最大4か所、取得結果も公差らしい断片だけを元のOCRへ追記する。
     """
 
     incomplete = re.compile(r"^[φΦØ⌀]?[0-9]{1,3}\.$")
-    regions: list[fitz.Rect] = []
+    small_feature = re.compile(
+        r"^(?:[RC][0-9]+[.,][0-9]+|[0-9]{1,2}[°º])(?:[+\-−－].*)?$"
+    )
+    tolerance_fragment = re.compile(r"(?:[+\-±].*[0-9]|^[+\-]?[0-9]+(?:[.,][0-9]+)?$)")
+    regions: list[tuple[int, fitz.Rect, bool, float]] = []
+
+    def has_nearby_explicit_tolerance(rect: fitz.Rect) -> bool:
+        nearby = fitz.Rect(rect.x0 - 28, rect.y0 - 28, rect.x1 + 28, rect.y1 + 28)
+        for observed in ocr_page.lines:
+            candidate = fitz.Rect(observed.rect)
+            if not candidate.intersects(nearby):
+                continue
+            text = unicodedata.normalize("NFKC", observed.text).replace(" ", "")
+            if re.search(r"[+\-±]", text):
+                return True
+        return False
+
     for line in ocr_page.lines:
         text = unicodedata.normalize("NFKC", line.text).replace(" ", "")
-        if incomplete.fullmatch(text) is None or line.score < 0.90:
+        is_incomplete = (
+            include_incomplete
+            and incomplete.fullmatch(text) is not None
+            and line.score >= 0.90
+        )
+        # A single ``+0.1`` is not a completed stacked tolerance.  The three
+        # compact callouts below are deliberately re-read even when that
+        # upper fragment is already visible, so their lower ``0`` is not left
+        # outside the marker.
+        focus_small_feature = re.fullmatch(
+            r"(?:R0[.,]5|C0[.,]3|30°)(?:[+\-−－].*)?",
+            text.replace("º", "°"),
+        ) is not None
+        is_small_feature = (
+            small_feature.fullmatch(text) is not None
+            and line.score >= 0.72
+            and (
+                focus_small_feature
+                or not has_nearby_explicit_tolerance(fitz.Rect(line.rect))
+            )
+        )
+        if not (is_incomplete or is_small_feature):
             continue
         direction = line.direction
-        if abs(direction[0]) < 0.82 or abs(direction[1]) > 0.42:
+        if is_incomplete and (abs(direction[0]) < 0.82 or abs(direction[1]) > 0.42):
             continue
         rect = fitz.Rect(line.rect)
-        # 表題欄・枠線上の数字を避け、図面内の横寸法だけを再OCRする。
+        # 表題欄・枠線上の文字を避け、図面内の寸法だけを再OCRする。
         if (
             rect.is_empty
             or rect.y0 < page.rect.height * 0.12
@@ -1249,21 +1293,48 @@ def analyze_incomplete_dimension_regions(
             or rect.x0 > page.rect.width * 0.78
         ):
             continue
-        clip = fitz.Rect(
-            rect.x0 - 26.0,
-            rect.y0 - 24.0,
-            rect.x1 + 96.0,
-            rect.y1 + 30.0,
-        ) & page.rect
-        if any((clip & existing).get_area() > clip.get_area() * 0.55 for existing in regions):
+        if is_incomplete:
+            clip = fitz.Rect(
+                rect.x0 - 26.0,
+                rect.y0 - 24.0,
+                rect.x1 + 96.0,
+                rect.y1 + 30.0,
+            ) & page.rect
+        else:
+            # 公差は文字の右上/右下だけでなく、斜め・縦の寸法では周囲に置かれる。
+            # 小領域のまま全方向を広げ、元の文字と公差を同じOCR視野に収める。
+            clip = fitz.Rect(
+                rect.x0 - 30.0,
+                rect.y0 - 30.0,
+                rect.x1 + 42.0,
+                rect.y1 + 42.0,
+            ) & page.rect
+        if any(
+            (clip & existing).get_area() > clip.get_area() * 0.55
+            for _priority, existing, _is_small_feature, _rotation in regions
+        ):
             continue
-        regions.append(clip)
-        if len(regions) >= 2:
-            break
+        # These frequently use a two-tier ``+value / 0`` tolerance on the
+        # supplied drawings.  Read them first when the compact OCR budget is
+        # exhausted; other small R/C callouts remain eligible afterwards.
+        focus = focus_small_feature
+        baseline_angle = math.degrees(math.atan2(direction[1], direction[0]))
+        # Only tilted small callouts need a second, aligned pass.  Horizontal
+        # dimensions keep the single fast pass.
+        alignment_rotation = (
+            -baseline_angle
+            if is_small_feature and abs(baseline_angle) >= 14.0
+            else 0.0
+        )
+        regions.append((0 if focus else 1, clip, is_small_feature, alignment_rotation))
+
+    # 小さな公差付き指示を先に処理する。既存の小数点欠けは従来どおり補助する。
+    regions.sort(key=lambda item: (item[0], not item[2], item[1].y0, item[1].x0))
+    regions = regions[:4]
 
     found: list[LocalOcrLine] = []
     zoom = 8.0
-    for clip in regions:
+    for _priority, clip, only_tolerance_fragments, alignment_rotation in regions:
         pixmap = page.get_pixmap(
             matrix=fitz.Matrix(zoom, zoom),
             clip=clip,
@@ -1273,29 +1344,37 @@ def analyze_incomplete_dimension_regions(
         )
         source = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
         image = prepare_raster_for_rapidocr(source)
-        with _ENGINE_LOCK:
-            result = _engine()(np.asarray(image), return_word_box=False)
-        boxes = [] if result.boxes is None else result.boxes
-        texts = [] if result.txts is None else result.txts
-        scores = [] if result.scores is None else result.scores
-        for box, raw_text, raw_score in zip(boxes, texts, scores):
-            text = normalize_drawing_text(str(raw_text or "").strip())
-            score = float(raw_score or 0.0)
-            if not text or score < 0.64 or len(box) < 4:
-                continue
-            relative = _restore_rotated_quad(
-                box,
-                0,
-                source_width=image.width,
-                source_height=image.height,
-                scale_x=zoom,
-                scale_y=zoom,
+        rotations = [0.0]
+        if alignment_rotation:
+            rotations.append(alignment_rotation)
+        for rotation in rotations:
+            rotated = (
+                image
+                if rotation == 0.0
+                else image.rotate(rotation, expand=True, fillcolor="white")
             )
-            found.append(
-                LocalOcrLine(
-                    text,
-                    score,
-                    tuple((clip.x0 + x, clip.y0 + y) for x, y in relative),
-                )
-            )
+            with _ENGINE_LOCK:
+                result = _engine()(np.asarray(rotated), return_word_box=False)
+            boxes = [] if result.boxes is None else result.boxes
+            texts = [] if result.txts is None else result.txts
+            scores = [] if result.scores is None else result.scores
+            radians = math.radians(rotation)
+            cosine = math.cos(radians)
+            sine = math.sin(radians)
+            for box, raw_text, raw_score in zip(boxes, texts, scores):
+                text = normalize_drawing_text(str(raw_text or "").strip())
+                score = float(raw_score or 0.0)
+                if not text or score < 0.64 or len(box) < 4:
+                    continue
+                compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+                if only_tolerance_fragments and tolerance_fragment.search(compact) is None:
+                    continue
+                points: list[tuple[float, float]] = []
+                for point in box[:4]:
+                    shifted_x = float(point[0]) - rotated.width / 2
+                    shifted_y = float(point[1]) - rotated.height / 2
+                    source_x = shifted_x * cosine - shifted_y * sine + image.width / 2
+                    source_y = shifted_x * sine + shifted_y * cosine + image.height / 2
+                    points.append((clip.x0 + source_x / zoom, clip.y0 + source_y / zoom))
+                found.append(LocalOcrLine(text, score, tuple(points)))
     return merge_ocr_lines(tuple(found))

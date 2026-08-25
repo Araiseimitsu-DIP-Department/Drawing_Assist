@@ -55,6 +55,8 @@ from drawing_assist.web_app import (
     _marking_paint_parts,
     _merge_detected_markings,
     _paint_entries_join,
+    _separate_limit_paint,
+    _stacked_tolerance_fragments,
     _strip_from_paint_group,
     _unify_dimension_marking_entries,
 )
@@ -1316,27 +1318,29 @@ def _verify_scanned_ocr_tolerance_recovery() -> None:
         fit_image,
         (
             vertical_line("Φ18.5±0.05", 438, 429, 456, 490),
-            vertical_line("Φ24.95G6", 461, 429, 481, 485),
+            # 縦書きの g はOCRで 9 と読まれやすい。右横の偏差がある
+            # 場合だけ、φ24.95g6 として復元できることを確認する。
+            vertical_line("Φ24.9596", 461, 429, 481, 485),
             LocalOcrLine(
                 "-0.007",
                 0.99,
-                ((483, 428), (496, 428), (496, 444), (483, 444)),
+                ((465, 428), (477, 428), (477, 444), (465, 444)),
             ),
             LocalOcrLine(
                 "-0.020",
                 0.99,
-                ((483, 444), (496, 444), (496, 460), (483, 460)),
+                ((465, 444), (477, 444), (477, 460), (465, 460)),
             ),
             vertical_line("Φ26G6", 482, 439, 499, 475),
             LocalOcrLine(
                 "-0.007",
                 0.99,
-                ((501, 438), (514, 438), (514, 454), (501, 454)),
+                ((484, 402), (496, 402), (496, 418), (484, 418)),
             ),
             LocalOcrLine(
                 "-0.020",
                 0.99,
-                ((501, 454), (514, 454), (514, 470), (501, 470)),
+                ((484, 418), (496, 418), (496, 434), (484, 434)),
             ),
         ),
     )
@@ -1363,10 +1367,11 @@ def _verify_scanned_ocr_tolerance_recovery() -> None:
             fitz.Rect(left.rect).get_area(),
             fitz.Rect(right.rect).get_area(),
         )
-        assert left.tolerance_rect is not None
-        assert right.tolerance_rect is not None
-        assert left.tolerance_rect[2] >= 494
-        assert right.tolerance_rect[2] >= 512
+        # 偏差は本体帯または専用帯に入るが、隣のg6の領域へは広がらない。
+        left_coverage = fitz.Rect(left.tolerance_rect or left.rect)
+        right_coverage = fitz.Rect(right.tolerance_rect or right.rect)
+        assert (left_coverage & fitz.Rect(right.rect)).get_area() < 0.45 * fitz.Rect(right.rect).get_area()
+        assert (right_coverage & fitz.Rect(left.rect)).get_area() < 0.45 * fitz.Rect(left.rect).get_area()
         yellow = next(
             item
             for item in fit_markings
@@ -1384,6 +1389,29 @@ def _verify_scanned_ocr_tolerance_recovery() -> None:
         paint_parts = _marking_paint_parts(left)
         widths = [part[0][2] - part[0][0] for part in paint_parts]
         assert max(widths) - min(widths) < 3.0
+
+        # 高精細の回転OCRでは、g6の偏差が本体の右ではなく上側へ
+        # 重なった座標で戻る。実図と同じ配置でも偏差まで覆うこと。
+        overlapping_fit_ocr = LocalOcrPage(
+            2382,
+            1684,
+            2.0,
+            2.0,
+            fit_image,
+            (
+                vertical_line("24.95G6", 465, 431, 477, 485),
+                vertical_line("-0.007", 465, 404, 472, 428),
+                vertical_line("-0.020", 470, 404, 477, 428),
+            ),
+        )
+        overlapping_fit = _detect_local_dimension_markings(
+            fit_page,
+            overlapping_fit_ocr,
+            include_plain_dimensions=False,
+            scanned_page=True,
+        )
+        assert len(overlapping_fit) == 1
+        assert overlapping_fit[0].rect[1] <= 405
     finally:
         fit_document.close()
 
@@ -1929,6 +1957,70 @@ def _verify_scanned_ocr_tolerance_recovery() -> None:
     assert len(merged) == 3
 
 
+def _verify_stacked_ocr_coordinate_association() -> None:
+    """Upper/lower OCR fragments must stay with their own nominal lane."""
+
+    document = fitz.open()
+    page = document.new_page(width=400, height=200)
+    image = Image.new("L", (800, 400), 255)
+    nominal = LocalOcrLine(
+        "10", 0.99, ((80, 100), (100, 100), (100, 108), (80, 108))
+    )
+    upper = LocalOcrLine(
+        "+0.02", 0.99, ((103, 90), (132, 90), (132, 97), (103, 97))
+    )
+    lower = LocalOcrLine(
+        "-0.01", 0.99, ((103, 109), (132, 109), (132, 116), (103, 116))
+    )
+    # This is a tolerance-shaped OCR read, but it belongs to a different
+    # dimension lane and must not enlarge the 10's highlight.
+    foreign = LocalOcrLine(
+        "+0.04", 0.99, ((180, 90), (209, 90), (209, 97), (180, 97))
+    )
+    ocr = LocalOcrPage(
+        800, 400, 2.0, 2.0, image, (nominal, upper, lower, foreign)
+    )
+    try:
+        fragments = _stacked_tolerance_fragments(nominal, ocr.lines)
+        assert {item.text for item in fragments} == {"+0.02", "-0.01"}
+        markings = _detect_local_dimension_markings(
+            page, ocr, include_plain_dimensions=False, scanned_page=True
+        )
+        assert len(markings) == 1
+        marking = markings[0]
+        assert "+0.02" in marking.source_text
+        assert "-0.01" in marking.source_text
+        assert marking.rect[2] < 140
+    finally:
+        document.close()
+
+    # 隣接する縦g6列では、偏差のxレーンが本体と重なるものだけを採用する。
+    left_fit = LocalOcrLine(
+        "φ24.95g6", 0.98, ((80, 90), (80, 145), (90, 145), (90, 90))
+    )
+    left_upper = LocalOcrLine(
+        "-0.007", 0.98, ((81, 66), (81, 87), (87, 87), (87, 66))
+    )
+    left_lower = LocalOcrLine(
+        "-0.020", 0.98, ((85, 66), (85, 87), (90, 87), (90, 66))
+    )
+    right_fit = LocalOcrLine(
+        "φ26g6", 0.98, ((98, 96), (98, 142), (108, 142), (108, 96))
+    )
+    right_upper = LocalOcrLine(
+        "-0.007", 0.98, ((99, 72), (99, 93), (105, 93), (105, 72))
+    )
+    right_lower = LocalOcrLine(
+        "-0.020", 0.98, ((103, 72), (103, 93), (108, 93), (108, 72))
+    )
+    left_fragments = _stacked_tolerance_fragments(
+        left_fit,
+        (left_fit, left_upper, left_lower, right_fit, right_upper, right_lower),
+        fit=True,
+    )
+    assert set(left_fragments) == {left_upper, left_lower}
+
+
 def _verify_stacked_vector_tolerance_detection() -> None:
     """テキストPDFの上下公差と小さい小数寸法を回帰確認する。"""
 
@@ -2045,6 +2137,26 @@ def _verify_vertical_tolerance_paint_is_connected() -> None:
     assert rect[1] <= 72 and rect[3] >= 140
 
 
+def _verify_tolerance_paint_rejects_empty_union() -> None:
+    """誤関連付けでできる大きな空白矩形は、文字帯へ退避する。"""
+
+    distant_tolerance = _DetectedDimensionMarking(
+        rect=(100, 100, 134, 108),
+        quad=((100, 100), (134, 100), (134, 108), (100, 108)),
+        direction=(1.0, 0.0),
+        source_text="15.25+0.05/0",
+        nominal_value=15.25,
+        kind="linear",
+        tolerance_range=0.05,
+        # OCRが離れた別の数値を公差候補と誤結合した状態を再現する。
+        tolerance_rect=(184, 142, 204, 151),
+        tolerance_quad=((184, 142), (204, 142), (204, 151), (184, 151)),
+    )
+    parts = _marking_paint_parts(distant_tolerance)
+    assert len(parts) == 2
+    assert all((rect[2] - rect[0]) < 42 for rect, _quad in parts)
+
+
 def _verify_different_direction_paint_is_not_joined() -> None:
     """横寸法と隣接する斜め角度の帯を統合しない。"""
 
@@ -2077,6 +2189,61 @@ def _verify_different_direction_paint_is_not_joined() -> None:
     )
     assert not _paint_entries_join(radius_limit, chamfer_limit)
 
+    # OCR経路の統合でも、同じ値の R/C 上限指示を一つに戻さない。
+    limit_radius = _DetectedDimensionMarking(
+        rect=(50, 30, 84, 38),
+        quad=((50, 30), (84, 30), (84, 38), (50, 38)),
+        direction=(1.0, 0.0),
+        source_text="R0.2以下",
+        nominal_value=0.2,
+        kind="limit",
+        tolerance_range=1.0,
+    )
+    limit_chamfer = _DetectedDimensionMarking(
+        rect=(52, 39, 86, 47),
+        quad=((52, 39), (86, 39), (86, 47), (52, 47)),
+        direction=(1.0, 0.0),
+        source_text="C0.2以下",
+        nominal_value=0.2,
+        kind="limit",
+        tolerance_range=1.0,
+    )
+    merged_limits = _merge_detected_markings(
+        [limit_radius], [limit_chamfer]
+    )
+    assert len(merged_limits) == 2
+    overlapping_limits = _separate_limit_paint(
+        [
+            DimensionMarkingEntry((50, 30, 84, 41), "#ffff00", kind="limit"),
+            DimensionMarkingEntry((52, 37, 86, 48), "#ffff00", kind="limit"),
+        ]
+    )
+    assert (fitz.Rect(overlapping_limits[0].rect) & fitz.Rect(overlapping_limits[1].rect)).is_empty
+
+    # 小R/Cの上付き公差を別OCR枠で読んだ場合も、寸法と公差を同じ帯で覆う。
+    small_body = _DetectedDimensionMarking(
+        rect=(120, 60, 156, 68),
+        quad=((120, 60), (156, 60), (156, 68), (120, 68)),
+        direction=(1.0, 0.0),
+        source_text="C0.1±0.05",
+        nominal_value=0.1,
+        kind="chamfer",
+        tolerance_range=0.1,
+    )
+    small_tolerance = _DetectedDimensionMarking(
+        rect=(142, 51, 164, 60),
+        quad=((142, 51), (164, 51), (164, 60), (142, 60)),
+        direction=(1.0, 0.0),
+        source_text="C0.1±0.05",
+        nominal_value=0.1,
+        kind="chamfer",
+        tolerance_range=0.1,
+    )
+    merged_small = _merge_detected_markings([small_body], [small_tolerance])
+    assert len(merged_small) == 1
+    assert merged_small[0].rect[1] <= 51
+    assert merged_small[0].rect[3] >= 68
+
 
 def main() -> None:
     _verify_tables()
@@ -2096,8 +2263,10 @@ def main() -> None:
     _verify_hidden_ocr_window()
     _verify_native_drawing_detection()
     _verify_scanned_drawing_detection()
+    _verify_stacked_ocr_coordinate_association()
     _verify_stacked_vector_tolerance_detection()
     _verify_vertical_tolerance_paint_is_connected()
+    _verify_tolerance_paint_rejects_empty_union()
     _verify_different_direction_paint_is_not_joined()
     print(
         "general tolerance tables, hidden OCR, native/image filtering, "

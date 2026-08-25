@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 # 画面表示・ビルド確認用（再ビルドのたびに更新する）
-APP_BUILD_ID = "2026-08-24-color63"
+APP_BUILD_ID = "2026-08-25-color77"
 
 # RapidOCR（ページ全体）のレンダリング倍率
 LOCAL_OCR_ZOOM_MIN = 2.4

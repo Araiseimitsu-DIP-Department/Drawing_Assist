@@ -39,6 +39,10 @@ from drawing_assist.local_ocr import (
     local_ocr_available,
 )
 from drawing_assist.drawing_text_normalizer import is_tolerance_fragment
+from drawing_assist.drawing_structure import (
+    dimension_line_score,
+    extract_structure_segments,
+)
 from drawing_assist.ocr_config import APP_BUILD_ID
 from drawing_assist.ocr_debug_logger import OcrPipelineRecorder
 
@@ -116,6 +120,7 @@ class _DetectedDimensionMarking:
     reference: bool = False
     tolerance_rect: tuple[float, float, float, float] | None = None
     tolerance_quad: tuple[tuple[float, float], ...] | None = None
+    structure_score: float = 0.5
 
 
 _MARKING_NUMBER_PATTERN = re.compile(
@@ -214,6 +219,71 @@ def _is_fit_cluster_line(text: str) -> bool:
         # ``(2)`` のように読まれることがある。括弧を伴う短い断片だけ
         # を本体候補へ渡し、空白領域を推定して塗ることはしない。
         or bool(re.fullmatch(r"[()（）][0-9.,+\-()（）]{0,8}", compact))
+    )
+
+
+def _is_explicit_fit_deviation(text: str) -> bool:
+    """Return true only for a parenthetical or signed fit-deviation read."""
+
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    return _is_fit_cluster_line(compact) and bool(
+        re.search(r"[()（）+\-−－]", compact)
+    )
+
+
+def _recover_g6_fit_from_deviations(
+    text: str,
+    line: LocalOcrLine,
+    lines: tuple[LocalOcrLine, ...],
+) -> tuple[str, float] | None:
+    """Recover a vertical ``g6`` when OCR reads its ``g`` as ``9``.
+
+    The recovery is deliberately gated by the two-column fit layout: a
+    diameter ending in ``96`` alone is a perfectly plausible ordinary number,
+    whereas the same text with a directly adjacent parenthetical deviation is
+    unambiguous fit evidence.
+    """
+
+    compact = unicodedata.normalize("NFKC", text).replace(" ", "")
+    match = re.fullmatch(
+        r"(?P<prefix>[φΦØ⌀])(?P<nominal>\d+(?:[.,]\d+)?)(?:9)6",
+        compact,
+    )
+    if match is None or not _fit_line_is_columnar(line):
+        return None
+    try:
+        nominal = float(match.group("nominal").replace(",", "."))
+    except ValueError:
+        return None
+    owner = fitz.Rect(line.rect)
+    for nearby in lines:
+        if nearby is line or not _is_fit_deviation_fragment(nearby.text):
+            continue
+        nearby_rect = fitz.Rect(nearby.rect)
+        vertical_overlap = min(owner.y1, nearby_rect.y1) - max(
+            owner.y0, nearby_rect.y0
+        )
+        right_gap = nearby_rect.x0 - owner.x1
+        if vertical_overlap > -4.0 and -4.0 <= right_gap <= 34.0:
+            return (f"{match.group('prefix')}{match.group('nominal')}G6", nominal)
+    return None
+
+
+def _is_plausible_columnar_fit_cluster(
+    owner: LocalOcrLine,
+    nearby: LocalOcrLine,
+) -> bool:
+    """Reject a broad OCR region masquerading as a vertical fit deviation."""
+
+    owner_rect = fitz.Rect(owner.rect)
+    nearby_rect = fitz.Rect(nearby.rect)
+    # A parenthetical fit deviation is a narrow, at-most-two-row label.  A
+    # large OCR block in the same right-hand lane previously produced the
+    # oversized pink rectangle seen beside φ26g6.
+    return (
+        nearby_rect.width <= max(28.0, owner_rect.width * 1.65)
+        and nearby_rect.height <= max(56.0, owner_rect.height * 0.82)
+        and nearby_rect.get_area() <= max(950.0, owner_rect.get_area() * 1.35)
     )
 
 
@@ -420,7 +490,19 @@ def _fit_owns_parenthetical(
             owner_rect = fitz.Rect(owner.rect)
             nearby_rect = fitz.Rect(nearby_line.rect)
             gap_x = nearby_rect.x0 - owner_rect.x1
-            beside_ok = along_overlap > 0 and -4.0 <= gap_x <= 30.0
+            # 図面の縦 g6 では、括弧内偏差が本体の右横かつ少し上側に
+            # 置かれることがある（φ26g6 のような配置）。縦方向に重なる
+            # 場合だけではその2段公差を取り逃がすため、右横レーンにあり
+            # 近い前後位置なら同じ「横付き」帯として帰属させる。
+            along_gap = max(
+                nearby_along0 - owner_along1,
+                owner_along0 - nearby_along1,
+                0.0,
+            )
+            beside_ok = (
+                -4.0 <= gap_x <= 30.0
+                and along_gap <= max(34.0, min(76.0, (owner_along1 - owner_along0) * 1.15))
+            )
             if beside_ok:
                 across_dist = max(gap_x, 0.0)
                 # 縦寸法列では、同じ高さで右横に置かれた偏差を「後続」と
@@ -452,6 +534,151 @@ def _fit_owns_parenthetical(
     if ranked[0][3] is not fit_line:
         return None
     return "after" if ranked[0][0] == 0 else "beside"
+
+
+def _stacked_tolerance_fragments(
+    owner: LocalOcrLine,
+    lines: tuple[LocalOcrLine, ...],
+    *,
+    fit: bool = False,
+) -> tuple[LocalOcrLine, ...]:
+    """Return only small, explicitly read tolerance labels owned by a dimension."""
+
+    owner_rect = fitz.Rect(owner.rect)
+    columnar = _fit_line_is_columnar(owner)
+    owner_compact = unicodedata.normalize("NFKC", owner.text).replace(" ", "")
+    owner_has_signed_tolerance = bool(re.search(r"[+\-−－]\d", owner_compact))
+    ranked: list[tuple[float, int, LocalOcrLine]] = []
+    for index, candidate in enumerate(lines):
+        if candidate is owner:
+            continue
+        compact = unicodedata.normalize("NFKC", candidate.text).replace(" ", "")
+        if fit:
+            # Parenthesis glyphs are added only after an actual signed value
+            # has been selected; a lone ``(`` must not win the nearest-slot
+            # ranking over the value that follows it.
+            if not _is_fit_deviation_fragment(compact):
+                continue
+            if not (
+                re.search(r"[+\-−－]", compact)
+                or compact in {"0", "(0)", "（0）"}
+            ):
+                continue
+        elif not re.fullmatch(
+            r"(?:[+\-−－]\d*(?:[.,]\d+)?|0(?:[.,]\d+)?)", compact
+        ):
+            continue
+        # A zero is retained provisionally.  The final group check below
+        # requires a signed companion, so a lone OCR "0" is still rejected
+        # while ``R0.5 +0.1 / 0`` can be completed as one tolerance.
+        candidate_rect = fitz.Rect(candidate.rect)
+        max_fragment_area = (
+            max(1400.0, owner_rect.get_area() * 2.5)
+            if fit
+            else max(760.0, owner_rect.get_area() * 1.45)
+        )
+        if candidate_rect.is_empty or candidate_rect.get_area() > max_fragment_area:
+            continue
+        if columnar:
+            # Vertical fit dimensions must own the same x lane as their
+            # deviations.  Allowing a wholly right-side lane here caused
+            # φ24.95g6 to absorb φ26g6's (-0.007/-0.020) and vice versa.
+            # A genuine superscript/subscript overlaps the nominal lane even
+            # when OCR clips its leftmost parenthesis.
+            lane_overlap = min(candidate_rect.x1, owner_rect.x1) - max(
+                candidate_rect.x0, owner_rect.x0
+            )
+            if lane_overlap < max(1.5, min(candidate_rect.width, owner_rect.width) * 0.24):
+                continue
+            right_gap = candidate_rect.x0 - owner_rect.x1
+            vertical_gap = max(
+                owner_rect.y0 - candidate_rect.y1,
+                candidate_rect.y0 - owner_rect.y1,
+                0.0,
+            )
+            if not (
+                -max(14.0, owner_rect.width * 1.15)
+                <= right_gap
+                <= max(5.0, owner_rect.width * 0.48)
+                and vertical_gap <= max(34.0, owner_rect.height * 0.72)
+            ):
+                continue
+            # Prefer a genuine adjacent-right lane when available.  An
+            # overlapping fallback remains valid for rotated OCR, but must
+            # not steal the preceding dimension's deviations in a dense
+            # column of fits.
+            distance = (
+                max(right_gap, 0.0)
+                + max(-right_gap, 0.0) * 0.65
+                + vertical_gap * 0.18
+            )
+        else:
+            # Horizontal upper/lower deviations must occupy the right-side
+            # lane, not merely be close to the nominal OCR rectangle.
+            right_gap = candidate_rect.x0 - owner_rect.x1
+            vertical_gap = max(
+                owner_rect.y0 - candidate_rect.y1,
+                candidate_rect.y0 - owner_rect.y1,
+                0.0,
+            )
+            if not (
+                -max(4.0, owner_rect.width * 0.18)
+                <= right_gap
+                <= max(40.0, owner_rect.width * 1.45)
+                and vertical_gap <= max(28.0, owner_rect.height * 2.4)
+            ):
+                continue
+            distance = max(right_gap, 0.0) + vertical_gap * 0.35
+        ranked.append((distance, index, candidate))
+
+    if not ranked:
+        return ()
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    first = ranked[0][2]
+    first_rect = fitz.Rect(first.rect)
+    selected = [first]
+    # Keep at most an upper/lower pair in one narrow tolerance lane.  Taking
+    # a third nearby OCR block is the oversized-highlight failure mode.
+    for _distance, _index, candidate in ranked[1:]:
+        rect = fitz.Rect(candidate.rect)
+        lane_offset_limit = (
+            max(5.0, owner_rect.width * 0.52)
+            if columnar
+            else max(14.0, owner_rect.width * 0.9)
+        )
+        if abs(rect.x0 - first_rect.x0) > lane_offset_limit:
+            continue
+        if abs(rect.width - first_rect.width) > max(16.0, first_rect.width * 1.1):
+            continue
+        same_vertical_band = (
+            min(rect.y1, first_rect.y1) - max(rect.y0, first_rect.y0)
+            >= min(rect.height, first_rect.height) * 0.42
+        )
+        if not (
+            _ocr_lines_near(
+                candidate, first, gap=max(22.0, owner_rect.height * 0.8)
+            )
+            # Rotated OCR can place the two vertical-fit deviations in the
+            # same y band.  They still belong together only after the strict
+            # x-lane test above has accepted both of them.
+            or (columnar and same_vertical_band)
+        ):
+            continue
+        selected.append(candidate)
+        break
+
+    # A lone zero is ambiguous.  A unilateral signed value is valid; an
+    # explicit sign is mandatory for every accepted group.
+    compact_selected = [
+        unicodedata.normalize("NFKC", item.text).replace(" ", "")
+        for item in selected
+    ]
+    if not owner_has_signed_tolerance and not any(
+        value.lstrip("(（").startswith(("+", "-", "−", "－"))
+        for value in compact_selected
+    ):
+        return ()
+    return tuple(selected)
 
 
 def _iso_fit_tolerance_width(nominal: float, grade: int) -> float | None:
@@ -880,6 +1107,59 @@ def _has_stacked_tolerance_layout(marking: _DetectedDimensionMarking) -> bool:
     )
 
 
+def _tolerance_group_has_compact_footprint(
+    base_points: list[fitz.Point],
+    tolerance_points: list[fitz.Point],
+    direction: tuple[float, float],
+) -> bool:
+    """Reject a tolerance union when its empty area signals a false link.
+
+    OCR boxes for a legitimate nominal value and its upper/lower tolerance
+    may overlap, or form two adjacent lanes.  Their combined oriented bounds
+    remain compact.  A falsely-associated label produces a large, mostly
+    empty rectangle; drawing that rectangle was the source of the oversized
+    yellow/pink markings.  In that case the caller retains the two precise
+    OCR quads instead of filling the untrusted gap.
+    """
+
+    base_along0, base_along1, base_across0, base_across1, _axis, _normal = (
+        _axis_bounds(base_points, direction)
+    )
+    extra_along0, extra_along1, extra_across0, extra_across1, _eaxis, _enormal = (
+        _axis_bounds(tolerance_points, direction)
+    )
+    base_area = max(
+        (base_along1 - base_along0) * (base_across1 - base_across0), 1.0
+    )
+    extra_area = max(
+        (extra_along1 - extra_along0) * (extra_across1 - extra_across0), 1.0
+    )
+    union_area = max(
+        max(base_along1, extra_along1) - min(base_along0, extra_along0), 1.0
+    ) * max(
+        max(base_across1, extra_across1) - min(base_across0, extra_across0), 1.0
+    )
+    along_gap = max(
+        extra_along0 - base_along1,
+        base_along0 - extra_along1,
+        0.0,
+    )
+    across_gap = max(
+        extra_across0 - base_across1,
+        base_across0 - extra_across1,
+        0.0,
+    )
+    character_width = max(
+        min(base_across1 - base_across0, extra_across1 - extra_across0), 2.8
+    )
+    # The ratio permits upper/lower tolerance lanes, but blocks only a union
+    # that contains a full character-width gap and is mostly empty.
+    return not (
+        union_area > (base_area + extra_area) * 2.65
+        and (along_gap > character_width or across_gap > character_width)
+    )
+
+
 def _marking_paint_parts(
     marking: _DetectedDimensionMarking,
 ) -> list[tuple[tuple[float, float, float, float], tuple[tuple[float, float], ...]]]:
@@ -932,8 +1212,6 @@ def _marking_paint_parts(
         and across_shift <= max(10.0, thickness * 3.0)
         and along_gap <= max(6.0, thickness * 1.5)
     )
-    # 縦の g6/H7 の括弧内偏差は、読み方向に連続していても別帯にする。
-    # 本体へ結合すると括弧部分が他色の寸法へ食い込みやすい。
     fit_tolerance = bool(
         _FIT_TOLERANCE_PATTERN.search(
             unicodedata.normalize("NFKC", marking.source_text)
@@ -944,9 +1222,27 @@ def _marking_paint_parts(
         or stacked_across
         or compact_stacked_across
         or diagonal_contiguous
-    ) and not fit_tolerance:
+        # はめあいの括弧内偏差は本体の上側へ離して置かれる場合がある。
+        # 検出済みの偏差は、間隔にかかわらず一つの寸法公差帯に統合する。
+        or (fit_tolerance and abs(direction[0]) < 0.92)
+    ):
+        # OCR may associate a nearby but unrelated number as a tolerance.
+        # Do not paint the whitespace between them as a single giant marker.
+        # Keeping the original quads still makes every recognized glyph
+        # visible, while the layout graph remains available for review.
+        if not _tolerance_group_has_compact_footprint(
+            base_points, extra_points, direction
+        ):
+            body_quad = _quad_same_thickness(
+                base_points, direction, thickness, along_expand=0.4
+            )
+            return [
+                (_marking_quad_bounds(body_quad), body_quad),
+                (_marking_quad_bounds(extra_quad), extra_quad),
+            ]
         # 縦書き寸法の上下公差は、本体より横幅が広い。公称値側の幅だけを
         # 維持すると「-0.01/-0.04」や「+0.03/0」の片側が塗り切れない。
+        # g6/H7の括弧内偏差も同じく、寸法値と公差を一つの帯で覆う。
         # 2つのOCR枠の外接幅で一本の帯を作り、手修正時と同じく公称値と
         # 公差を確実に連結する。
         # 横書きの上下公差も、別帯の段差ではなく公称値を含む同じ高さの
@@ -1601,6 +1897,63 @@ def _separate_other_color_paint(
     return result
 
 
+def _separate_limit_paint(
+    entries: list[DimensionMarkingEntry],
+) -> list[DimensionMarkingEntry]:
+    """Keep adjacent R/C ``以下`` callouts as two readable yellow bands."""
+
+    result = list(entries)
+    for left_index, left in enumerate(result):
+        if left.kind != "limit":
+            continue
+        left_rect = fitz.Rect(left.rect)
+        for right_index in range(left_index + 1, len(result)):
+            right = result[right_index]
+            if right.kind != "limit" or right.color != left.color:
+                continue
+            right_rect = fitz.Rect(right.rect)
+            overlap = left_rect & right_rect
+            if overlap.is_empty:
+                continue
+            # These callouts are laid out as horizontal text in consecutive
+            # rows.  Split only the intersecting padding at the midpoint;
+            # their glyph cores stay untouched and neither instruction is
+            # merged into the other.
+            horizontal_pair = left_rect.width >= left_rect.height and right_rect.width >= right_rect.height
+            if not horizontal_pair or overlap.width < min(left_rect.width, right_rect.width) * 0.30:
+                continue
+            upper_index, lower_index = (
+                (left_index, right_index)
+                if (left_rect.y0 + left_rect.y1) <= (right_rect.y0 + right_rect.y1)
+                else (right_index, left_index)
+            )
+            upper = fitz.Rect(result[upper_index].rect)
+            lower = fitz.Rect(result[lower_index].rect)
+            split_y = (max(upper.y0, lower.y0) + min(upper.y1, lower.y1)) / 2
+            if split_y <= upper.y0 + 2.2 or split_y >= lower.y1 - 2.2:
+                continue
+            upper.y1 = min(upper.y1, split_y - 0.35)
+            lower.y0 = max(lower.y0, split_y + 0.35)
+            result[upper_index] = replace(
+                result[upper_index],
+                rect=tuple(upper),
+                quad=(
+                    (upper.x0, upper.y0), (upper.x1, upper.y0),
+                    (upper.x1, upper.y1), (upper.x0, upper.y1),
+                ),
+            )
+            result[lower_index] = replace(
+                result[lower_index],
+                rect=tuple(lower),
+                quad=(
+                    (lower.x0, lower.y0), (lower.x1, lower.y0),
+                    (lower.x1, lower.y1), (lower.x0, lower.y1),
+                ),
+            )
+            left_rect = fitz.Rect(result[left_index].rect)
+    return result
+
+
 def _unify_dimension_marking_entries(
     entries: list[DimensionMarkingEntry],
     image: Image.Image | None = None,
@@ -1686,9 +2039,9 @@ def _unify_dimension_marking_entries(
             unified.append(
                 _strip_from_paint_group(group, image, scale_x, scale_y)
             )
-    return _separate_other_color_paint(
+    return _separate_limit_paint(_separate_other_color_paint(
         _align_collinear_complete_strips(_equalize_beside_paint(unified))
-    )
+    ))
 
 
 def _same_callout_fragments(
@@ -1697,6 +2050,14 @@ def _same_callout_fragments(
 ) -> bool:
     """同じ寸法のOCR断片かどうか。隣の別寸法はまとめない。"""
 
+    left_text = unicodedata.normalize("NFKC", left.source_text).replace(" ", "")
+    right_text = unicodedata.normalize("NFKC", right.source_text).replace(" ", "")
+    # ``R0.2以下`` と ``C0.2以下`` は同じ呼び径でも一つの指示ではない。
+    # OCR経路ごとの重複だけは除けるよう、上限指示では完全に同じ文字列の
+    # 場合に限って断片として扱う。
+    if left.kind == "limit" or right.kind == "limit":
+        if left.kind != right.kind or left_text != right_text:
+            return False
     kinds = {left.kind, right.kind}
     if left.kind != right.kind and not kinds <= {"linear", "diameter"}:
         return False
@@ -1704,8 +2065,6 @@ def _same_callout_fragments(
         return False
     if left.kind == "roughness" and right.kind == "roughness":
         return _roughness_fragments_join(left, right)
-    left_text = unicodedata.normalize("NFKC", left.source_text).replace(" ", "")
-    right_text = unicodedata.normalize("NFKC", right.source_text).replace(" ", "")
     left_rect = fitz.Rect(left.rect)
     right_rect = fitz.Rect(right.rect)
     distance = math.dist(
@@ -1868,7 +2227,9 @@ def _marking_highlight_color(kind: str, total_range: float | None) -> str:
     return "#ff33cc" if total_range <= limit + 1e-9 else "#ffff00"
 
 
-def _marking_ocr_quality(text: str, score: float) -> tuple[int, int, float]:
+def _marking_ocr_quality(
+    text: str, score: float, structure_score: float = 0.5
+) -> tuple[int, int, float]:
     """重複候補の採用判定用。公差の読みが整っている方を優先する。"""
 
     compact = unicodedata.normalize("NFKC", text).replace(" ", "")
@@ -1892,7 +2253,9 @@ def _marking_ocr_quality(text: str, score: float) -> tuple[int, int, float]:
     stem = re.split(r"[±+\-－−士土]", compact, maxsplit=1)[0]
     digit_count = len(re.sub(r"\D", "", stem))
     quality += min(5, digit_count)
-    return (quality, len(compact), float(score))
+    # Structure is deliberately only a tie breaker.  It improves the chosen
+    # geometry for duplicate OCR readings but never drops an OCR candidate.
+    return (quality, len(compact), float(score) + structure_score * 0.08)
 
 
 def _merge_detected_markings(
@@ -1913,7 +2276,9 @@ def _merge_detected_markings(
             (item_rect.x0 + item_rect.x1) / 2,
             (item_rect.y0 + item_rect.y1) / 2,
         )
-        item_quality = _marking_ocr_quality(item.source_text, extra_score)
+        item_quality = _marking_ocr_quality(
+            item.source_text, extra_score, item.structure_score
+        )
         overlapped = False
         for index, existing in enumerate(merged):
             existing_compact = unicodedata.normalize(
@@ -1948,6 +2313,13 @@ def _merge_detected_markings(
                 )
             )
             same_text = item_compact == existing_compact
+            # 上限指示は値が同じでも R/C ごとに独立した呼びである。ここで
+            # ``same_dimension`` の近接判定に通すと、別行の R0.2以下 と
+            # C0.2以下が1つの大きな候補へ戻ってしまう。完全一致したOCR
+            # 重複だけを統合対象にする。
+            if existing.kind == "limit" or item.kind == "limit":
+                if existing.kind != item.kind or not same_text:
+                    continue
             # 画像OCRは縦のはめあい寸法を ``φ24.95g6`` と ``95g6`` の
             # ように全体・末尾だけで二重に読むことがある。公称値は異なるが
             # 後者は前者の部分文字列であり、別寸法ではない。短い断片を
@@ -2006,18 +2378,43 @@ def _merge_detected_markings(
             if not overlap_hit and not near_hit:
                 continue
             overlapped = True
-            existing_quality = _marking_ocr_quality(existing.source_text, 0.0)
+            existing_quality = _marking_ocr_quality(
+                existing.source_text, 0.0, existing.structure_score
+            )
             # Preserve the page-OCR geometry when both engines read the same
             # expression equally well.  Windows OCR boxes are often displaced
             # perpendicular to vertical or tightly stacked dimensions.
             keeper = item if item_quality[:2] > existing_quality[:2] else existing
             other = existing if keeper is item else item
-            union_quad = _extend_along_keep_across(
-                [fitz.Point(point) for point in keeper.quad],
-                [fitz.Point(point) for point in other.quad],
-                keeper.direction,
-                along_expand=0.4,
+            keeper_points = [fitz.Point(point) for point in keeper.quad]
+            other_points = [fitz.Point(point) for point in other.quad]
+            # 高精細OCRでは C0.1±0.05 / R0.2… の上付き・下付き公差だけを
+            # 別の高さで読めることがある。通常の候補は従来どおり本体の帯幅を
+            # 保つが、小R/Cの明示公差に限っては両方のOCR枠の幅も合わせる。
+            # これにより寸法値だけが塗られ、公差の上下端が欠けるのを防ぐ。
+            small_feature_tolerance = (
+                keeper.kind in {"chamfer", "radius"}
+                and keeper.nominal_value <= 1.0
+                and keeper.tolerance_range is not None
             )
+            if small_feature_tolerance:
+                _u0, _u1, union_across0, union_across1, _ua, _un = _axis_bounds(
+                    keeper_points + other_points,
+                    keeper.direction,
+                )
+                union_quad = _quad_same_thickness(
+                    keeper_points + other_points,
+                    keeper.direction,
+                    union_across1 - union_across0,
+                    along_expand=0.4,
+                )
+            else:
+                union_quad = _extend_along_keep_across(
+                    keeper_points,
+                    other_points,
+                    keeper.direction,
+                    along_expand=0.4,
+                )
             merged[index] = replace(
                 keeper,
                 rect=_marking_quad_bounds(union_quad),
@@ -2063,7 +2460,13 @@ def _is_plausible_tolerance_marking(
         or compact.endswith((".", ":", ",", "+", "-", "±", "0±0", "±0"))
         or re.search(r"[±+\-]0\.?$", compact)
         or re.search(r"[±+\-]0\.$", compact)
-        or re.search(r"^\d+[±+\-]", compact) and not re.search(r"\d", compact.split("±")[-1] if "±" in compact else "")
+        # A separated unilateral/stacked tolerance is reconstructed as
+        # ``10+0.02-0.01``.  Check the text after the *first* sign, rather
+        # than only after a ± glyph, so valid local associations are kept.
+        or (
+            re.search(r"^\d+[±+\-]", compact)
+            and not re.search(r"\d", re.split(r"[±+\-]", compact, maxsplit=1)[1])
+        )
         or re.fullmatch(r"\d{1,2}[±+\-]\d", compact)
         or re.search(r"\d\.[±+\-]", compact)
         # 4.5-0.2022 のような桁崩れ
@@ -2471,23 +2874,24 @@ def _detect_dimension_markings(
                     point.x * normal.x + point.y * normal.y
                     for point in group_points
                 ]
-                nominal_along = [
-                    point[0] * axis.x + point[1] * axis.y
-                    for point in core_quad
-                ]
-                tolerance_along_min = max(nominal_along) + 0.05
-                tolerance_along_max = max(group_along)
-                if tolerance_along_max - tolerance_along_min > 0.6:
+                # 公差は常に読取方向の「後ろ」にあるとは限らない。画像の
+                # 2.5+0.25/0 や C0.2 のような上付き／下付きは、同じ文字位置
+                # で直交方向へ張り出す。完成したテキストグループ全体を公差
+                # 帯として渡し、最終の帯整形で公称値と一体にする。
+                group_along_min = min(group_along)
+                group_along_max = max(group_along)
+                group_across_min = min(group_across)
+                group_across_max = max(group_across)
+                if (
+                    group_along_max - group_along_min > 0.6
+                    and group_across_max - group_across_min > 0.2
+                ):
                     tolerance_quad = _marking_quad_from_points(
                         [
-                            axis * tolerance_along_min
-                            + normal * min(group_across),
-                            axis * tolerance_along_max
-                            + normal * min(group_across),
-                            axis * tolerance_along_max
-                            + normal * max(group_across),
-                            axis * tolerance_along_min
-                            + normal * max(group_across),
+                            axis * group_along_min + normal * group_across_min,
+                            axis * group_along_max + normal * group_across_min,
+                            axis * group_along_max + normal * group_across_max,
+                            axis * group_along_min + normal * group_across_max,
                         ],
                         direction,
                         across_inset=max(0.1, font_size * 0.025),
@@ -3099,6 +3503,7 @@ def _detect_local_dimension_markings(
     *,
     include_plain_dimensions: bool = False,
     scanned_page: bool = False,
+    structure_analysis: bool = False,
 ) -> list[_DetectedDimensionMarking]:
     """Parse dimension notation from the shared ONNX OCR page result."""
 
@@ -3238,10 +3643,16 @@ def _detect_local_dimension_markings(
             )
             continue
         small_feature_callout = re.fullmatch(
-            r"(?P<prefix>[RCＲＣ])\s*(?P<number>0[.,]\d+)",
+            r"(?P<prefix>[RCＲＣ])\s*(?P<number>0[.,]\d+)"
+            r"(?P<tolerance>(?:[±士土+\-−－].*)?)",
             compact,
         )
-        if small_feature_callout is not None and line.score >= 0.82:
+        # Tiny R/C callouts sit on leader lines and are routinely assigned a
+        # lower OCR confidence than their otherwise complete characters.
+        # The strict full-token pattern is sufficient protection here; using
+        # 0.82 skipped R0.5/C0.3 before their recovered +value/0 fragments
+        # could be painted.
+        if small_feature_callout is not None and line.score >= 0.68:
             # 詳細図のC0.3のように、公差だけが注記行へ混ざる小面取り・
             # 小Rを、独立した文字行として扱う。値と接頭辞が完全な場合のみ。
             nominal = float(small_feature_callout.group("number").replace(",", "."))
@@ -3254,6 +3665,31 @@ def _detect_local_dimension_markings(
                 direction,
                 rect,
             )
+            tolerance_range = _explicit_tolerance_range(compact, nominal)
+            tolerance_lines = _stacked_tolerance_fragments(
+                line, ocr_page.lines
+            )
+            tolerance_quad = None
+            if tolerance_lines:
+                tolerance_points = [
+                    fitz.Point(point)
+                    for tolerance_line in tolerance_lines
+                    for point in tolerance_line.quad
+                ]
+                combined = f"{compact}{''.join(item.text for item in tolerance_lines)}"
+                combined_range = _explicit_tolerance_range(combined, nominal)
+                if combined_range is not None:
+                    # Keep the nominal and the superscript/subscript as two
+                    # OCR regions until painting.  Using their outer bounds
+                    # here hid the +0.1/0 on R0.5 and C0.3 in a wide box.
+                    compact = combined
+                    tolerance_range = combined_range
+                tolerance_quad = _marking_quad_from_points(
+                    tolerance_points,
+                    direction,
+                    along_expand=0.5,
+                    across_inset=0.0,
+                )
             detected.append(
                 _DetectedDimensionMarking(
                     rect=_marking_quad_bounds(quad),
@@ -3265,8 +3701,16 @@ def _detect_local_dimension_markings(
                         small_feature_callout.group("prefix"),
                         "",
                     ),
-                    tolerance_range=1.0,
+                    tolerance_range=(
+                        tolerance_range if tolerance_range is not None else 1.0
+                    ),
                     reference=False,
+                    tolerance_rect=(
+                        _marking_quad_bounds(tolerance_quad)
+                        if tolerance_quad is not None
+                        else None
+                    ),
+                    tolerance_quad=tolerance_quad,
                 )
             )
             continue
@@ -3277,12 +3721,28 @@ def _detect_local_dimension_markings(
         match = _MARKING_NUMBER_PATTERN.search(working)
         if match is None:
             continue
+        recovered_g6 = _recover_g6_fit_from_deviations(
+            working,
+            line,
+            ocr_page.lines,
+        )
+        if recovered_g6 is not None:
+            # ``φ24.95g6`` が ``φ24.9596`` のように読まれても、右横の
+            # 括弧内偏差で裏付けられる場合だけ本来のはめあい表記へ戻す。
+            working, recovered_nominal = recovered_g6
+            match = _MARKING_NUMBER_PATTERN.search(working)
+            if match is None:
+                continue
         if working.endswith(("+", "-")):
             continue
         if working[:1] in {"+", "-", "−", "±"}:
             continue
         try:
-            nominal = float(match.group("number").replace(",", "."))
+            nominal = (
+                recovered_nominal
+                if recovered_g6 is not None
+                else float(match.group("number").replace(",", "."))
+            )
         except (AttributeError, ValueError):
             continue
         if nominal <= 0 or nominal > 4000:
@@ -3300,33 +3760,29 @@ def _detect_local_dimension_markings(
             # OCRで読めない場合でも、引出線付きの独立寸法として残す。
             # 後段の寸法線・領域判定を通過したものだけを黄色候補にする。
             tolerance_range = 1.0
-        joined_tolerance_line: LocalOcrLine | None = None
+        joined_tolerance_lines: tuple[LocalOcrLine, ...] = ()
         if tolerance_range is None and re.fullmatch(
-            r"[φΦØ⌀RCＲＣ]?\d+(?:[.,]\d+)?",
+            r"[φΦØ⌀RCＲＣ]?\d+(?:[.,]\d+)?[°。]?",
             working,
         ):
-            # 18.7 と +0.05 のように公称値・上付き公差が別OCR行になっても、
-            # 近接する明示公差だけを同じ寸法として戻す。
-            for nearby_line in ocr_page.lines:
-                if nearby_line is line or not _ocr_lines_near(line, nearby_line):
-                    continue
-                fragment = unicodedata.normalize(
-                    "NFKC", nearby_line.text
-                ).replace(" ", "")
-                if not re.fullmatch(r"[±+\-−－]?0(?:[.,]\d+)", fragment):
-                    continue
-                combined = f"{working}{fragment}"
+            # Associate raw OCR rectangles before any visual union.  This
+            # accepts one-sided values and a narrow upper/lower pair, while
+            # rejecting a nearby GD&T/table cell.
+            fragments = _stacked_tolerance_fragments(line, ocr_page.lines)
+            if fragments:
+                combined = f"{working}{''.join(item.text for item in fragments)}"
                 combined_range = _explicit_tolerance_range(combined, nominal)
-                if combined_range is None or not _is_plausible_tolerance_marking(
-                    combined,
-                    nominal,
-                    combined_range,
+                if (
+                    combined_range is not None
+                    and _is_plausible_tolerance_marking(
+                        combined,
+                        nominal,
+                        combined_range,
+                    )
                 ):
-                    continue
-                working = combined
-                tolerance_range = combined_range
-                joined_tolerance_line = nearby_line
-                break
+                    working = combined
+                    tolerance_range = combined_range
+                    joined_tolerance_lines = fragments
         rect = fitz.Rect(line.rect) & page.rect
         direction = line.direction
         if tolerance_range is not None and _is_dense_table_region(
@@ -3394,11 +3850,10 @@ def _detect_local_dimension_markings(
             rect, reference_rects
         ):
             continue
+        # Keep the nominal OCR polygon separate from the linked tolerance
+        # polygons.  Joining them here loses the actual superscript/subscript
+        # bounds before the paint stage can construct a compact unified band.
         quad_points = [fitz.Point(point) for point in line.quad]
-        if joined_tolerance_line is not None:
-            quad_points.extend(
-                fitz.Point(point) for point in joined_tolerance_line.quad
-            )
         edge_lengths = (
             math.dist(line.quad[0], line.quad[1]),
             math.dist(line.quad[0], line.quad[3]),
@@ -3511,6 +3966,59 @@ def _detect_local_dimension_markings(
             tolerance_range=tolerance_range,
             reference=reference,
         )
+        if joined_tolerance_lines:
+            joined_points = [
+                fitz.Point(point)
+                for joined_tolerance_line in joined_tolerance_lines
+                for point in joined_tolerance_line.quad
+            ]
+            joined_quad = _marking_quad_from_points(
+                joined_points,
+                direction,
+                along_expand=0.5,
+                across_inset=0.0,
+            )
+            candidate = replace(
+                candidate,
+                tolerance_rect=_marking_quad_bounds(joined_quad),
+                tolerance_quad=joined_quad,
+            )
+        if (
+            tolerance_range is not None
+            and kind in {"radius", "chamfer", "angle"}
+        ):
+            # 小R/Cや角度では、上側の +0.1 は本体OCR行に含まれても、
+            # 下側の ``0`` だけが独立行になることがある。明示公差を持つ
+            # 寸法の直近だけを拾い、寸法・上下公差を一つの塗りへ渡す。
+            tolerance_points: list[fitz.Point] = []
+            for nearby_line in ocr_page.lines:
+                if nearby_line is line or not _ocr_lines_near(
+                    line, nearby_line, gap=28.0
+                ):
+                    continue
+                fragment = unicodedata.normalize(
+                    "NFKC", nearby_line.text
+                ).replace(" ", "")
+                if not re.fullmatch(
+                    r"(?:[±+\-−－]?0(?:[.,]\d+)?|[+\-−－]\d+(?:[.,]\d+)?)",
+                    fragment,
+                ):
+                    continue
+                tolerance_points.extend(
+                    fitz.Point(point) for point in nearby_line.quad
+                )
+            if tolerance_points and candidate.tolerance_quad is None:
+                tolerance_quad = _marking_quad_from_points(
+                    tolerance_points,
+                    direction,
+                    along_expand=0.8,
+                    across_inset=0.0,
+                )
+                candidate = replace(
+                    candidate,
+                    tolerance_rect=_marking_quad_bounds(tolerance_quad),
+                    tolerance_quad=tolerance_quad,
+                )
         if _FIT_TOLERANCE_PATTERN.search(working):
             if _fit_line_is_columnar(line):
                 base_points = [fitz.Point(point) for point in candidate.quad]
@@ -3543,39 +4051,30 @@ def _detect_local_dimension_markings(
                 if _is_dimension_owner_line(other.text)
             )
             original_rect = fitz.Rect(candidate.rect)
-            cluster: list[LocalOcrLine] = []
+            # Coordinate-association PoC.  Broad OCR-cluster fallbacks are
+            # deliberately removed: only an adjacent, signed tolerance lane
+            # can extend a g6/H7 candidate.
+            cluster = list(
+                _stacked_tolerance_fragments(line, ocr_page.lines, fit=True)
+            )
+            # 括弧だけはOCRで独立し得るため、直接確認できた偏差に接する
+            # 開閉括弧だけを補う。偏差値そのものを連鎖取得しないので、密な
+            # 縦寸法列の別 g6/H7 を根拠なく補助マーキングしない。
             for nearby_line in ocr_page.lines:
-                if nearby_line is line:
+                if nearby_line is line or nearby_line in cluster:
                     continue
-                if not _is_fit_cluster_line(nearby_line.text):
+                if not _is_fit_paren_glyph(nearby_line.text):
                     continue
-                if _fit_owns_parenthetical(line, nearby_line, owner_lines):
+                if (
+                    _fit_line_is_columnar(line)
+                    and not _is_plausible_columnar_fit_cluster(line, nearby_line)
+                ):
+                    continue
+                if any(
+                    _ocr_lines_near(nearby_line, owned, gap=10.0)
+                    for owned in cluster
+                ):
                     cluster.append(nearby_line)
-            changed = True
-            while changed:
-                changed = False
-                for nearby_line in ocr_page.lines:
-                    if nearby_line is line or nearby_line in cluster:
-                        continue
-                    if not _is_fit_cluster_line(nearby_line.text):
-                        continue
-                    if not any(
-                        _ocr_lines_near(nearby_line, owned) for owned in cluster
-                    ):
-                        continue
-                    stolen = False
-                    for other in owner_lines:
-                        if other is line:
-                            continue
-                        if _fit_owns_parenthetical(
-                            other, nearby_line, owner_lines
-                        ):
-                            stolen = True
-                            break
-                    if stolen:
-                        continue
-                    cluster.append(nearby_line)
-                    changed = True
             after_points: list[fitz.Point] = []
             beside_points: list[fitz.Point] = []
             default_side = (
@@ -3671,6 +4170,17 @@ def _detect_local_dimension_markings(
         if overlapped:
             continue
         detected.append(candidate)
+    if structure_analysis:
+        structure_segments = extract_structure_segments(ocr_page)
+        detected = [
+            replace(
+                item,
+                structure_score=dimension_line_score(
+                    item.rect, item.direction, structure_segments
+                ),
+            )
+            for item in detected
+        ]
     detected = _separate_overlapping_roughness(
         _merge_nearby_same_callout(
             _merge_fragmented_roughness(
@@ -3874,6 +4384,7 @@ class DrawingApi:
         self.enriched_ocr_cache: dict[int, LocalOcrPage] = {}
         self.vertical_ocr_cache: dict[int, tuple[LocalOcrLine, ...]] = {}
         self.incomplete_dimension_ocr_cache: dict[int, tuple[LocalOcrLine, ...]] = {}
+        self.compact_tolerance_ocr_cache: dict[int, tuple[LocalOcrLine, ...]] = {}
         self.lock = RLock()
         self.upload_directory = tempfile.TemporaryDirectory(
             prefix="DrawingAssist-"
@@ -3970,6 +4481,7 @@ class DrawingApi:
                 page_ocr,
                 include_plain_dimensions=False,
                 scanned_page=True,
+                structure_analysis=True,
             )
             scanned_detected = list(page_detected)
             if recorder is not None:
@@ -4023,10 +4535,45 @@ class DrawingApi:
                     scale_x=horizontal_ocr.scale_x,
                     scale_y=horizontal_ocr.scale_y,
                     image=horizontal_ocr.image,
-                    lines=(*horizontal_ocr.lines, *vertical_joined),
+                    # ``enrich_scanned_ocr_page`` は横寸法の重複を整えるが、
+                    # 縦g6の本体と右横の括弧内偏差は別々の生OCR行として
+                    # 残す必要がある。元タイルも併せて渡し、帰属判定に必要
+                    # な2段偏差を欠落させない。
+                    lines=(*horizontal_ocr.lines, *tiles, *vertical_joined),
                 )
             else:
                 ocr_for_tiles = build_tile_ocr_page(page, tiles)
+            # The page OCR can miss the body of a small R/C/angle callout
+            # completely, while the high-resolution tile OCR still reads its
+            # nominal value.  Re-run only those compact tile candidates so
+            # ``R0.5 +0.1/0`` and a slanted ``30° +1/0`` retain every glyph
+            # in their final marker.  Decimal recovery was already done on
+            # the page OCR above, so this second pass is cached and targeted.
+            compact_tolerance_lines = self.compact_tolerance_ocr_cache.get(
+                self.page_index
+            )
+            if compact_tolerance_lines is None:
+                try:
+                    compact_tolerance_lines = analyze_incomplete_dimension_regions(
+                        page, ocr_for_tiles, include_incomplete=False
+                    )
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "小R/C・角度の追加OCRに失敗しました: %s", exc
+                    )
+                    compact_tolerance_lines = ()
+                self.compact_tolerance_ocr_cache[self.page_index] = (
+                    compact_tolerance_lines
+                )
+            if compact_tolerance_lines:
+                ocr_for_tiles = LocalOcrPage(
+                    width=ocr_for_tiles.width,
+                    height=ocr_for_tiles.height,
+                    scale_x=ocr_for_tiles.scale_x,
+                    scale_y=ocr_for_tiles.scale_y,
+                    image=ocr_for_tiles.image,
+                    lines=(*ocr_for_tiles.lines, *compact_tolerance_lines),
+                )
             tile_detected = _detect_local_dimension_markings(
                 page,
                 ocr_for_tiles,
@@ -4047,6 +4594,9 @@ class DrawingApi:
             if abs(marking.direction[1]) >= 0.72
             and marking.tolerance_range is not None
         ]
+        # 補助OCRは全頁の候補を省略しない。画像図面では RapidOCR と
+        # Windows OCR の片方だけが拾う小角度・細い公差があるため、件数を
+        # 根拠に抑止すると未検出を増やす。
         if page_ocr is not None and len(vertical_evidence) >= 2:
             # 全頁の補助OCRを重ねると候補数だけ増え、画像PDF①の精度を
             # 悪化させる。ここでは通常OCRが落としやすい小R/Cの明示公差
@@ -4106,6 +4656,14 @@ class DrawingApi:
         for marking in unique:
             compact = unicodedata.normalize("NFKC", marking.source_text).replace(" ", "")
             marking_rect = fitz.Rect(marking.rect)
+            # The bottom-right title block contains fit notation in table
+            # cells. It is never a drawing callout and must be rejected after
+            # every OCR source (page, tile, or Windows fallback) is merged.
+            if (
+                marking_rect.x0 > page.rect.width * 0.64
+                and marking_rect.y0 > page.rect.height * 0.78
+            ):
+                continue
             marking_center = marking_rect.tl + (marking_rect.br - marking_rect.tl) / 2
             truncated_duplicate = False
             for other in unique:
@@ -4765,6 +5323,7 @@ class DrawingApi:
             self.enriched_ocr_cache.clear()
             self.vertical_ocr_cache.clear()
             self.incomplete_dimension_ocr_cache.clear()
+            self.compact_tolerance_ocr_cache.clear()
             return self._state(
                 "PDFを読み込みました。使いたいツールを選んで図面をクリックしてください。"
             )

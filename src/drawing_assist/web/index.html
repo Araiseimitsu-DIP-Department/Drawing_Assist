@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>加工図面作成支援ツール</title>
-  <link rel="stylesheet" href="styles.css?v=2026-08-24-color63">
+  <link rel="stylesheet" href="styles.css?v=2026-08-25-color77">
 </head>
 <body>
   <input id="pdfFileInput" type="file" accept=".pdf,application/pdf" hidden>
@@ -14,7 +14,7 @@
         <div class="brand-mark">DA</div>
         <div>
           <strong>加工図面作成支援ツール</strong>
-          <span>寸法チェック・追記</span>
+          <span>図面を、見やすく整える</span>
         </div>
       </div>
 
@@ -48,16 +48,16 @@
     <main class="workspace">
       <aside class="tool-panel">
         <div class="panel-heading">
-          <span><b>1</b> 作業を選ぶ</span>
-          <small>よく使う作業</small>
+          <span><b>1</b> やりたいこと</span>
+          <small>クイック操作</small>
         </div>
 
         <button class="tool-card active workflow-tool" data-mode="general_tolerance" type="button">
           <span class="tool-icon tolerance-icon">±</span>
-          <span><strong>公差未記載の寸法</strong><small>一般公差を適用</small></span>
+          <span><strong>公差を自動で入れる</strong><small>指示のない寸法を探す</small></span>
         </button>
         <details class="dimension-fix-tools">
-          <summary><b aria-hidden="true"></b><span><strong>寸法を直す</strong><small id="dimensionFixStatus">必要なときだけ</small></span><i>⌄</i></summary>
+          <summary><b aria-hidden="true"></b><span><strong>寸法を追加・修正</strong><small id="dimensionFixStatus">必要なときだけ</small></span><i>⌄</i></summary>
           <button class="tool-card compact" data-mode="dimension" type="button">
             <span class="tool-icon dimension-icon"></span>
             <span><strong>寸法と矢印を追加</strong><small>追加・移動・矢先調整</small></span>
@@ -73,14 +73,14 @@
         </details>
         <button class="tool-card workflow-tool" data-mode="word" type="button">
           <span class="tool-icon marker-icon"></span>
-          <span><strong>寸法を色分け</strong><small>一括色分け・手動追加</small></span>
+          <span><strong>寸法を色分け</strong><small>自動で探して、あとから直せる</small></span>
         </button>
         <button class="tool-card workflow-tool" data-mode="work_shape" type="button">
           <span class="tool-icon work-shape-icon"></span>
-          <span><strong>製品を塗る</strong><small>断面・加工部の範囲</small></span>
+          <span><strong>製品を塗る</strong><small>断面・加工部を見やすく</small></span>
         </button>
         <details class="more-tools">
-          <summary><span><strong>その他の機能</strong><small>印・注記・測定記号</small></span><i>⌄</i></summary>
+          <summary><span><strong>便利なツール</strong><small>印・注記・測定記号</small></span><i>⌄</i></summary>
           <details class="workflow-stamps">
             <summary><strong>印・必要な注記を入れる</strong><small>印または注記を選択</small></summary>
             <button class="tool-card compact stamp-card quality" data-mode="quality_stamp" type="button">
@@ -104,7 +104,7 @@
 
         <div class="source-note">
           <span class="note-icon">i</span>
-          <p>原本PDFは変更しません。編集結果は別ファイルに保存されます。</p>
+          <p>元のPDFはそのまま。編集した図面は別ファイルで保存されます。</p>
         </div>
       </aside>
 
@@ -189,12 +189,12 @@
 
       <aside class="settings-panel">
         <div class="panel-heading">
-          <span><b>2</b> 設定と操作</span>
+          <span><b>2</b> いまの作業</span>
           <small id="settingsToolName">公差をまとめて入れる</small>
         </div>
 
         <section id="taskGuide" class="task-guide">
-          <div class="task-guide-heading"><span id="taskStep">STEP 1</span><small>いまやること</small></div>
+          <div class="task-guide-heading"><span id="taskStep">STEP 1</span><small>つぎにすること</small></div>
           <strong id="taskTitle">規格を選んで検出</strong>
           <p id="modeHelp">右の「対象寸法を検出」を押します。</p>
         </section>
@@ -206,21 +206,31 @@
             <span id="markingFlowReview" class="operation-step">Step 2 確認</span>
             <span id="markingFlowApply" class="operation-step">Step 3 反映</span>
           </div>
+          <div class="workflow-choice" aria-label="自動と手動の使い分け">
+            <div class="workflow-choice-main">
+              <span class="workflow-choice-icon" aria-hidden="true">✦</span>
+              <span><strong>まずは自動で探す</strong><small>下の「対象寸法を検出」を押すだけ</small></span>
+            </div>
+            <div class="workflow-choice-manual">
+              <b>合わない所だけ自分で直す</b>
+              <span>反映後、文字をクリック。選べない時は「うまく選べないとき」を開きます。</span>
+            </div>
+          </div>
           <button id="scanDimensionMarkingsButton" class="detect-button" type="button" disabled>
-            対象寸法を検出
+            1. 自動で対象寸法を探す
           </button>
           <div class="selection-progress tolerance-progress">
             <span>色分けする件数</span>
             <output id="dimensionMarkingCandidateCount">未検出</output>
           </div>
           <button id="applyDimensionMarkingsButton" class="save-button primary-next wide-button" type="button" disabled>
-            一括反映
+            3. この内容で色分けする
           </button>
           <button id="removeDimensionMarkingButton" class="soft-button wide-button toggle-mode-button hidden" type="button">
             不要な色を解除
           </button>
           <p id="dimensionMarkingHint" class="setting-tip">
-            ①検出 → ②クリックで確認 → ③一括反映
+            2. 色を確認：合っていればそのまま。違う色だけクリックで外せます。
           </p>
           <details class="advanced-details compact-details">
             <summary>色の意味</summary>
@@ -572,6 +582,6 @@
     </main>
   </div>
 
-  <script src="app.js?v=2026-08-24-color63"></script>
+  <script src="app.js?v=2026-08-25-color77"></script>
 </body>
 </html>

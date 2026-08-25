@@ -8,7 +8,7 @@
   --accent: #315fd4;
   --accent-soft: #edf3ff;
   --shadow: 0 14px 32px rgba(15, 23, 42, .10);
-  font-family: "Noto Sans JP", "BIZ UDPGothic", "Segoe UI Variable", sans-serif;
+  font-family: "BIZ UDPGothic", "Yu Gothic UI", "Segoe UI Variable", sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -95,6 +95,45 @@ summary::-webkit-details-marker { display: none; }
   background: #ecfdf3;
   color: #15803d;
 }
+.workflow-choice {
+  margin: -2px 0 2px;
+  overflow: hidden;
+  border: 1px solid #dce8ff;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #f8fbff, #f5f8ff);
+}
+.workflow-choice-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px 8px;
+}
+.workflow-choice-icon {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  border-radius: 8px;
+  color: #fff;
+  background: linear-gradient(145deg, #4b7bf2, #2d58c6);
+  box-shadow: 0 4px 9px rgba(49, 95, 212, .20);
+  font-size: 14px;
+}
+.workflow-choice-main strong, .workflow-choice-main small { display: block; }
+.workflow-choice-main strong { color: #1f438f; font-size: 11px; }
+.workflow-choice-main small { margin-top: 1px; color: #64748b; font-size: 9px; }
+.workflow-choice-manual {
+  display: grid;
+  gap: 2px;
+  padding: 7px 10px 8px;
+  border-top: 1px dashed #d8e3f8;
+  color: #667085;
+  background: rgba(255,255,255,.7);
+  font-size: 9px;
+  line-height: 1.45;
+}
+.workflow-choice-manual b { color: #465d82; font-size: 10px; }
 .detect-button {
   width: 100%;
   margin-top: 9px;
@@ -179,8 +218,12 @@ body:not(.document-loaded) .settings-panel { display: none; }
   gap: 8px; margin: 0 6px 13px;
 }
 .panel-heading span { display: flex; min-width: 0; align-items: center; gap: 7px; font-size: 14px; font-weight: 800; white-space: nowrap; }
-.panel-heading span b { display: none; }
-.panel-heading span { color: #263752; letter-spacing: .035em; }
+.panel-heading span b {
+  display: grid; place-items: center; width: 20px; height: 20px;
+  border-radius: 7px; color: #fff; background: linear-gradient(145deg, #4a78ec, #315fd4);
+  box-shadow: 0 3px 7px rgba(49, 95, 212, .20); font-size: 10px;
+}
+.panel-heading span { color: #243b61; letter-spacing: .025em; }
 .panel-heading small {
   min-width: 0; color: var(--muted); font-size: 10px; line-height: 1.35;
   overflow-wrap: anywhere; text-align: right;
@@ -191,10 +234,10 @@ body:not(.document-loaded) .settings-panel { display: none; }
   align-items: center; width: 100%; min-height: 60px; margin: 5px 0; padding: 8px 9px;
   border: 1px solid transparent; border-radius: 12px; text-align: left; background: transparent;
 }
-.tool-card:hover { border-color: #e2e8f2; background: #f6f8fc; }
+.tool-card:hover { border-color: #d7e3fb; background: #f5f8ff; transform: translateX(2px); }
 .tool-card:focus { outline: none; }
 .tool-card:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 1px; }
-.tool-card.active { color: #244fae; border-color: #bfd0fb; background: var(--accent-soft); box-shadow: inset 2px 0 var(--accent), 0 5px 12px rgba(48, 95, 212, .08); }
+.tool-card.active { color: #244fae; border-color: #bfd0fb; background: linear-gradient(100deg, #edf3ff, #f7faff); box-shadow: inset 3px 0 var(--accent), 0 5px 12px rgba(48, 95, 212, .08); }
 /* Tool names already show the workflow step; a second badge was redundant. */
 .workflow-tool { padding-right: 9px; }
 .workflow-tool::after, .tool-card::after { content: none !important; display: none !important; }
